@@ -35,6 +35,11 @@ struct SocketPeerDescriptor {
     DeviceAddr config_buffer_address = 0;
     DeviceAddr data_buffer_address = 0;
     multihost::Tag exchange_tag = multihost::Tag{0};
+    // Fabric chip id of this endpoint's core per connection (socket_connection_config order),
+    // resolved locally from its own MeshDevice. Lets the peer skip deriving the chip from a
+    // submesh-local coord, which mis-resolves when a submesh spans several ranks. Empty if the
+    // peer did not supply it; callers then fall back to the coordinate derivation.
+    std::vector<uint32_t> local_chip_ids;
 };
 
 // Create send/receive socket config buffers
@@ -78,10 +83,19 @@ SocketPeerDescriptor receive_and_verify_descriptor_from_peer(
     const std::shared_ptr<const multihost::DistributedContext>& context,
     const std::unordered_map<multihost::Rank, multihost::Rank>& rank_translation_table);
 
+// Map each connection's endpoint coords to fabric node ids.
+//
+// An endpoint backed by a local MeshDevice resolves through it. For a remote endpoint, pass the chip
+// ids the peer sent in its descriptor (SocketPeerDescriptor::local_chip_ids) -- the peer resolved
+// them from its own device handle, so they stay correct when its submesh spans several ranks. When
+// they are empty the coord is derived from the owning rank's host binding, which assumes the submesh
+// begins at that rank's host slice.
 std::array<std::unordered_map<MeshCoordinate, tt::tt_fabric::FabricNodeId>, 2> generate_fabric_node_id_map(
     const SocketConfig& config,
     const std::shared_ptr<MeshDevice>& sender_device = nullptr,
-    const std::shared_ptr<MeshDevice>& receiver_device = nullptr);
+    const std::shared_ptr<MeshDevice>& receiver_device = nullptr,
+    const std::vector<uint32_t>& peer_sender_chip_ids = {},
+    const std::vector<uint32_t>& peer_receiver_chip_ids = {});
 
 std::vector<multihost::Rank> get_ranks_for_mesh_id(
     tt_fabric::MeshId mesh_id, const std::unordered_map<multihost::Rank, multihost::Rank>& rank_translation_table);

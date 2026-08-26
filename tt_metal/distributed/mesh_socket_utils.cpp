@@ -354,14 +354,23 @@ void write_socket_configs(
     auto get_fabric_node_from_coord = [&](const MeshCoordinate& device_coord,
                                           const std::shared_ptr<MeshDevice>& peer_device,
                                           tt_fabric::MeshId peer_mesh_id,
-                                          multihost::Rank peer_rank) -> tt_fabric::FabricNodeId {
+                                          multihost::Rank peer_rank,
+                                          uint32_t connection_idx) -> tt_fabric::FabricNodeId {
         if (peer_device) {
             return peer_device->get_fabric_node_id(device_coord);
         }
         // peer_device is null for rank-scoped cross-process sockets, so we can't ask the peer's
-        // MeshDevice directly. Resolve the peer's submesh-local coordinate to its GLOBAL chip via
-        // the peer rank's host binding — without host_rank, coordinate_to_chip assumes host-rank 0
-        // and maps every cross-rank receiver into rank 0's chips (wrong destination -> hang).
+        // MeshDevice directly. Prefer the chip the peer resolved from its OWN device handle and sent
+        // in its descriptor: it is authoritative, and it stays correct when the peer's submesh is
+        // shared by several ranks (a 4x2 stage carved from two 4x1 host slices), where the fallback
+        // below lands on the neighbouring chip. This value becomes the kernel's fabric destination.
+        if (connection_idx < peer_descriptor.local_chip_ids.size()) {
+            return tt_fabric::FabricNodeId(peer_mesh_id, peer_descriptor.local_chip_ids[connection_idx]);
+        }
+        // Fallback (peer sent no chip ids): resolve the peer's submesh-local coordinate to its GLOBAL
+        // chip via the peer rank's host binding — without host_rank, coordinate_to_chip assumes
+        // host-rank 0 and maps every cross-rank receiver into rank 0's chips (wrong destination ->
+        // hang). This assumes the peer's submesh starts at that rank's host slice.
         auto it = global_bindings.find(peer_rank);
         std::optional<tt_fabric::MeshHostRankId> host_rank;
         if (it != global_bindings.end()) {
@@ -420,7 +429,11 @@ void write_socket_configs(
                     auto recv_virtual_core =
                         mesh_device->worker_core_from_logical_core(connection.receiver_core.core_coord);
                     tt_fabric::FabricNodeId recv_fabric_node_id = get_fabric_node_from_coord(
-                        recv_device_coord, peer_device, config.receiver_mesh_id.value(), config.receiver_rank);
+                        recv_device_coord,
+                        peer_device,
+                        config.receiver_mesh_id.value(),
+                        config.receiver_rank,
+                        indexed_connection.first);
                     uint32_t receiver_id = receiver_ids_per_sender.at(connection);
                     auto sender_node = mesh_device->get_fabric_node_id(sender_core.device_coord);
                     auto [downstream_mesh_id, downstream_chip_id] = get_sender_receiver_chip_fabric_encoding(
@@ -455,7 +468,11 @@ void write_socket_configs(
                 auto sender_virtual_core =
                     mesh_device->worker_core_from_logical_core(connection.sender_core.core_coord);
                 tt_fabric::FabricNodeId sender_fabric_node_id = get_fabric_node_from_coord(
-                    sender_device_coord, peer_device, config.sender_mesh_id.value(), config.sender_rank);
+                    sender_device_coord,
+                    peer_device,
+                    config.sender_mesh_id.value(),
+                    config.sender_rank,
+                    indexed_connections.front().first);
                 MeshCoreCoord recv_core = {device_coord, recv_core_coord};
 
                 auto [upstream_mesh_id, upstream_chip_id] = get_sender_receiver_chip_fabric_encoding(
@@ -511,11 +528,24 @@ SocketPeerDescriptor generate_local_endpoint_descriptor(
                   ? generate_rank_scoped_exchange_tag(config.sender_rank, config.receiver_rank, context_id)
                   : generate_descriptor_exchange_tag(peer_mesh_id, context_id);
 
+    // Resolve THIS endpoint's chip per connection from our own device handle -- the only frame that
+    // is always right, since a submesh shared by several ranks does not start at the endpoint rank's
+    // host slice. The peer consumes these rather than deriving the chip from the coord itself.
+    std::vector<uint32_t> local_chip_ids;
+    if (auto* device = socket_endpoint.get_config_buffer()->device()) {
+        local_chip_ids.reserve(config.socket_connection_config.size());
+        for (const auto& connection : config.socket_connection_config) {
+            const auto& core = is_sender ? connection.sender_core : connection.receiver_core;
+            local_chip_ids.push_back(device->get_fabric_node_id(core.device_coord).chip_id);
+        }
+    }
+
     SocketPeerDescriptor local_endpoint_desc = {
         .config = config,
         .config_buffer_address = socket_endpoint.get_config_buffer()->address(),
         .data_buffer_address = is_sender ? 0 : get_receiver_data_buffer_address(socket_endpoint),
-        .exchange_tag = tag};
+        .exchange_tag = tag,
+        .local_chip_ids = std::move(local_chip_ids)};
     return local_endpoint_desc;
 }
 
@@ -715,7 +745,9 @@ SocketPeerDescriptor receive_and_verify_descriptor_from_peer(
 std::array<std::unordered_map<MeshCoordinate, tt::tt_fabric::FabricNodeId>, 2> generate_fabric_node_id_map(
     const SocketConfig& config,
     const std::shared_ptr<MeshDevice>& sender_device,
-    const std::shared_ptr<MeshDevice>& receiver_device) {
+    const std::shared_ptr<MeshDevice>& receiver_device,
+    const std::vector<uint32_t>& peer_sender_chip_ids,
+    const std::vector<uint32_t>& peer_receiver_chip_ids) {
     std::array<std::unordered_map<MeshCoordinate, tt::tt_fabric::FabricNodeId>, 2> fabric_node_id_map;
     const auto& control_plane = tt::tt_metal::MetalContext::instance().get_control_plane();
     const auto& mesh_graph = control_plane.get_mesh_graph();
@@ -724,13 +756,23 @@ std::array<std::unordered_map<MeshCoordinate, tt::tt_fabric::FabricNodeId>, 2> g
     auto resolve_fabric_node_id = [&](const MeshCoordinate& device_coord,
                                       tt_fabric::MeshId mesh_id,
                                       const std::shared_ptr<MeshDevice>& device,
-                                      multihost::Rank rank) -> tt_fabric::FabricNodeId {
+                                      multihost::Rank rank,
+                                      const std::vector<uint32_t>& peer_chip_ids,
+                                      uint32_t connection_idx) -> tt_fabric::FabricNodeId {
         if (device) {
             return device->get_fabric_node_id(device_coord);
         }
-        // No local device handle: resolve the submesh-local coord to its global chip via the
-        // owning rank's host binding (host_rank). Without it, coordinate_to_chip assumes
-        // host-rank 0 and the kernel's fabric routes point at the wrong chip.
+        // No local device handle. Prefer the chip the peer resolved from ITS own device handle and
+        // sent in the descriptor: it is authoritative, and unlike the derivation below it holds when
+        // the peer's submesh is shared by several ranks.
+        if (connection_idx < peer_chip_ids.size()) {
+            return tt_fabric::FabricNodeId(mesh_id, peer_chip_ids[connection_idx]);
+        }
+        // Fallback (peer sent no chip ids): resolve the submesh-local coord to its global chip via
+        // the owning rank's host binding (host_rank). Without it, coordinate_to_chip assumes
+        // host-rank 0 and the kernel's fabric routes point at the wrong chip. NOTE: this assumes the
+        // submesh starts at that rank's host slice, so it lands on the wrong chip for a submesh
+        // spanning several ranks -- which is exactly what the descriptor's chip ids avoid.
         auto it = global_bindings.find(rank);
         std::optional<tt_fabric::MeshHostRankId> host_rank;
         if (it != global_bindings.end()) {
@@ -746,14 +788,21 @@ std::array<std::unordered_map<MeshCoordinate, tt::tt_fabric::FabricNodeId>, 2> g
         fabric_node_id_map[static_cast<std::underlying_type_t<SocketEndpoint>>(SocketEndpoint::SENDER)].emplace(
             connection.sender_core.device_coord,
             resolve_fabric_node_id(
-                connection.sender_core.device_coord, config.sender_mesh_id.value(), sender_device, config.sender_rank));
+                connection.sender_core.device_coord,
+                config.sender_mesh_id.value(),
+                sender_device,
+                config.sender_rank,
+                peer_sender_chip_ids,
+                i));
         fabric_node_id_map[static_cast<std::underlying_type_t<SocketEndpoint>>(SocketEndpoint::RECEIVER)].emplace(
             connection.receiver_core.device_coord,
             resolve_fabric_node_id(
                 connection.receiver_core.device_coord,
                 config.receiver_mesh_id.value(),
                 receiver_device,
-                config.receiver_rank));
+                config.receiver_rank,
+                peer_receiver_chip_ids,
+                i));
     }
     return fabric_node_id_map;
 }

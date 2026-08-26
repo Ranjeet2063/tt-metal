@@ -273,11 +273,29 @@ void MeshSocket::connect_with_peer(const std::shared_ptr<multihost::DistributedC
         if (socket_endpoint_type_ == SocketEndpoint::SENDER) {
             forward_descriptor_to_peer(local_endpoint_desc, peer_rank, context);
             remote_endpoint_desc = receive_and_verify_descriptor_from_peer(local_endpoint_desc, peer_rank, context);
-            fabric_node_id_map_ = generate_fabric_node_id_map(config_);
+            fabric_node_id_map_ = generate_fabric_node_id_map(
+                config_,
+                /*sender_device=*/nullptr,
+                /*receiver_device=*/nullptr,
+                /*peer_sender_chip_ids=*/
+                socket_endpoint_type_ == SocketEndpoint::RECEIVER ? remote_endpoint_desc.local_chip_ids
+                                                                  : std::vector<uint32_t>{},
+                /*peer_receiver_chip_ids=*/
+                socket_endpoint_type_ == SocketEndpoint::SENDER ? remote_endpoint_desc.local_chip_ids
+                                                                : std::vector<uint32_t>{});
         } else {
             remote_endpoint_desc = receive_and_verify_descriptor_from_peer(local_endpoint_desc, peer_rank, context);
             forward_descriptor_to_peer(local_endpoint_desc, peer_rank, context);
-            fabric_node_id_map_ = generate_fabric_node_id_map(config_);
+            fabric_node_id_map_ = generate_fabric_node_id_map(
+                config_,
+                /*sender_device=*/nullptr,
+                /*receiver_device=*/nullptr,
+                /*peer_sender_chip_ids=*/
+                socket_endpoint_type_ == SocketEndpoint::RECEIVER ? remote_endpoint_desc.local_chip_ids
+                                                                  : std::vector<uint32_t>{},
+                /*peer_receiver_chip_ids=*/
+                socket_endpoint_type_ == SocketEndpoint::SENDER ? remote_endpoint_desc.local_chip_ids
+                                                                : std::vector<uint32_t>{});
         }
         write_socket_configs(config_buffer_, local_endpoint_desc, remote_endpoint_desc, socket_endpoint_type_);
         execute_with_timeout(
@@ -288,12 +306,30 @@ void MeshSocket::connect_with_peer(const std::shared_ptr<multihost::DistributedC
             forward_descriptor_to_peer(local_endpoint_desc, socket_endpoint_type_, context, rank_translation_table_);
             remote_endpoint_desc = receive_and_verify_descriptor_from_peer(
                 local_endpoint_desc, socket_endpoint_type_, context, rank_translation_table_);
-            fabric_node_id_map_ = generate_fabric_node_id_map(config_);
+            fabric_node_id_map_ = generate_fabric_node_id_map(
+                config_,
+                /*sender_device=*/nullptr,
+                /*receiver_device=*/nullptr,
+                /*peer_sender_chip_ids=*/
+                socket_endpoint_type_ == SocketEndpoint::RECEIVER ? remote_endpoint_desc.local_chip_ids
+                                                                  : std::vector<uint32_t>{},
+                /*peer_receiver_chip_ids=*/
+                socket_endpoint_type_ == SocketEndpoint::SENDER ? remote_endpoint_desc.local_chip_ids
+                                                                : std::vector<uint32_t>{});
         } else {
             remote_endpoint_desc = receive_and_verify_descriptor_from_peer(
                 local_endpoint_desc, socket_endpoint_type_, context, rank_translation_table_);
             forward_descriptor_to_peer(local_endpoint_desc, socket_endpoint_type_, context, rank_translation_table_);
-            fabric_node_id_map_ = generate_fabric_node_id_map(config_);
+            fabric_node_id_map_ = generate_fabric_node_id_map(
+                config_,
+                /*sender_device=*/nullptr,
+                /*receiver_device=*/nullptr,
+                /*peer_sender_chip_ids=*/
+                socket_endpoint_type_ == SocketEndpoint::RECEIVER ? remote_endpoint_desc.local_chip_ids
+                                                                  : std::vector<uint32_t>{},
+                /*peer_receiver_chip_ids=*/
+                socket_endpoint_type_ == SocketEndpoint::SENDER ? remote_endpoint_desc.local_chip_ids
+                                                                : std::vector<uint32_t>{});
         }
         write_socket_configs(config_buffer_, local_endpoint_desc, remote_endpoint_desc, socket_endpoint_type_);
 
@@ -301,6 +337,40 @@ void MeshSocket::connect_with_peer(const std::shared_ptr<multihost::DistributedC
         std::vector<Rank> recv_ranks = get_ranks_for_mesh_id(config_.receiver_mesh_id.value(), rank_translation_table_);
         execute_with_timeout([&]() { barrier_across_send_recv_ranks(sender_ranks, recv_ranks, context); });
     }
+}
+
+MeshSocket MeshSocket::create_mirror(
+    const std::shared_ptr<MeshDevice>& device, const SocketConfig& config, SocketEndpoint endpoint) {
+    TT_FATAL(!config.socket_connection_config.empty(), "Socket connection config cannot be empty.");
+    TT_FATAL(
+        socket_uses_rank_scoped_semantics(config),
+        "create_mirror is only meaningful for a rank-scoped socket (one built from explicit "
+        "sender/receiver ranks); a mesh-scoped socket already allocates on every rank bound to the "
+        "endpoint mesh, so its co-owners are never skipped.");
+    // Same context the constructor resolves the local rank against.
+    const auto& context =
+        config.distributed_context ? config.distributed_context : DistributedContext::get_current_world();
+    const auto current_rank = *context->rank();
+    TT_FATAL(
+        current_rank != *config.sender_rank && current_rank != *config.receiver_rank,
+        "Rank {} is the socket's own {} -- it must construct the real MeshSocket, not a mirror.",
+        current_rank,
+        (current_rank == *config.sender_rank) ? "sender" : "receiver");
+
+    // The same buffers, in the same order, as the endpoint rank allocates in the constructor above:
+    // the config buffer for either endpoint, plus the data buffer for a receiver. Both are sized
+    // from the connection config, the endpoint type and the device's core grid -- never from the
+    // mesh ids -- so a mirror needs no mesh-id resolution to match the endpoint byte for byte.
+    auto config_buffer = create_socket_config_buffer(device, config, endpoint);
+    std::shared_ptr<MeshBuffer> data_buffer =
+        (endpoint == SocketEndpoint::RECEIVER) ? create_socket_data_buffer(device, config) : nullptr;
+
+    auto socket = MeshSocket(std::move(data_buffer), std::move(config_buffer), config, endpoint);
+    socket.rank_scoped_socket_ = true;
+    socket.is_mirror_ = true;
+    // No connect_with_peer: the descriptor exchange and its barrier run strictly between
+    // sender_rank and receiver_rank, and this rank is neither.
+    return socket;
 }
 
 std::pair<MeshSocket, MeshSocket> MeshSocket::create_socket_pair(
@@ -339,6 +409,10 @@ std::pair<MeshSocket, MeshSocket> MeshSocket::create_socket_pair(
 
 std::shared_ptr<MeshBuffer> MeshSocket::get_data_buffer() const {
     TT_FATAL(data_buffer_, "Cannot access the data buffer for a sender socket.");
+    TT_FATAL(
+        !is_mirror_,
+        "Cannot access the data buffer of a mirror socket: its buffers only hold an allocation for a co-owning "
+        "rank and were never handshaked with a peer.");
     return data_buffer_;
 };
 
