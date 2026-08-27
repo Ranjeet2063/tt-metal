@@ -37,8 +37,9 @@ struct ReduceParams {
     // Accurate fp32: route Float32 through the SFPU (full fp32); set from
     // fast_and_approximate_mode=False on sum/mean/max/min.
     bool use_sfpu_reduce{false};
-    // Number of contiguous H segments to reduce independently (RM-H dense path; 1 = no split).
-    // Spreads a tall-H reduce over more cores, yielding a (N, C, num_h_slices, W) partial.
+    // Number of contiguous H segments to reduce independently (1 = no split). Spreads a tall-H
+    // reduce over more cores, yielding a (N, C, num_h_slices, W) partial. Set on the RM-H dense
+    // path and on stage 1 of the TILE H-axis split.
     uint32_t num_h_slices{1};
     // Physical layout the op must produce: TILE on the tilized paths, ROW_MAJOR on the dense RM
     // ones, or TILE from RM-H when num_h_slices == 1.

@@ -407,12 +407,15 @@ Tensor reduce(
     // NC*Wt columns. Stage 1 keeps the tiled reader + reduce.cpp but emits (N,C,S,W) FP32
     // ROW_MAJOR partials — a TILE partial would put up to TILE_HEIGHT slices inside one page,
     // which independent cores cannot write. Stage 2 is then the same RM dense H collapse the
-    // ROW_MAJOR split already uses.
+    // ROW_MAJOR split already uses. Block-float rides along at both ends: the input crosses the
+    // reader as whole tiles, the partials are FP32, and a block-float result is packed by stage 2's
+    // whole-tile write.
     if (prepared_input.layout() == tt::tt_metal::Layout::TILE && reduce_dim == tt::tt_metal::ReduceOpDim::H &&
         (reduce_math == tt::tt_metal::ReduceOpMath::AVG || reduce_math == tt::tt_metal::ReduceOpMath::SUM) && !negate &&
         both_interleaved && !prepared_input.shard_spec().has_value() && prepared_input.logical_shape().rank() == 4 &&
         (prepared_input.dtype() == tt::tt_metal::DataType::BFLOAT16 ||
-         prepared_input.dtype() == tt::tt_metal::DataType::FLOAT32)) {
+         prepared_input.dtype() == tt::tt_metal::DataType::FLOAT32 ||
+         tt::tt_metal::is_block_float(prepared_input.dtype()))) {
         const auto& logical = prepared_input.logical_shape();
         const auto& padded = prepared_input.padded_shape();
         const uint32_t tile_h = prepared_input.tensor_spec().tile().get_height();

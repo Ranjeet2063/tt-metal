@@ -258,6 +258,48 @@ def test_tile_reduce_h_axis_split(device, reduce_op, dtype, keepdim, shape):
     )
 
 
+# Block-float takes the same split: the input crosses the reader as whole tiles and stage 2 packs
+# the result whole, so neither end needs the per-datum size that block-float cannot supply. The
+# per-column scale keeps the reduced row from collapsing to a constant, which PCC cannot score.
+@pytest.mark.parametrize("reduce_op", ["mean", "sum"])
+@pytest.mark.parametrize("keepdim", [False, True])
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (1, 1, 12544, 32),  # EfficientNetB0 SE global-pool; Wt=1, un-split this is a single core
+        (1, 1, 3136, 96),  # EfficientNetB0 SE global-pool; Wt=3
+        (1, 1, 3216, 128),  # non-aligned H → trailing slices past the end (identity pad)
+    ],
+)
+def test_tile_reduce_h_axis_split_block_float(device, reduce_op, keepdim, shape):
+    """H reduce on tall block-float TILE input — same two stages, block-float in and out."""
+    torch.manual_seed(0)
+    torch_input = torch.rand(shape, dtype=torch.bfloat16) * torch.linspace(0.25, 4.0, shape[-1], dtype=torch.bfloat16)
+
+    tt_input = ttnn.from_torch(torch_input, dtype=ttnn.bfloat8_b, layout=ttnn.TILE_LAYOUT, device=device)
+    # Reference from the round-tripped input: against the pre-quantization tensor this would be
+    # measuring from_torch, not the reduce.
+    torch_op = torch.mean if reduce_op == "mean" else torch.sum
+    torch_ref = torch_op(ttnn.to_torch(tt_input).float(), dim=-2, keepdim=keepdim)
+
+    ttnn_op = ttnn.mean if reduce_op == "mean" else ttnn.sum
+    tt_output = ttnn_op(tt_input, dim=-2, keepdim=keepdim)
+    assert tt_output.dtype == ttnn.bfloat8_b
+    assert tt_output.layout == ttnn.TILE_LAYOUT
+
+    # Tolerances are set by the bfloat8_b pack of the result, not by the split: stage 1 accumulates
+    # in FP32, so the error here is at or below the un-split path's.
+    assert_numeric_metrics(
+        torch_ref,
+        ttnn.to_torch(tt_output).float(),
+        pcc_threshold=0.999,
+        rtol=0.02,
+        atol=0.02,
+        frobenius_threshold=0.01,
+        check_ulp=False,
+    )
+
+
 # Partials are always ROW_MAJOR, so output_layout only selects what the final combine stage emits —
 # orthogonal to dtype, so bfloat16 alone covers it.
 @pytest.mark.parametrize("reduce_op", ["mean", "sum"])
