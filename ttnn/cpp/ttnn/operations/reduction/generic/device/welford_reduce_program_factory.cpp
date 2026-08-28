@@ -309,6 +309,8 @@ tt::tt_metal::ProgramDescriptor WelfordReduceDeviceOperation::WelfordReduceProgr
     }
 
     // --- Reader kernel ---
+    // Shared readers take scaler as a runtime arg (same layout as the reduce factories).
+    // Still hashed here; phase 3 of #54180 will exclude it.
     uint32_t scaler_bits = std::bit_cast<uint32_t>(operation_attributes.scalar);
     KernelDescriptor reader_desc;
     reader_desc.source_type = KernelDescriptor::SourceType::FILE_PATH;
@@ -323,8 +325,7 @@ tt::tt_metal::ProgramDescriptor WelfordReduceDeviceOperation::WelfordReduceProgr
         // order: all Ht tiles of column 0, then all Ht tiles of column 1, etc.
         // enable_fp32_sfpu=0: Welford never uses the fp32-SFPU reduce path (use_welford=1 forces
         // row_chunk=1). The slot keeps this reader's CT-arg layout in lockstep with the reduce factories.
-        std::vector<uint32_t> reader_compile_time_args = {
-            Ht, Wt, HtWt, scaler_bits, /*use_welford=*/1, /*enable_fp32_sfpu=*/0u};
+        std::vector<uint32_t> reader_compile_time_args = {Ht, Wt, HtWt, /*use_welford=*/1, /*enable_fp32_sfpu=*/0u};
         TensorAccessorArgs(input).append_to(reader_compile_time_args);
         reader_desc.kernel_source =
             "ttnn/cpp/ttnn/operations/reduction/generic/device/kernels/dataflow/"
@@ -332,7 +333,7 @@ tt::tt_metal::ProgramDescriptor WelfordReduceDeviceOperation::WelfordReduceProgr
         reader_desc.compile_time_args = reader_compile_time_args;
     } else {
         // W-reduce: sequential reader reads tiles row by row.
-        std::vector<uint32_t> reader_compile_time_args = {scaler_bits};
+        std::vector<uint32_t> reader_compile_time_args = {};
         TensorAccessorArgs(input).append_to(reader_compile_time_args);
         reader_desc.kernel_source =
             "ttnn/cpp/ttnn/operations/reduction/generic/device/kernels/dataflow/"
@@ -510,7 +511,7 @@ tt::tt_metal::ProgramDescriptor WelfordReduceDeviceOperation::WelfordReduceProgr
             }
             uint32_t num_input_tiles_per_core = num_work_units_per_core * Wt;
             uint32_t num_output_tiles_per_core = num_work_units_per_core;
-            reader_desc.emplace_runtime_args(core, {input, num_input_tiles_per_core, input_tiles_offset});
+            reader_desc.emplace_runtime_args(core, {input, num_input_tiles_per_core, input_tiles_offset, scaler_bits});
             (in_g1 ? compute_desc_g1 : *compute_desc_g2)
                 .runtime_args.emplace_back(core, KernelDescriptor::CoreRuntimeArgs{num_work_units_per_core});
             writer_desc.emplace_runtime_args(core, {output, num_output_tiles_per_core, output_tiles_offset});
@@ -549,7 +550,8 @@ tt::tt_metal::ProgramDescriptor WelfordReduceDeviceOperation::WelfordReduceProgr
                 {input,
                  col_start_tile_id,
                  /*curr_col_in_batch=*/0u,
-                 num_cols});
+                 num_cols,
+                 scaler_bits});
             // Compute: runtime arg is total NC slices (not num_outputs).
             (in_g1 ? compute_desc_g1 : *compute_desc_g2)
                 .runtime_args.emplace_back(core, KernelDescriptor::CoreRuntimeArgs{nc_slices_per_core});
@@ -578,7 +580,11 @@ tt::tt_metal::ProgramDescriptor WelfordReduceDeviceOperation::WelfordReduceProgr
             }
             reader_desc.emplace_runtime_args(
                 core,
-                {input, (num_cols_read / Wt * HtWt) + (num_cols_read % Wt), num_cols_read % Wt, num_cols_per_core});
+                {input,
+                 (num_cols_read / Wt * HtWt) + (num_cols_read % Wt),
+                 num_cols_read % Wt,
+                 num_cols_per_core,
+                 scaler_bits});
             (in_g1 ? compute_desc_g1 : *compute_desc_g2)
                 .runtime_args.emplace_back(core, KernelDescriptor::CoreRuntimeArgs{num_cols_per_core});
             writer_desc.emplace_runtime_args(core, {output, num_cols_per_core, num_cols_read});

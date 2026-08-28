@@ -26,10 +26,6 @@
 #include "ttnn/cpp/ttnn/kernel_lib/reduce_helpers_compute.hpp"
 #include "ttnn/cpp/ttnn/kernel_lib/tilize_helpers.hpp"
 
-#ifdef REDUCE_POST_MUL
-#include "api/compute/eltwise_unary/binop_with_scalar.h"
-#endif
-
 namespace {
 
 constexpr uint32_t cb_rm = tt::CBIndex::c_24;
@@ -47,14 +43,19 @@ constexpr auto rm_reconfig_mode =
     compute_kernel_lib::ReduceDataFormatReconfigMode::INPUT;
 #endif
 
-// Accurate fp32: CT arg 6 routes Float32 through the SFPU (full fp32) instead of the FPU (tf32).
-constexpr auto fp32_mode = get_compile_time_arg_val(6) != 0 ? ReduceFp32Mode::Accurate : ReduceFp32Mode::Fast;
+// Accurate fp32: CT arg 5 routes Float32 through the SFPU (full fp32) instead of the FPU (tf32).
+constexpr auto fp32_mode = get_compile_time_arg_val(5) != 0 ? ReduceFp32Mode::Accurate : ReduceFp32Mode::Fast;
 
 // One reduce() call over the (ht_in_chunk × wt_in_chunk × NC) block currently staged in cb_tile_in.
 // is_last_chunk == true packs the final result into cb_out (with optional post-mul); otherwise the
 // partial is left in cb_acc at index chunk_idx and accumulation continues on the next call.
 FORCE_INLINE void reduce_block(
-    uint32_t ht_in_chunk, uint32_t wt_in_chunk, uint32_t NC, uint32_t chunk_idx, bool is_last_chunk) {
+    uint32_t ht_in_chunk,
+    uint32_t wt_in_chunk,
+    uint32_t NC,
+    uint32_t chunk_idx,
+    bool is_last_chunk,
+    uint32_t post_mul_scaler_bits) {
     if (is_last_chunk) {
         compute_kernel_lib::reduce<
             REDUCE_OP,
@@ -68,16 +69,10 @@ FORCE_INLINE void reduce_block(
             compute_kernel_lib::ReduceInputBlockShape::of(ht_in_chunk, wt_in_chunk, NC),
             compute_kernel_lib::ReduceInputMemoryLayout::contiguous(),
             compute_kernel_lib::Accumulate::at(cb_acc, chunk_idx),
-#ifdef REDUCE_POST_MUL
-            [](uint32_t dst_idx) {
-                constexpr uint32_t post_mul_scaler_bits = get_compile_time_arg_val(3);
-                binop_with_scalar_tile_init();
-                mul_unary_tile(dst_idx, post_mul_scaler_bits);
-            }
-#else
-            compute_kernel_lib::NoOp{}
-#endif
-        );
+            [post_mul_scaler_bits](uint32_t dst_idx) {
+                constexpr DataFormat reduce_format = static_cast<DataFormat>(unpack_src_format[cb_tile_in]);
+                compute_kernel_lib::detail::reduce_post_mul_tile<reduce_format>(dst_idx, post_mul_scaler_bits);
+            });
     } else {
         compute_kernel_lib::reduce<
             REDUCE_OP,
@@ -103,10 +98,10 @@ void kernel_main() {
     constexpr uint32_t Ht = get_compile_time_arg_val(0);
     constexpr uint32_t Wt = get_compile_time_arg_val(1);
     constexpr uint32_t NC = get_compile_time_arg_val(2);
-    constexpr uint32_t wt_tiles_per_chunk = get_compile_time_arg_val(4);
-    constexpr uint32_t ht_tiles_per_chunk = get_compile_time_arg_val(5);
-    // arg(3) = post_mul_scaler_bits — captured inside reduce_block() under REDUCE_POST_MUL.
-    // arg(6) = accurate-fp32 flag — consumed by fp32_mode above.
+    constexpr uint32_t wt_tiles_per_chunk = get_compile_time_arg_val(3);
+    constexpr uint32_t ht_tiles_per_chunk = get_compile_time_arg_val(4);
+    // arg(5) = accurate-fp32 flag — consumed by fp32_mode above.
+    const uint32_t post_mul_scaler_bits = get_arg_val<uint32_t>(0);
 
     compute_kernel_hw_startup(cb_rm, cb_tile_in);
 
@@ -124,7 +119,7 @@ void kernel_main() {
 
                 compute_kernel_lib::tilize<wt_tiles_per_chunk, cb_rm, cb_tile_in>(
                     ht_in_chunk, ht_in_chunk * tt::constants::TILE_HEIGHT);
-                reduce_block(ht_in_chunk, wt_tiles_per_chunk, NC, chunk_idx, is_last_chunk);
+                reduce_block(ht_in_chunk, wt_tiles_per_chunk, NC, chunk_idx, is_last_chunk, post_mul_scaler_bits);
                 ++chunk_idx;
             }
         }
@@ -133,12 +128,12 @@ void kernel_main() {
         // === H reduce path ===
         //
         // chunk_idx resets per output tile and advances per H chunk; cb_acc holds wt_tiles_per_chunk
-        // (== 1 in current factory) partial tile(s) per output. Runtime arg 1 (start_output_tile_id)
+        // (== 1 in current factory) partial tile(s) per output. Runtime arg 2 (start_output_tile_id)
         // is unused on the compute side now that wt_in_chunk is the compile-time constant.
         //
-        const uint32_t num_output_tiles_local = get_arg_val<uint32_t>(0);
+        const uint32_t num_output_tiles_local = get_arg_val<uint32_t>(1);
 
-        constexpr uint32_t Ht_total = Ht;  // For H reduce, arg(0) IS the total Ht.
+        constexpr uint32_t Ht_total = Ht;  // For H reduce, compile-time arg 0 IS the total Ht.
 
         for (uint32_t out_idx = 0; out_idx < num_output_tiles_local; ++out_idx) {
             uint32_t chunk_idx = 0;
@@ -149,7 +144,7 @@ void kernel_main() {
 
                 compute_kernel_lib::tilize<wt_tiles_per_chunk, cb_rm, cb_tile_in>(
                     ht_in_chunk, ht_in_chunk * tt::constants::TILE_HEIGHT);
-                reduce_block(ht_in_chunk, wt_tiles_per_chunk, NC, chunk_idx, is_last_chunk);
+                reduce_block(ht_in_chunk, wt_tiles_per_chunk, NC, chunk_idx, is_last_chunk, post_mul_scaler_bits);
                 ++chunk_idx;
             }
         }

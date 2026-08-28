@@ -217,6 +217,17 @@ ReduceDeviceOperation::spec_return_value_t ReduceDeviceOperation::compute_output
         operation_attributes.output_layout);
 }
 
+ttsl::hash::hash_t ReduceDeviceOperation::compute_program_hash(
+    const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
+    // Zero the scalars so the cache keys on scaler_mode, not the value. Copy the attributes so
+    // new fields stay hashed automatically. override_runtime_arguments re-applies the scalars.
+    operation_attributes_t hashed_attributes = operation_attributes;
+    hashed_attributes.scaler = 0.0f;
+    hashed_attributes.post_mul_scaler = 0.0f;
+    return ttsl::hash::hash_objects_with_default_seed(
+        ttsl::hash::type_hash<ReduceDeviceOperation>, hashed_attributes, tensor_args);
+}
+
 ReduceDeviceOperation::tensor_return_value_t ReduceDeviceOperation::create_output_tensors(
     const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
     return create_device_tensor(compute_output_specs(operation_attributes, tensor_args), tensor_args.device());
@@ -233,11 +244,33 @@ ttnn::Tensor reduce(
     const std::optional<CoreRangeSet>& sub_core_grids,
     bool negate,
     float post_mul_scaler,
+    ScalerMode scaler_mode,
     bool row_major_w_dense_path,
     bool row_major_h_dense_path,
     bool use_sfpu_reduce,
     uint32_t num_h_slices,
     tt::tt_metal::Layout output_layout) {
+    // scaler_mode is hashed, the floats are not — check the live float matches the mode on every
+    // call (a new scalar no longer misses the cache).
+    const bool is_max_or_min =
+        reduce_math == tt::tt_metal::ReduceOpMath::MAX || reduce_math == tt::tt_metal::ReduceOpMath::MIN;
+    TT_FATAL(
+        !is_max_or_min || scaler_mode != ScalerMode::ScalerTile,
+        "MAX/MIN must use PostMul (GMPOOL keeps only the scaler exponent)");
+    TT_FATAL(
+        scaler_mode != ScalerMode::None || (scaler == 1.0f && post_mul_scaler == 1.0f),
+        "ScalerMode::None applies no scalar, but got scaler={} post_mul={}",
+        scaler,
+        post_mul_scaler);
+    TT_FATAL(
+        scaler_mode != ScalerMode::ScalerTile || post_mul_scaler == 1.0f,
+        "ScalerMode::ScalerTile applies the scaler tile, but post_mul={}",
+        post_mul_scaler);
+    TT_FATAL(
+        scaler_mode != ScalerMode::PostMul || scaler == 1.0f,
+        "ScalerMode::PostMul applies the scalar after reduce, but the scaler tile got {}",
+        scaler);
+
     return ttnn::device_operation::launch<ReduceDeviceOperation>(
         ReduceParams{
             reduce_math,
@@ -249,6 +282,7 @@ ttnn::Tensor reduce(
             sub_core_grids,
             negate,
             post_mul_scaler,
+            scaler_mode,
             row_major_w_dense_path,
             row_major_h_dense_path,
             use_sfpu_reduce,

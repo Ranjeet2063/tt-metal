@@ -39,11 +39,8 @@ tt::tt_metal::ProgramDescriptor ReduceDeviceOperation::ReduceSingleCoreHwProgram
         "ReduceSingleCoreHwProgramFactory supports HW dim only, got dim enum value {}",
         static_cast<int>(operation_attributes.dim));
 
-    // The single-core HW path uses REDUCE_SCALAR mode, which applies the
-    // scaler twice internally (once per dimension). Here we compensate with
-    // sqrt(scaler). However, sqrt of a negative number is NaN, so negative scalers
-    // must not reach this code path. Instead negative scalers are handled via the two-step
-    // W-then-H path where the scaler is applied once (see the reduce function in reduce_op.cpp).
+    // REDUCE_SCALAR applies the scaler once per dim, so the reader gets sqrt(scaler). Negative
+    // scalars cannot use this path (sqrt is NaN) and take the two-step W-then-H path instead.
     TT_FATAL(operation_attributes.scaler >= 0, "Scalar must be non-negative");
     float scaler = std::sqrt(operation_attributes.scaler);
 
@@ -115,13 +112,9 @@ tt::tt_metal::ProgramDescriptor ReduceDeviceOperation::ReduceSingleCoreHwProgram
         }}},
     });
 
-    // For min/max with non-unity scalar, the GMPOOL hardware path only respects the scaler's
-    // exponent, so the device reduces with scaler=1.0 and the user scalar is applied after the
-    // reduction via SFPU mul_unary_tile inside the compute kernel.
-    const bool use_post_mul = operation_attributes.post_mul_scaler != 1.0f;
-    uint32_t post_mul_scaler_bits = std::bit_cast<uint32_t>(operation_attributes.post_mul_scaler);
+    const uint32_t post_mul_scaler_bits = std::bit_cast<uint32_t>(operation_attributes.post_mul_scaler);
 
-    std::vector<uint32_t> reader_compile_time_args = {std::bit_cast<uint32_t>(scaler)};
+    std::vector<uint32_t> reader_compile_time_args = {};
     TensorAccessorArgs(a).append_to(reader_compile_time_args);
 
     if (operation_attributes.negate) {
@@ -155,9 +148,6 @@ tt::tt_metal::ProgramDescriptor ReduceDeviceOperation::ReduceSingleCoreHwProgram
 
     std::map<std::string, std::string> reduce_defines =
         reduce_op_utils::get_defines(operation_attributes.math_op, tt::tt_metal::ReduceOpDim::HW);
-    if (use_post_mul) {
-        reduce_defines["REDUCE_POST_MUL"] = "1";
-    }
 
     KernelDescriptor reader_desc;
     reader_desc.kernel_source =
@@ -178,11 +168,10 @@ tt::tt_metal::ProgramDescriptor ReduceDeviceOperation::ReduceSingleCoreHwProgram
     writer_desc.config = WriterConfigDescriptor{};
 
     std::vector<uint32_t> compute_kernel_args = {
-        Ht,                    // Ht
-        Wt,                    // Wt
-        NC,                    // NC
-        post_mul_scaler_bits,  // packed fp32 user scalar (only used if REDUCE_POST_MUL is set)
-        0u,                    // enable_fp32_sfpu: always 0 (accurate fp32 HW is forced to the two-step W-then-H path)
+        Ht,  // Ht
+        Wt,  // Wt
+        NC,  // NC
+        0u,  // enable_fp32_sfpu: always 0 (accurate fp32 HW is forced to the two-step W-then-H path)
     };
 
     const std::string compute_kernel =
@@ -200,7 +189,7 @@ tt::tt_metal::ProgramDescriptor ReduceDeviceOperation::ReduceSingleCoreHwProgram
         .fp32_dest_acc_en = fp32_dest_acc_en,
     };
 
-    reader_desc.emplace_runtime_args(selected_core_coord, {a, num_tensor_tiles, 0u});
+    reader_desc.emplace_runtime_args(selected_core_coord, {a, num_tensor_tiles, 0u, std::bit_cast<uint32_t>(scaler)});
 
     TT_FATAL(Ht != 0 && Wt != 0, "Height and width in tiles must be non-zero (Ht={}, Wt={}, H={}, W={})", Ht, Wt, H, W);
     uint32_t out_dim_divider = Ht * Wt;
@@ -211,12 +200,30 @@ tt::tt_metal::ProgramDescriptor ReduceDeviceOperation::ReduceSingleCoreHwProgram
         out_dim_divider);
 
     writer_desc.emplace_runtime_args(selected_core_coord, {output, num_tensor_tiles / out_dim_divider, 0u});
+    compute_desc.emplace_runtime_args(selected_core_coord, {post_mul_scaler_bits});
 
     desc.kernels.push_back(std::move(reader_desc));
     desc.kernels.push_back(std::move(writer_desc));
     desc.kernels.push_back(std::move(compute_desc));
 
     return desc;
+}
+
+void ReduceDeviceOperation::ReduceSingleCoreHwProgramFactory::override_runtime_arguments(
+    tt::tt_metal::Program& program,
+    const operation_attributes_t& operation_attributes,
+    const tensor_args_t& tensor_args,
+    tensor_return_value_t& tensor_return_value,
+    const std::optional<ttnn::MeshCoordinate>& /*mesh_dispatch_coordinate*/) {
+    enum : uint32_t { kReader = 0, kWriter = 1, kCompute = 2 };
+    const uint32_t scaler_bits = std::bit_cast<uint32_t>(std::sqrt(operation_attributes.scaler));
+    patch_cached_runtime_args(
+        program,
+        kReader,
+        {{0, tensor_args.mesh_tensor().mesh_buffer().get_reference_buffer()->address()}, {3, scaler_bits}});
+    patch_cached_runtime_args(
+        program, kWriter, {{0, tensor_return_value.mesh_tensor().mesh_buffer().get_reference_buffer()->address()}});
+    patch_cached_runtime_args(program, kCompute, {{0, std::bit_cast<uint32_t>(operation_attributes.post_mul_scaler)}});
 }
 
 }  // namespace ttnn::prim

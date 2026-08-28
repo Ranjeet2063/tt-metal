@@ -4,9 +4,12 @@
 
 #pragma once
 
+#include <optional>
 #include <variant>
 
 #include "ttnn/tensor/tensor.hpp"
+
+#include <tt-metalium/program.hpp>
 
 #include "reduce_op_device_operation_types.hpp"
 #include "tt_stl/reflection.hpp"
@@ -26,6 +29,14 @@ struct ReduceDeviceOperation {
             const operation_attributes_t& operation_attributes,
             const tensor_args_t& tensor_args,
             tensor_return_value_t& tensor_return_value);
+
+        // Re-patch buffer addresses and hash-excluded scalars on a cache hit.
+        static void override_runtime_arguments(
+            tt::tt_metal::Program& program,
+            const operation_attributes_t& operation_attributes,
+            const tensor_args_t& tensor_args,
+            tensor_return_value_t& tensor_return_value,
+            const std::optional<ttnn::MeshCoordinate>& mesh_dispatch_coordinate = std::nullopt);
     };
 
     struct ReduceMultiCoreHProgramFactory {
@@ -33,6 +44,14 @@ struct ReduceDeviceOperation {
             const operation_attributes_t& operation_attributes,
             const tensor_args_t& tensor_args,
             tensor_return_value_t& tensor_return_value);
+
+        // Re-patch buffer addresses and hash-excluded scalars on a cache hit.
+        static void override_runtime_arguments(
+            tt::tt_metal::Program& program,
+            const operation_attributes_t& operation_attributes,
+            const tensor_args_t& tensor_args,
+            tensor_return_value_t& tensor_return_value,
+            const std::optional<ttnn::MeshCoordinate>& mesh_dispatch_coordinate = std::nullopt);
     };
 
     struct ReduceMultiCoreWProgramFactory {
@@ -40,6 +59,14 @@ struct ReduceDeviceOperation {
             const operation_attributes_t& operation_attributes,
             const tensor_args_t& tensor_args,
             tensor_return_value_t& tensor_return_value);
+
+        // Re-patch buffer addresses and hash-excluded scalars on a cache hit.
+        static void override_runtime_arguments(
+            tt::tt_metal::Program& program,
+            const operation_attributes_t& operation_attributes,
+            const tensor_args_t& tensor_args,
+            tensor_return_value_t& tensor_return_value,
+            const std::optional<ttnn::MeshCoordinate>& mesh_dispatch_coordinate = std::nullopt);
     };
 
     using program_factory_t =
@@ -49,6 +76,10 @@ struct ReduceDeviceOperation {
         const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args);
 
     static void validate_on_program_cache_miss(
+        const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args);
+
+    // Hash shape/dtype/op and scaler_mode, never the scalar values (they are runtime args).
+    static ttsl::hash::hash_t compute_program_hash(
         const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args);
 
     static spec_return_value_t compute_output_specs(
@@ -69,6 +100,7 @@ ttnn::Tensor reduce(
     const std::optional<CoreRangeSet>& sub_core_grids,
     bool negate = false,
     float post_mul_scaler = 1.0f,
+    ScalerMode scaler_mode = ScalerMode::ScalerTile,
     bool row_major_w_dense_path = false,
     bool row_major_h_dense_path = false,
     bool use_sfpu_reduce = false,

@@ -17,6 +17,29 @@
 
 namespace ttnn::prim {
 
+namespace {
+
+bool is_height_sharded(const tt::tt_metal::MeshTensor& a, const tt::tt_metal::MeshTensor& output, bool rm_path) {
+    if (rm_path || !a.shard_spec().has_value() || !output.shard_spec().has_value()) {
+        return false;
+    }
+    const auto& shape = a.padded_shape();
+    const uint32_t tile_h = a.tensor_spec().tile().get_height();
+    const uint32_t shard_Ht = a.shard_spec()->shape[0] / tile_h;
+    const bool layouts_match =
+        a.memory_config().memory_layout() == tt::tt_metal::TensorMemoryLayout::HEIGHT_SHARDED &&
+        output.memory_config().memory_layout() == tt::tt_metal::TensorMemoryLayout::HEIGHT_SHARDED;
+    const bool specs_match = a.shard_spec()->grid == output.shard_spec()->grid &&
+                             a.shard_spec()->shape[0] == output.shard_spec()->shape[0] &&
+                             a.shard_spec()->orientation == output.shard_spec()->orientation;
+    const uint32_t NC = shape[0] * shape[1];
+    const uint32_t Ht = tt::div_up(shape[2], tile_h);
+    const bool tiles_exactly = shard_Ht * a.shard_spec()->grid.num_cores() == NC * Ht;
+    return layouts_match && specs_match && tiles_exactly;
+}
+
+}  // namespace
+
 tt::tt_metal::ProgramDescriptor ReduceDeviceOperation::ReduceMultiCoreWProgramFactory::create_descriptor(
     const operation_attributes_t& operation_attributes,
     const tensor_args_t& tensor_args,
@@ -40,13 +63,7 @@ tt::tt_metal::ProgramDescriptor ReduceDeviceOperation::ReduceMultiCoreWProgramFa
     // gathering tiles over the NoC. Needs matching shard grid, height and orientation, plus shards
     // that tile the tensor exactly; anything else falls through to the generic path.
     const uint32_t shard_Ht = a.shard_spec().has_value() ? a.shard_spec()->shape[0] / tile_height : 0;
-    const bool use_height_sharding =
-        !rm_path && a.memory_config().memory_layout() == TensorMemoryLayout::HEIGHT_SHARDED &&
-        output.memory_config().memory_layout() == TensorMemoryLayout::HEIGHT_SHARDED && a.shard_spec().has_value() &&
-        output.shard_spec().has_value() && a.shard_spec()->grid == output.shard_spec()->grid &&
-        a.shard_spec()->shape[0] == output.shard_spec()->shape[0] &&
-        a.shard_spec()->orientation == output.shard_spec()->orientation &&
-        shard_Ht * a.shard_spec()->grid.num_cores() == NC * Ht;
+    const bool use_height_sharding = is_height_sharded(a, output, rm_path);
 
     if (rm_path) {
         validate_rm_preconditions(
@@ -213,11 +230,7 @@ tt::tt_metal::ProgramDescriptor ReduceDeviceOperation::ReduceMultiCoreWProgramFa
         .tensor = use_height_sharding ? &output : nullptr,
     });
 
-    // For min/max with non-unity scalar, the GMPOOL hardware path only respects the scaler's
-    // exponent, so the device reduces with scaler=1.0 and the user scalar is applied after the
-    // reduction via SFPU mul_unary_tile inside the compute kernel.
-    const bool use_post_mul = operation_attributes.post_mul_scaler != 1.0f;
-    uint32_t post_mul_scaler_bits = std::bit_cast<uint32_t>(operation_attributes.post_mul_scaler);
+    const uint32_t post_mul_scaler_bits = std::bit_cast<uint32_t>(operation_attributes.post_mul_scaler);
 
     // Int32 max/min/sum use the SFPU reduce path; fp32 SUM only for the accurate mean opt-in.
     const bool is_sfpu_reduce =
@@ -226,13 +239,11 @@ tt::tt_metal::ProgramDescriptor ReduceDeviceOperation::ReduceMultiCoreWProgramFa
 
     std::vector<uint32_t> reader_compile_time_args;
     if (rm_path) {
-        reader_compile_time_args = build_rm_reader_ct_args(
-            plan, std::bit_cast<uint32_t>(operation_attributes.scaler), a, ReduceOpDim::W);
+        reader_compile_time_args = build_rm_reader_ct_args(plan, a, ReduceOpDim::W);
     } else if (use_height_sharding) {
-        reader_compile_time_args = {
-            src0_cb_index, src1_cb_index, CBIndex::c_2, std::bit_cast<uint32_t>(operation_attributes.scaler)};
+        reader_compile_time_args = {src0_cb_index, src1_cb_index, CBIndex::c_2};
     } else {
-        reader_compile_time_args = {std::bit_cast<uint32_t>(operation_attributes.scaler)};
+        reader_compile_time_args = {};
         TensorAccessorArgs(a).append_to(reader_compile_time_args);
     }
 
@@ -274,9 +285,6 @@ tt::tt_metal::ProgramDescriptor ReduceDeviceOperation::ReduceMultiCoreWProgramFa
 
     std::map<std::string, std::string> reduce_defines =
         reduce_op_utils::get_defines(operation_attributes.math_op, ReduceOpDim::W);
-    if (use_post_mul) {
-        reduce_defines["REDUCE_POST_MUL"] = "1";
-    }
     // Accurate fp32: route Float32 through the SFPU (needs 32-bit DEST)
     const bool fp32_sfpu_reduce = is_sfpu_reduce && a.dtype() == DataType::FLOAT32 && fp32_dest_acc_en;
 
@@ -327,18 +335,16 @@ tt::tt_metal::ProgramDescriptor ReduceDeviceOperation::ReduceMultiCoreWProgramFa
         rm_path ? (num_rows_per_core_group_2 + plan.rm_rows_per_tile - 1) / plan.rm_rows_per_tile
                 : num_rows_per_core_group_2;
 
-    // reduce_rm.cpp expects {Ht, Wt, nc_per_reduce, post_mul_bits, wt_chunk, ht_chunk};
-    // reduce.cpp / reduce_w_neg.cpp expect {Ht, Wt, NC, post_mul_bits}.
+    // reduce_rm.cpp expects {Ht, Wt, nc_per_reduce, wt_chunk, ht_chunk, fp32};
+    // reduce.cpp / reduce_w_neg.cpp expect {Ht, Wt, NC, fp32}. Post-mul scaler is runtime arg 0.
     std::vector<uint32_t> compute_kernel_args_group_1;
     if (rm_path) {
-        compute_kernel_args_group_1 =
-            build_rm_compute_ct_args(plan, ht_per_core_group_1, post_mul_scaler_bits, fp32_sfpu_reduce);
+        compute_kernel_args_group_1 = build_rm_compute_ct_args(plan, ht_per_core_group_1, fp32_sfpu_reduce);
     } else {
         compute_kernel_args_group_1 = {
             ht_per_core_group_1,         // Ht
             Wt,                          // Wt
             1,                           // NC
-            post_mul_scaler_bits,        // packed fp32 user scalar (only used if REDUCE_POST_MUL is set)
             fp32_sfpu_reduce ? 1u : 0u,  // enable_fp32_sfpu: route Float32 through the SFPU
         };
     }
@@ -366,14 +372,12 @@ tt::tt_metal::ProgramDescriptor ReduceDeviceOperation::ReduceMultiCoreWProgramFa
     if (!core_group_2.ranges().empty()) {
         std::vector<uint32_t> compute_kernel_args_group_2;
         if (rm_path) {
-            compute_kernel_args_group_2 =
-                build_rm_compute_ct_args(plan, ht_per_core_group_2, post_mul_scaler_bits, fp32_sfpu_reduce);
+            compute_kernel_args_group_2 = build_rm_compute_ct_args(plan, ht_per_core_group_2, fp32_sfpu_reduce);
         } else {
             compute_kernel_args_group_2 = {
                 ht_per_core_group_2,         // Ht
                 Wt,                          // Wt
                 1,                           // NC
-                post_mul_scaler_bits,        // packed fp32 user scalar (only used if REDUCE_POST_MUL is set)
                 fp32_sfpu_reduce ? 1u : 0u,  // enable_fp32_sfpu: route Float32 through the SFPU
             };
         }
@@ -405,11 +409,17 @@ tt::tt_metal::ProgramDescriptor ReduceDeviceOperation::ReduceMultiCoreWProgramFa
             shard_Ht,
             num_cores,
             num_rows);
-        KernelDescriptor::CoreRuntimeArgs reader_rt_args = {shard_Ht * Wt};
+        KernelDescriptor::CoreRuntimeArgs reader_rt_args = {
+            shard_Ht * Wt, std::bit_cast<uint32_t>(operation_attributes.scaler)};
         KernelDescriptor::CoreRuntimeArgs writer_rt_args = {shard_Ht};
         for (const CoreCoord& core : corerange_to_cores(all_cores)) {
             reader_desc.runtime_args.emplace_back(core, reader_rt_args);
             writer_desc.runtime_args.emplace_back(core, writer_rt_args);
+            if (core_group_1.contains(core)) {
+                compute_desc_g1.emplace_runtime_args(core, {post_mul_scaler_bits});
+            } else if (compute_desc_g2.has_value()) {
+                compute_desc_g2->emplace_runtime_args(core, {post_mul_scaler_bits});
+            }
         }
         desc.kernels.push_back(std::move(reader_desc));
         desc.kernels.push_back(std::move(writer_desc));
@@ -456,6 +466,7 @@ tt::tt_metal::ProgramDescriptor ReduceDeviceOperation::ReduceMultiCoreWProgramFa
                     a,
                     num_rows_per_core,
                     num_rows_read,
+                    std::bit_cast<uint32_t>(operation_attributes.scaler),
                 });
             writer_desc.emplace_runtime_args(
                 core,
@@ -472,7 +483,8 @@ tt::tt_metal::ProgramDescriptor ReduceDeviceOperation::ReduceMultiCoreWProgramFa
                 {
                     a,
                     num_tensor_tiles_per_core,
-                    num_tiles_read  // tile index of row to start reading from
+                    num_tiles_read,  // tile index of row to start reading from
+                    std::bit_cast<uint32_t>(operation_attributes.scaler),
                 });
 
             writer_desc.emplace_runtime_args(
@@ -483,6 +495,11 @@ tt::tt_metal::ProgramDescriptor ReduceDeviceOperation::ReduceMultiCoreWProgramFa
                     num_tiles_read / out_dim_divider              // output tile start index
                 });
             num_tiles_read += num_tensor_tiles_per_core;
+        }
+        if (core_group_1.contains(core)) {
+            compute_desc_g1.emplace_runtime_args(core, {post_mul_scaler_bits});
+        } else if (compute_desc_g2.has_value()) {
+            compute_desc_g2->emplace_runtime_args(core, {post_mul_scaler_bits});
         }
         if (i == num_cores - 1) {
             if (rm_path) {
@@ -509,6 +526,46 @@ tt::tt_metal::ProgramDescriptor ReduceDeviceOperation::ReduceMultiCoreWProgramFa
     }
 
     return desc;
+}
+
+void ReduceDeviceOperation::ReduceMultiCoreWProgramFactory::override_runtime_arguments(
+    tt::tt_metal::Program& program,
+    const operation_attributes_t& operation_attributes,
+    const tensor_args_t& tensor_args,
+    tensor_return_value_t& tensor_return_value,
+    const std::optional<ttnn::MeshCoordinate>& /*mesh_dispatch_coordinate*/) {
+    using namespace tt::tt_metal;
+    const auto& a = tensor_args.mesh_tensor();
+    const auto& output = tensor_return_value.mesh_tensor();
+    const bool rm_path = operation_attributes.row_major_w_dense_path;
+    const bool sharded = is_height_sharded(a, output, rm_path);
+    const uint32_t tile_h = a.tensor_spec().tile().get_height();
+    const uint32_t scaler_bits = std::bit_cast<uint32_t>(operation_attributes.scaler);
+    const uint32_t post_mul_bits = std::bit_cast<uint32_t>(operation_attributes.post_mul_scaler);
+    // Height-sharded reader: {num_tiles, scaler}. RM/tiled: {addr, count, offset, scaler}.
+    const uint32_t reader_scaler_slot = sharded ? 1u : 3u;
+
+    enum : uint32_t { kReader = 0, kWriter = 1, kComputeG1 = 2, kComputeG2 = 3 };
+
+    if (sharded) {
+        // Writer slot 0 is shard_Ht (a count); addresses live on the aliased CBs.
+        patch_cached_runtime_args(program, kReader, {{reader_scaler_slot, scaler_bits}});
+        patch_cached_cb_address(program, tt::CBIndex::c_1, a);
+        patch_cached_cb_address(program, tt::CBIndex::c_3, output);
+    } else {
+        patch_cached_runtime_args(
+            program,
+            kReader,
+            {{0, a.mesh_buffer().get_reference_buffer()->address()}, {reader_scaler_slot, scaler_bits}});
+        patch_cached_runtime_args(program, kWriter, {{0, output.mesh_buffer().get_reference_buffer()->address()}});
+    }
+    patch_cached_runtime_args(program, kComputeG1, {{0, post_mul_bits}});
+    const auto& shape = a.padded_shape();
+    const uint32_t num_rows =
+        rm_path ? (shape[0] * shape[1] * a.logical_shape()[2]) : (shape[0] * shape[1] * tt::div_up(shape[2], tile_h));
+    if (!sharded && split_has_remainder_group(operation_attributes.sub_core_grids, a, num_rows, rm_path)) {
+        patch_cached_runtime_args(program, kComputeG2, {{0, post_mul_bits}});
+    }
 }
 
 }  // namespace ttnn::prim

@@ -17,18 +17,14 @@
 
 #include "llk_math_eltwise_binary.h"
 
-#ifdef REDUCE_POST_MUL
 #include "api/compute/eltwise_unary/binop_with_scalar.h"
-#endif
+#include "ttnn/cpp/ttnn/kernel_lib/reduce_helpers_common.hpp"
 
 void kernel_main() {
     uint32_t Ht = get_compile_time_arg_val(0);
     uint32_t Wt = get_compile_time_arg_val(1);
     uint32_t NC = get_compile_time_arg_val(2);
-#ifdef REDUCE_POST_MUL
-    // Packed fp32 user scalar applied via mul_unary_tile after the reduce+negate finishes.
-    constexpr uint32_t post_mul_scaler_bits = get_compile_time_arg_val(3);
-#endif
+    const uint32_t post_mul_scaler_bits = get_arg_val<uint32_t>(0);
 
     // Circular buffers:
     constexpr uint32_t dfb_input = tt::CBIndex::c_0;
@@ -102,13 +98,11 @@ void kernel_main() {
             copy_tile(dfb_acc, 0, dst_idx);
             negative_tile_init();
             negative_tile(dst_idx);
-#ifdef REDUCE_POST_MUL
-            // GMPOOL only respects the scaler's exponent for MAX/MIN, so the host requests reduction
-            // with scaler=1.0 and then applies the user scalar via mul_unary_tile (SFPU) on each
-            // output DEST register.
-            binop_with_scalar_tile_init();
-            mul_unary_tile(dst_idx, post_mul_scaler_bits);
-#endif
+            // MAX/MIN keep only the scaler exponent through GMPOOL; apply the user scalar here.
+            if (post_mul_scaler_bits != k_identity_scaler_bits) {
+                binop_with_scalar_tile_init();
+                mul_unary_tile(dst_idx, post_mul_scaler_bits);
+            }
             tile_regs_wait();
             dfb_acc_obj.pop_front(onetile);
             dfb_output_obj.reserve_back(onetile);

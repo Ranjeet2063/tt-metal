@@ -93,18 +93,16 @@ void validate_rm_preconditions(
 
 std::vector<uint32_t> build_rm_reader_ct_args(
     const RmPlan& plan,
-    uint32_t scaler_bits,
     const tt::tt_metal::MeshTensor& src,
     tt::tt_metal::ReduceOpDim dim,
     uint32_t num_h_slices,
     uint32_t slice_Ht) {
-    // Slots 0-7 are shared by both paths. The reader's REDUCE_COL (H) branch additionally consumes
-    // H_logical at slot 8 and the H-axis-split geometry (num_h_slices, slice_Ht) at slots 9-10; the
-    // W path omits all three, so the source TensorAccessor args follow at slot 8 (W) or slot 11 (H).
+    // Slots 0-6 are shared by both paths. The reader's REDUCE_COL (H) branch additionally consumes
+    // H_logical at slot 7 and the H-axis-split geometry (num_h_slices, slice_Ht) at slots 8-9; the
+    // W path omits all three, so the source TensorAccessor args follow at slot 7 (W) or slot 10 (H).
     // The kernel is templated on REDUCE_DIM so the unused slots are genuinely dropped.
     // Only supports ReduceOpDim::W or ReduceOpDim::H
     std::vector<uint32_t> args = {
-        scaler_bits,
         plan.W_logical,
         plan.src_datum_size,
         plan.padding_identity_bits,
@@ -149,17 +147,64 @@ std::vector<uint32_t> build_rm_writer_ct_args(
     return args;
 }
 
-std::vector<uint32_t> build_rm_compute_ct_args(
-    const RmPlan& plan, uint32_t Ht_arg, uint32_t post_mul_scaler_bits, bool fp32_sfpu_reduce) {
+std::vector<uint32_t> build_rm_compute_ct_args(const RmPlan& plan, uint32_t Ht_arg, bool fp32_sfpu_reduce) {
     return {
         Ht_arg,
         plan.Wt,
         1u,  // NC (kept literal-1 per the existing RM compute contract; not hoisted into the plan)
-        post_mul_scaler_bits,
         plan.wt_tiles_per_chunk,
         plan.ht_tiles_per_chunk,
         fp32_sfpu_reduce ? 1u : 0u,  // enable_fp32_sfpu: route Float32 through the SFPU
     };
+}
+
+void patch_cached_runtime_args(
+    tt::tt_metal::Program& program,
+    uint32_t kernel_index,
+    std::initializer_list<std::pair<uint32_t, uint32_t>> slot_values) {
+    auto& args_by_core = tt::tt_metal::GetRuntimeArgs(program, kernel_index);
+    for (auto& column : args_by_core) {
+        for (auto& core_args : column) {
+            // Cores outside this kernel's core ranges have no runtime args.
+            if (core_args.size() == 0) {
+                continue;
+            }
+            for (const auto& [slot, value] : slot_values) {
+                TT_FATAL(
+                    slot < core_args.size(),
+                    "Reduce cache-hit patch: slot {} out of range (kernel {} has {} runtime args)",
+                    slot,
+                    kernel_index,
+                    core_args.size());
+                core_args[slot] = value;
+            }
+        }
+    }
+}
+
+bool split_has_remainder_group(
+    const std::optional<tt::tt_metal::CoreRangeSet>& sub_core_grids,
+    const tt::tt_metal::MeshTensor& a,
+    uint32_t num_work_units,
+    bool split_row_wise) {
+    const auto group_2 =
+        sub_core_grids.has_value()
+            ? std::get<3>(tt::tt_metal::split_work_to_cores(*sub_core_grids, num_work_units, split_row_wise))
+            : std::get<3>(tt::tt_metal::split_work_to_cores(
+                  a.mutable_device().compute_with_storage_grid_size(), num_work_units, split_row_wise));
+    return !group_2.ranges().empty();
+}
+
+void patch_cached_cb_address(
+    tt::tt_metal::Program& program, uint8_t cb_buffer_index, const tt::tt_metal::MeshTensor& tensor) {
+    tt::tt_metal::Buffer* buffer = tensor.mesh_buffer().get_reference_buffer();
+    for (const auto& cb : program.circular_buffers()) {
+        if (cb->buffer_indices().contains(cb_buffer_index)) {
+            tt::tt_metal::UpdateDynamicCircularBufferAddress(program, cb->id(), *buffer);
+            return;
+        }
+    }
+    TT_THROW("No circular buffer with buffer index {} in the cached reduce program", cb_buffer_index);
 }
 
 tt::tt_metal::ReduceOpParallelizationStrategy get_parallelization_strategy(

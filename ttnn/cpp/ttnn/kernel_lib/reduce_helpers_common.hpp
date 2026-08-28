@@ -17,6 +17,10 @@
  */
 enum class ReduceFp32Mode : uint8_t { Fast, Accurate };
 
+// IEEE bits of 1.0f. Identity is skipped at runtime: Int32 post-mul typecasts through fp32
+// and would truncate |x| > 2^24 if we multiplied by 1.0.
+constexpr uint32_t k_identity_scaler_bits = 0x3F800000u;
+
 /**
  * @brief Determines whether a reduce operation should use the SFPU path.
  *

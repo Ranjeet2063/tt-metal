@@ -13,12 +13,12 @@ The ReduceDeviceOperation uses 3 ProgramFactory variants:
     MULTI_CORE_HW which also maps to ReduceSingleCoreHwProgramFactory
 
 compute_program_hash() includes:
-  math_op, dim, scaler, output_mem_config, output_dtype, compute_kernel_config,
-  sub_core_grids, negate, program_factory.index(), input dtype,
+  math_op, dim, output_mem_config, output_dtype, compute_kernel_config,
+  sub_core_grids, negate, scaler_mode, program_factory.index(), input dtype,
   input memory_config, input padded_shape.
 
-override_runtime_arguments() only updates buffer addresses — shape/work distribution
-changes require separate cache entries (padded_shape is in hash).
+Scalar values (scaler / post_mul_scaler) are runtime args and are excluded from the
+hash (#54180). override_runtime_arguments() re-applies them on every hit.
 """
 
 import pytest
@@ -289,3 +289,43 @@ def test_reduce_cache_miss_sub_core_grids(device, isolate_program_cache):
     )
 
     assert device.cache_entries_counter.total == 2
+
+
+# Distinct scalars must reuse one program (#54180). Negative scalars are a separate case
+# because max(s*x) with s<0 lowers to s*min(x), which is a different program.
+TORCH_REDUCE = {
+    ttnn.sum: lambda x, dim: torch.sum(x, dim=dim, keepdim=True),
+    ttnn.max: lambda x, dim: torch.amax(x, dim=dim, keepdim=True),
+    ttnn.min: lambda x, dim: torch.amin(x, dim=dim, keepdim=True),
+}
+
+
+@pytest.mark.parametrize("op", [ttnn.sum, ttnn.max, ttnn.min], ids=["sum", "max", "min"])
+@pytest.mark.parametrize("dim", [-1, -2, [-2, -1]], ids=["dim_w", "dim_h", "dim_hw"])
+@pytest.mark.parametrize("scalars", [(1.0, 2.0, 3.5, 0.25, 7.0), (-1.0, -2.0, -0.5)], ids=["pos", "neg"])
+def test_reduce_scalar_value_does_not_add_cache_entries(device, isolate_program_cache, op, dim, scalars):
+    """Several distinct scalars on one op/shape must not grow the program cache."""
+    torch.manual_seed(0)
+    # Ramp both axes so max/min outputs actually change; uniform noise is near-constant after reduce.
+    row_ramp = 1.0 + torch.arange(64, dtype=torch.float32).reshape(1, 1, 64, 1) * 0.1
+    col_ramp = 1.0 + torch.arange(64, dtype=torch.float32).reshape(1, 1, 1, 64) * 0.05
+    torch_a = ((torch.rand([1, 1, 64, 64], dtype=torch.float32) + 0.1) * row_ramp * col_ramp).bfloat16()
+    tt_a = ttnn.from_torch(torch_a, layout=ttnn.TILE_LAYOUT, device=device)
+
+    entries = []
+    for scalar in scalars:
+        tt_out = op(tt_a, dim=dim, keepdim=True, scalar=scalar)
+        assert_numeric_metrics(
+            TORCH_REDUCE[op](scalar * torch_a.float(), dim),
+            ttnn.to_torch(tt_out).float(),
+            pcc_threshold=0.999,
+            rtol=1e-02,
+            atol=1e-02,
+            frobenius_threshold=1e-01,
+        )
+        entries.append(device.num_program_cache_entries())
+
+    assert len(set(entries)) == 1, (
+        f"cache grew with the scalar value: entries={entries} for scalars={scalars}. "
+        "The scalar must be a runtime arg, not part of the program hash."
+    )

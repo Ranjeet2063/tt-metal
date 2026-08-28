@@ -141,6 +141,9 @@ ALWI bool sfpu_is_first_tile(uint32_t axis_index, const AccumulateT& accumulate)
 // (truncates toward zero on the way back); all other formats use plain mul_unary_tile.
 template <DataFormat reduce_format>
 ALWI void reduce_post_mul_tile(uint32_t dst, uint32_t scaler_bits) {
+    if (scaler_bits == k_identity_scaler_bits) {
+        return;
+    }
     if constexpr (reduce_format == DataFormat::Int32) {
         typecast_tile_init<(uint32_t)DataFormat::Int32, (uint32_t)DataFormat::Float32>();
         typecast_tile<(uint32_t)DataFormat::Int32, (uint32_t)DataFormat::Float32>(dst);
