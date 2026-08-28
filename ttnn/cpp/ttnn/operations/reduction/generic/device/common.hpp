@@ -9,7 +9,9 @@
 #include <cstdint>
 #include <limits>
 #include <initializer_list>
+#include <map>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -70,11 +72,17 @@ inline bool use_sfpu_reduce_path(
 }
 
 // How the scalar is applied. Chosen from op semantics, never from the value, so it is safe to hash.
+// Integer values are part of the kernel ABI (TTNN_SCALER_MODE). Keep in sync with
+// k_scaler_mode_* in reduce_helpers_common.hpp.
 enum class ScalerMode {
-    None,        // intermediate stage of a decomposed reduce (literal 1.0); only the host knows this
-    ScalerTile,  // folded into the FPU scaler tile
-    PostMul,     // multiplied after reduce; the scaler CB is ignored
+    None = 0,        // intermediate stage of a decomposed reduce (literal 1.0); only the host knows this
+    ScalerTile = 1,  // folded into the FPU scaler tile
+    PostMul = 2,     // multiplied after reduce; the scaler CB is ignored
 };
+
+inline void set_scaler_mode_define(std::map<std::string, std::string>& defines, ScalerMode mode) {
+    defines["TTNN_SCALER_MODE"] = std::to_string(static_cast<uint32_t>(mode));
+}
 
 // Never returns None. MAX/MIN and SFPU SUM/AVG ignore the scaler CB, so they post-multiply.
 inline ScalerMode select_scaler_mode(

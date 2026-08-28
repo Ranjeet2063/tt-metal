@@ -200,6 +200,7 @@ tt::tt_metal::ProgramDescriptor ReduceDeviceOperation::ReduceMultiCoreHProgramFa
             }}},
         });
 
+        // Resident input shard. override_runtime_arguments rebinds this CB (c_1), not scratch c_0.
         desc.cbs.push_back(CBDescriptor{
             .total_size = num_shard_tiles * src0_single_tile_size,
             .core_ranges = all_cores,
@@ -366,6 +367,7 @@ tt::tt_metal::ProgramDescriptor ReduceDeviceOperation::ReduceMultiCoreHProgramFa
 
     std::map<std::string, std::string> reduce_defines =
         reduce_op_utils::get_defines(operation_attributes.math_op, tt::tt_metal::ReduceOpDim::H);
+    set_scaler_mode_define(reduce_defines, operation_attributes.scaler_mode);
     // Accurate fp32: route Float32 through the SFPU (needs 32-bit DEST)
     const bool fp32_sfpu_reduce = is_sfpu_reduce && a.dtype() == DataType::FLOAT32 && fp32_dest_acc_en;
     // A bf16 input packed into an FP32 partial needs the packer reconfigured, not just the unpacker.
@@ -692,8 +694,10 @@ void ReduceDeviceOperation::ReduceMultiCoreHProgramFactory::override_runtime_arg
     enum : uint32_t { kReader = 0, kWriter = 1, kComputeG1 = 2, kComputeG2 = 3 };
 
     if (sharded) {
+        // Width-sharded input is aliased as c_1; c_0 is L1 scratch. override is the only
+        // cache-hit update (the adapter skips resolve_bindings when this hook exists).
         patch_cached_runtime_args(program, kReader, {{reader_scaler_slot, scaler_bits}});
-        patch_cached_cb_address(program, tt::CBIndex::c_0, a);
+        patch_cached_cb_address(program, tt::CBIndex::c_1, a);
         patch_cached_cb_address(program, tt::CBIndex::c_3, output);
     } else {
         patch_cached_runtime_args(

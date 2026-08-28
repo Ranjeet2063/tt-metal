@@ -9,8 +9,9 @@ Tests target potential caching issues.
 The ReduceDeviceOperation uses 3 ProgramFactory variants:
   - ReduceMultiCoreHProgramFactory (dim=H)
   - ReduceMultiCoreWProgramFactory (dim=W)
-  - ReduceSingleCoreHwProgramFactory (dim=HW with single tile), or
-    MULTI_CORE_HW which also maps to ReduceSingleCoreHwProgramFactory
+  - ReduceSingleCoreHwProgramFactory (dim=HW, one tile)
+
+Multi-tile HW is W-then-H (the H and W factories), not a fourth factory.
 
 compute_program_hash() includes:
   math_op, dim, output_mem_config, output_dtype, compute_kernel_config,
@@ -26,7 +27,7 @@ import pytest
 import torch
 
 import ttnn
-from tests.ttnn.utils_for_testing import assert_numeric_metrics
+from tests.ttnn.utils_for_testing import assert_equal, assert_numeric_metrics
 
 
 @pytest.fixture
@@ -296,6 +297,7 @@ def test_reduce_cache_miss_sub_core_grids(device, isolate_program_cache):
 # because max(s*x) with s<0 lowers to s*min(x), which is a different program.
 TORCH_REDUCE = {
     ttnn.sum: lambda x, dim: torch.sum(x, dim=dim, keepdim=True),
+    ttnn.mean: lambda x, dim: torch.mean(x, dim=dim, keepdim=True),
     ttnn.max: lambda x, dim: torch.amax(x, dim=dim, keepdim=True),
     ttnn.min: lambda x, dim: torch.amin(x, dim=dim, keepdim=True),
 }
@@ -335,7 +337,7 @@ def test_reduce_scalar_value_does_not_add_cache_entries(device, isolate_program_
 @pytest.mark.parametrize("op", [ttnn.sum, ttnn.max, ttnn.min], ids=["sum", "max", "min"])
 @pytest.mark.parametrize("scalars", [(1.0, 2.0, 0.25), (-1.0, -2.0, -0.5)], ids=["pos", "neg"])
 def test_single_core_hw_scalar_value_does_not_add_cache_entries(device, isolate_program_cache, op, scalars):
-    """1-tile HW: identity scaler tile + runtime post-mul. Sign used to pick W-then-H."""
+    """1-tile HW: identity scaler tile + runtime post-mul; sign does not change the program."""
     torch.manual_seed(0)
     row_ramp = 1.0 + torch.arange(32, dtype=torch.float32).reshape(1, 1, 32, 1) * 0.1
     col_ramp = 1.0 + torch.arange(32, dtype=torch.float32).reshape(1, 1, 1, 32) * 0.05
@@ -359,7 +361,7 @@ def test_single_core_hw_scalar_value_does_not_add_cache_entries(device, isolate_
 
 
 def test_single_core_hw_sum_pos_and_neg_scalar_share_cache(device, isolate_program_cache):
-    """SUM no longer forks topology on scaler sign (the old sqrt-NaN two-step)."""
+    """1-tile HW SUM: positive and negative scalars share one program."""
     torch.manual_seed(0)
     torch_a = torch.rand([1, 1, 32, 32], dtype=torch.float32).bfloat16()
     tt_a = ttnn.from_torch(torch_a, layout=ttnn.TILE_LAYOUT, device=device)
@@ -374,8 +376,8 @@ def test_single_core_hw_sum_pos_and_neg_scalar_share_cache(device, isolate_progr
     ), f"1-tile HW SUM compiled a new program for the opposite sign: {after_pos} -> {after_neg}."
 
 
-# Welford scalar and correction are runtime args (#54180 phase 3). std vs var stay
-# different programs (is_std is hashed).
+# Welford scalar and correction are runtime args. std vs var stay different programs
+# (is_std is hashed).
 TORCH_WELFORD = {
     ttnn.var: lambda x, dim, correction: torch.var(x, dim=dim, keepdim=True, correction=correction),
     ttnn.std: lambda x, dim, correction: torch.std(x, dim=dim, keepdim=True, correction=correction),
@@ -429,3 +431,144 @@ def test_welford_correction_does_not_add_cache_entries(device, isolate_program_c
         entries.append(device.num_program_cache_entries())
 
     assert len(set(entries)) == 1, f"Welford cache grew with correction: entries={entries}."
+
+
+def _assert_cache_stable(entries, label):
+    assert len(set(entries)) == 1, (
+        f"{label} cache grew with the scalar or tensor: entries={entries}. "
+        "The scalar must be a runtime arg; buffer addresses must be re-patched on a hit."
+    )
+
+
+def _ramped_bf16(shape, seed):
+    torch.manual_seed(seed)
+    h, w = shape[-2], shape[-1]
+    row_ramp = 1.0 + torch.arange(h, dtype=torch.float32).reshape(1, 1, h, 1) * 0.1
+    col_ramp = 1.0 + torch.arange(w, dtype=torch.float32).reshape(1, 1, 1, w) * 0.05
+    return ((torch.rand(shape, dtype=torch.float32) + 0.1) * row_ramp * col_ramp).bfloat16()
+
+
+@pytest.mark.requires_grid_size((2, 1))
+def test_width_sharded_h_scalar_value_does_not_add_cache_entries(device, isolate_program_cache):
+    """Width-sharded H: patch c_1 (input shard) on a hit; two tensors + several scalars share one program."""
+    shape = [1, 1, 64, 128]
+    mem_config = ttnn.create_sharded_memory_config(
+        shape=(64, 64),
+        core_grid=ttnn.CoreGrid(x=2, y=1),
+        strategy=ttnn.ShardStrategy.WIDTH,
+        use_height_and_width_as_shard_shape=True,
+    )
+    scalars = (1.0, 2.0, 0.25)
+    tensors = [_ramped_bf16(shape, seed) for seed in (0, 1)]
+    entries = []
+    for torch_a in tensors:
+        tt_a = ttnn.from_torch(
+            torch_a, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16, device=device, memory_config=mem_config
+        )
+        for scalar in scalars:
+            tt_out = ttnn.sum(tt_a, dim=-2, keepdim=True, scalar=scalar, memory_config=mem_config)
+            assert_numeric_metrics(
+                TORCH_REDUCE[ttnn.sum](scalar * torch_a.float(), -2),
+                ttnn.to_torch(tt_out).float(),
+                pcc_threshold=0.999,
+                rtol=1e-02,
+                atol=1e-02,
+                frobenius_threshold=1e-01,
+            )
+            entries.append(device.num_program_cache_entries())
+    _assert_cache_stable(entries, "width-sharded H")
+
+
+@pytest.mark.requires_grid_size((1, 2))
+def test_height_sharded_w_scalar_value_does_not_add_cache_entries(device, isolate_program_cache):
+    """Height-sharded W: patch c_1 (input shard) on a hit; two tensors + several scalars share one program."""
+    shape = [1, 1, 64, 64]
+    mem_config = ttnn.create_sharded_memory_config(
+        shape=(32, 64),
+        core_grid=ttnn.CoreGrid(x=1, y=2),
+        strategy=ttnn.ShardStrategy.HEIGHT,
+        use_height_and_width_as_shard_shape=True,
+    )
+    scalars = (1.0, 2.0, 0.25)
+    tensors = [_ramped_bf16(shape, seed) for seed in (0, 1)]
+    entries = []
+    for torch_a in tensors:
+        tt_a = ttnn.from_torch(
+            torch_a, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16, device=device, memory_config=mem_config
+        )
+        for scalar in scalars:
+            tt_out = ttnn.sum(tt_a, dim=-1, keepdim=True, scalar=scalar, memory_config=mem_config)
+            assert_numeric_metrics(
+                TORCH_REDUCE[ttnn.sum](scalar * torch_a.float(), -1),
+                ttnn.to_torch(tt_out).float(),
+                pcc_threshold=0.999,
+                rtol=1e-02,
+                atol=1e-02,
+                frobenius_threshold=1e-01,
+            )
+            entries.append(device.num_program_cache_entries())
+    _assert_cache_stable(entries, "height-sharded W")
+
+
+@pytest.mark.parametrize("op", [ttnn.sum, ttnn.mean], ids=["sum", "mean"])
+@pytest.mark.parametrize("dim", [-1, -2], ids=["dim_w", "dim_h"])
+def test_rm_dense_scalar_value_does_not_add_cache_entries(device, isolate_program_cache, op, dim):
+    """Dense RM mean/sum: scaler is a runtime arg on both W and H factories."""
+    torch.manual_seed(0)
+    shape = [1, 1, 64, 64]
+    torch_a = (torch.rand(shape, dtype=torch.float32) + 0.1).bfloat16()
+    tt_a = ttnn.from_torch(torch_a, layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.bfloat16, device=device)
+    scalars = (1.0, 2.0, 0.25)
+    entries = []
+    for scalar in scalars:
+        tt_out = op(tt_a, dim=dim, keepdim=True, scalar=scalar)
+        assert_numeric_metrics(
+            TORCH_REDUCE[op](scalar * torch_a.float(), dim),
+            ttnn.to_torch(tt_out).float(),
+            pcc_threshold=0.999,
+            rtol=1e-02,
+            atol=1e-02,
+            frobenius_threshold=1e-01,
+        )
+        entries.append(device.num_program_cache_entries())
+    _assert_cache_stable(entries, f"dense RM dim={dim}")
+
+
+@pytest.mark.parametrize(
+    "dtype, fast_and_approximate_mode",
+    [
+        (ttnn.int32, True),
+        (ttnn.float32, False),
+    ],
+    ids=["int32", "fp32_accurate"],
+)
+def test_reduce_scalar_cache_int32_and_accurate_fp32(device, isolate_program_cache, dtype, fast_and_approximate_mode):
+    """Int32 and accurate-fp32 PostMul paths must reuse one program across scalar values."""
+    torch.manual_seed(0)
+    shape = [1, 1, 64, 64]
+    if dtype == ttnn.int32:
+        torch_a = torch.randint(-20, 20, shape, dtype=torch.int32)
+    else:
+        torch_a = torch.rand(shape, dtype=torch.float32) + 0.1
+    tt_a = ttnn.from_torch(torch_a, layout=ttnn.TILE_LAYOUT, dtype=dtype, device=device)
+    scalars = (1.0, 2.0, 0.25)
+    entries = []
+    for scalar in scalars:
+        tt_out = ttnn.sum(
+            tt_a, dim=-1, keepdim=True, scalar=scalar, fast_and_approximate_mode=fast_and_approximate_mode
+        )
+        torch_ref = TORCH_REDUCE[ttnn.sum](scalar * torch_a.float(), -1)
+        tt_torch = ttnn.to_torch(tt_out)
+        if dtype == ttnn.int32:
+            assert_equal(torch_ref.to(torch.int32), tt_torch)
+        else:
+            assert_numeric_metrics(
+                torch_ref,
+                tt_torch.float(),
+                pcc_threshold=0.999,
+                rtol=1e-02,
+                atol=1e-02,
+                frobenius_threshold=1e-01,
+            )
+        entries.append(device.num_program_cache_entries())
+    _assert_cache_stable(entries, f"{dtype} scalar")

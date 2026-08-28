@@ -10,6 +10,7 @@
 #include "api/dataflow/dataflow_buffer.h"
 #include "ttnn/cpp/ttnn/kernel_lib/dfb_helpers_dataflow.hpp"
 #include "ttnn/cpp/ttnn/kernel_lib/l1_helpers.hpp"
+#include "ttnn/cpp/ttnn/kernel_lib/reduce_helpers_common.hpp"
 
 namespace dataflow_kernel_lib {
 
@@ -137,6 +138,7 @@ FORCE_INLINE void fill_each_face_row0_partial(
 
 template <uint32_t dfb_id, PoolType pool_type, ReduceDim reduce_dim>
 FORCE_INLINE void prepare_reduce_scaler(float scaler_f, uint32_t valid_reduce_dim_elements_in_tile) {
+    assert_none_mode_identity(__builtin_bit_cast(uint32_t, scaler_f));
     constexpr DataFormat data_format = get_dataformat(dfb_id);
     constexpr uint32_t tile_r_dim = get_tile_r_dim<dfb_id>();
     constexpr uint32_t tile_c_dim = get_tile_c_dim<dfb_id>();

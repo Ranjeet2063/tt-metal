@@ -15,18 +15,17 @@ namespace ttnn::prim {
 struct ReduceParams {
     tt::tt_metal::ReduceOpMath math_op{};
     tt::tt_metal::ReduceOpDim dim{};
-    float scaler{1.0f};
+    float scaler{1.0f};  // runtime arg; excluded from the program hash
     tt::tt_metal::MemoryConfig output_mem_config;
     tt::tt_metal::DataType output_dtype{tt::tt_metal::DataType::INVALID};
     ttnn::DeviceComputeKernelConfig compute_kernel_config;
     std::optional<tt::tt_metal::CoreRangeSet> sub_core_grids;
     bool negate{false};
-    float post_mul_scaler{1.0f};  // live when scaler_mode == PostMul
+    float post_mul_scaler{1.0f};  // runtime arg; excluded from the program hash. live when scaler_mode == PostMul
     ScalerMode scaler_mode{ScalerMode::ScalerTile};
-    // Dense row-major path for **mean only** (generic_reductions dispatches AVG over W/H): host enables only when
-    // constraints match tilized mean (4D, BF16/FLOAT32, interleaved I/O); AVG is lowered to SUM + scaler before
-    // launch. Other ROW_MAJOR reductions tilize and use the standard tile kernels. Exactly one of the two flags
-    // may be set at a time (validated in validate_on_program_cache_miss).
+    // Dense RM path for mean (AVG) and sum: 4D BF16/FLOAT32 interleaved I/O. AVG is lowered
+    // to SUM + scaler before launch. Other ROW_MAJOR reductions tilize. Exactly one flag
+    // may be set (validated in validate_on_program_cache_miss).
     bool row_major_w_dense_path{false};
     bool row_major_h_dense_path{false};
     // Accurate fp32: route Float32 through the SFPU (full fp32); set from

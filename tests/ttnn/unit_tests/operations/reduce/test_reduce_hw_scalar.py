@@ -2,10 +2,10 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-"""HW reduce with a negative scalar (#54180 phase 2).
+"""HW reduce with a negative scalar.
 
-Single-tile HW used to fork to W-then-H because sqrt(s) is NaN. It now stays on
-ReduceSingleCoreHwProgramFactory with an identity scaler tile and a runtime post-mul.
+1-tile HW uses an identity scaler tile and a runtime post-mul, so a negative
+scalar stays on ReduceSingleCoreHwProgramFactory. Multi-tile HW is W-then-H.
 """
 
 import pytest
@@ -81,7 +81,7 @@ def _run_hw_negative_scalar(device, op, torch_reduce, shape, dim, dtype, fast_an
     ids=["bf16", "fp32_fast", "fp32_accurate", "int32"],
 )
 def test_hw_negative_scalar(device, op, torch_reduce, shape, dtype, fast_and_approximate_mode):
-    """dim=HW, scalar<0: 1-tile now uses the single-core factory; multi-tile stays W-then-H."""
+    """dim=HW, scalar<0: 1-tile uses the single-core factory; multi-tile stays W-then-H."""
     _run_hw_negative_scalar(device, op, torch_reduce, shape, [-2, -1], dtype, fast_and_approximate_mode)
 
 

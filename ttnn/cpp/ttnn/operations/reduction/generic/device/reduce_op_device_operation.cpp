@@ -250,8 +250,8 @@ ttnn::Tensor reduce(
     bool use_sfpu_reduce,
     uint32_t num_h_slices,
     tt::tt_metal::Layout output_layout) {
-    // scaler_mode is hashed, the floats are not — check the live float matches the mode on every
-    // call (a new scalar no longer misses the cache).
+    // scaler_mode is hashed; the floats are not. Check the live float matches the mode on every
+    // launch so a mismatched pair cannot ride a cache hit.
     const bool is_max_or_min =
         reduce_math == tt::tt_metal::ReduceOpMath::MAX || reduce_math == tt::tt_metal::ReduceOpMath::MIN;
     TT_FATAL(

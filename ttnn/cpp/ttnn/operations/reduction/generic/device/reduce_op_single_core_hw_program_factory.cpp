@@ -149,6 +149,7 @@ tt::tt_metal::ProgramDescriptor ReduceDeviceOperation::ReduceSingleCoreHwProgram
 
     std::map<std::string, std::string> reduce_defines =
         reduce_op_utils::get_defines(operation_attributes.math_op, tt::tt_metal::ReduceOpDim::HW);
+    set_scaler_mode_define(reduce_defines, operation_attributes.scaler_mode);
 
     KernelDescriptor reader_desc;
     reader_desc.kernel_source =

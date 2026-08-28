@@ -25,6 +25,7 @@ void kernel_main() {
     uint32_t Wt = get_compile_time_arg_val(1);
     uint32_t NC = get_compile_time_arg_val(2);
     const uint32_t post_mul_scaler_bits = get_arg_val<uint32_t>(0);
+    assert_none_mode_identity(post_mul_scaler_bits);
 
     // Circular buffers:
     constexpr uint32_t dfb_input = tt::CBIndex::c_0;

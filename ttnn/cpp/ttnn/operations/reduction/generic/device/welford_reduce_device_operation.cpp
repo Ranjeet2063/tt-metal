@@ -110,7 +110,7 @@ ttnn::Tensor welford_reduce(
         /*default_approx_mode=*/false,
         /*default_fp32_acc=*/true));
 
-    // Always-on: correction is a runtime arg and no longer misses the cache.
+    // Correction is a runtime arg, so N < 2 must be rejected on every launch.
     if (correction) {
         const auto& shape = input_tensor.logical_shape();
         const uint64_t H = shape[-2];

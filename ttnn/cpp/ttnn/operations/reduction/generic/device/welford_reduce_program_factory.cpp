@@ -15,6 +15,15 @@
 #include <cstdint>
 
 namespace ttnn::prim {
+namespace {
+
+uint32_t welford_post_mul_bits(float scalar, bool is_std) {
+    // var(s*x) = s^2 var(x); std(s*x) = |s| std(x). Identity (1.0) is skipped in the kernel.
+    const float post_mul = is_std ? std::abs(scalar) : scalar * scalar;
+    return std::bit_cast<uint32_t>(post_mul);
+}
+
+}  // namespace
 
 tt::tt_metal::ProgramDescriptor WelfordReduceDeviceOperation::WelfordReduceProgramFactory::create_descriptor(
     const operation_attributes_t& operation_attributes,
@@ -65,10 +74,9 @@ tt::tt_metal::ProgramDescriptor WelfordReduceDeviceOperation::WelfordReduceProgr
         "ttnn.std/var with Float32 input requires fp32_dest_acc_en=true in the compute kernel "
         "config; otherwise precision is silently lost in the unpacker format conversion.");
 
-    // Match cb_scalar's data format to the input. When cb_in is FP32, cb_scalar must also be
-    // FP32: mul_tiles_bcast_scalar reads cb_in as SrcA and cb_scalar as SrcB, and a
-    // format/stride mismatch between the two operands would cause the unpacker to silently
-    // produce zeros into DEST.
+    // Shared readers always write a scaler tile into c_2. Welford compute never reads it
+    // (the user scalar is the SFPU post-mul), but the CB must still exist and match the
+    // input format so prepare_reduce_scaler writes a valid tile.
     tt::DataFormat scalar_cb_data_format =
         (input_cb_data_format == tt::DataFormat::Float32) ? tt::DataFormat::Float32 : tt::DataFormat::Float16_b;
     uint32_t scalar_single_tile_size = tt::tile_size(scalar_cb_data_format);
@@ -232,14 +240,7 @@ tt::tt_metal::ProgramDescriptor WelfordReduceDeviceOperation::WelfordReduceProgr
         });
     }
 
-    // Post-reduction scaling: the reduction always runs unscaled (the precise
-    // UnpackToDestFp32 path), and the user scalar is applied to the small-magnitude result via
-    // SFPU mul_unary_tile inside the compute kernel. Identity (1.0) is skipped at runtime.
-    // The post-multiplier follows var(s*x)=s^2 var(x) and std(s*x)=|s| std(x):
-    //   var: scalar^2   std: |scalar|.
-    const float post_mul_scaler =
-        is_std ? std::abs(operation_attributes.scalar) : operation_attributes.scalar * operation_attributes.scalar;
-    const uint32_t post_mul_scaler_bits = std::bit_cast<uint32_t>(post_mul_scaler);
+    const uint32_t post_mul_scaler_bits = welford_post_mul_bits(operation_attributes.scalar, is_std);
     const uint32_t correction_u32 = static_cast<uint32_t>(operation_attributes.correction);
 
     // cb_partial (c_21): HW-reduce only -- holds per-column mean+var tile pairs
@@ -301,9 +302,9 @@ tt::tt_metal::ProgramDescriptor WelfordReduceDeviceOperation::WelfordReduceProgr
     }
 
     // --- Reader kernel ---
-    // Shared readers take scaler as a runtime arg (same layout as the reduce factories).
-    // The Welford compute path does not read the scaler CB; the user scalar is a post-mul.
-    uint32_t scaler_bits = std::bit_cast<uint32_t>(operation_attributes.scalar);
+    // Shared readers take a scaler runtime arg (same layout as the reduce factories).
+    // Compute does not read c_2, so this is always identity.
+    const uint32_t scaler_bits = std::bit_cast<uint32_t>(1.0f);
     KernelDescriptor reader_desc;
     reader_desc.source_type = KernelDescriptor::SourceType::FILE_PATH;
     reader_desc.core_ranges = all_cores;
@@ -600,19 +601,11 @@ void WelfordReduceDeviceOperation::WelfordReduceProgramFactory::override_runtime
     const bool reduce_w = operation_attributes.reduce_dim == ReduceOpDim::W;
     const bool reduce_hw = operation_attributes.reduce_dim == ReduceOpDim::HW;
     const bool is_std = operation_attributes.math_op == ReduceOpMath::STD;
-    const float post_mul =
-        is_std ? std::abs(operation_attributes.scalar) : operation_attributes.scalar * operation_attributes.scalar;
-    const uint32_t post_mul_bits = std::bit_cast<uint32_t>(post_mul);
+    const uint32_t post_mul_bits = welford_post_mul_bits(operation_attributes.scalar, is_std);
     const uint32_t correction_u32 = static_cast<uint32_t>(operation_attributes.correction);
-    const uint32_t scaler_bits = std::bit_cast<uint32_t>(operation_attributes.scalar);
-    // W reader: {addr, count, offset, scaler}. H/HW reader: {addr, start, col, num_cols, scaler}.
-    const uint32_t reader_scaler_slot = reduce_w ? 3u : 4u;
 
     patch_cached_runtime_args(
-        program,
-        kReader,
-        {{0, tensor_args.mesh_tensor().mesh_buffer().get_reference_buffer()->address()},
-         {reader_scaler_slot, scaler_bits}});
+        program, kReader, {{0, tensor_args.mesh_tensor().mesh_buffer().get_reference_buffer()->address()}});
     if (reduce_hw) {
         patch_cached_runtime_args(
             program,

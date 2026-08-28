@@ -6,6 +6,7 @@
 
 #include <cstdint>
 
+#include "api/debug/assert.h"
 #include "llk_defs.h"
 
 /**
@@ -20,6 +21,38 @@ enum class ReduceFp32Mode : uint8_t { Fast, Accurate };
 // IEEE bits of 1.0f. Identity is skipped at runtime: Int32 post-mul typecasts through fp32
 // and would truncate |x| > 2^24 if we multiplied by 1.0.
 constexpr uint32_t k_identity_scaler_bits = 0x3F800000u;
+
+// Matches ttnn::prim::ScalerMode. The host passes TTNN_SCALER_MODE as this integer.
+constexpr uint32_t k_scaler_mode_none = 0;
+constexpr uint32_t k_scaler_mode_scaler_tile = 1;
+constexpr uint32_t k_scaler_mode_post_mul = 2;
+
+#ifdef TTNN_SCALER_MODE
+static_assert(
+    TTNN_SCALER_MODE == k_scaler_mode_none || TTNN_SCALER_MODE == k_scaler_mode_scaler_tile ||
+        TTNN_SCALER_MODE == k_scaler_mode_post_mul,
+    "TTNN_SCALER_MODE must be None, ScalerTile, or PostMul");
+#if defined(REDUCE_OP) && !defined(ARCH_QUASAR)
+static_assert(
+    (REDUCE_OP != ckernel::PoolType::MAX && REDUCE_OP != ckernel::PoolType::MIN) ||
+        TTNN_SCALER_MODE != k_scaler_mode_scaler_tile,
+    "MAX/MIN must not compile with ScalerTile (GMPOOL keeps only the scaler exponent)");
+#elif defined(REDUCE_OP)
+static_assert(
+    REDUCE_OP != ckernel::PoolType::MAX || TTNN_SCALER_MODE != k_scaler_mode_scaler_tile,
+    "MAX must not compile with ScalerTile (GMPOOL keeps only the scaler exponent)");
+#endif
+#endif
+
+inline void assert_none_mode_identity(uint32_t scaler_bits) {
+#ifdef TTNN_SCALER_MODE
+    if constexpr (TTNN_SCALER_MODE == k_scaler_mode_none) {
+        ASSERT(scaler_bits == k_identity_scaler_bits);
+    }
+#else
+    (void)scaler_bits;
+#endif
+}
 
 /**
  * @brief Determines whether a reduce operation should use the SFPU path.
