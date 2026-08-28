@@ -12,16 +12,18 @@
 
 #include "api/dataflow/dataflow_buffer.h"
 
-#ifdef WELFORD_POST_MUL
-// SFPU multiply-by-scalar (mul_unary_tile) applied to the reduced output. See issue #45222.
 #include "api/compute/eltwise_unary/binop_with_scalar.h"
-#endif
+#include "ttnn/cpp/ttnn/kernel_lib/reduce_helpers_common.hpp"
 
 void kernel_main() {
     // Runtime args:
     // Total number of outer-loop iterations (N * C * Ht),
     // i.e. how many independent row-reductions this core must perform.
     uint32_t NCHt = get_arg_val<uint32_t>(0);
+    // Packed fp32 post-multiplier: var uses scalar^2, std uses |scalar|. Identity (1.0) is skipped.
+    const uint32_t post_mul_scaler_bits = get_arg_val<uint32_t>(1);
+    // Bessel's correction (divide by N-1 instead of N). Host rejects N < 2 when this is set.
+    const bool correction = get_arg_val<uint32_t>(2) != 0;
 
     // Compile-time args:
     // Number of tiles along the W (reduction) dimension.
@@ -31,15 +33,8 @@ void kernel_main() {
     // Number of elements per tile in the W dimension
     // (typically 32, but can be smaller for narrow tiles).
     constexpr uint32_t tile_width = get_compile_time_arg_val(2);
-#ifdef WELFORD_POST_MUL
-    // Packed fp32 post-multiplier applied to the reduced output via mul_unary_tile (SFPU).
-    // For var this is scalar^2, for std it is |scalar| (see welford_reduce_program_factory).
-    constexpr uint32_t post_mul_scaler_bits = get_compile_time_arg_val(3);
-#endif
-    // Whether to apply Bessel's correction (divide by N-1 instead of N).
-    constexpr bool correction = get_compile_time_arg_val(4) != 0;
     // Whether to compute standard deviation (sqrt of variance) instead of variance.
-    constexpr bool is_std = get_compile_time_arg_val(5) != 0;
+    constexpr bool is_std = get_compile_time_arg_val(3) != 0;
 
     constexpr uint32_t onetile = 1;
 
@@ -138,7 +133,8 @@ void kernel_main() {
                 // scale_idx controls the divisor for M2 -> variance conversion:
                 //   correction=false: scale_idx = W-1, reciprocal = 1/W  (population variance)
                 //   correction=true:  scale_idx = W-2, reciprocal = 1/(W-1) (sample variance)
-                constexpr uint32_t scale_idx = correction ? (W - 2) : (W - 1);
+                ASSERT(!correction || W >= 2);
+                const uint32_t scale_idx = correction ? (W - 2) : (W - 1);
                 welford_finalize_to_row<0>(mean_dst, scale_idx, {});
                 tile_regs_commit();
             }
@@ -162,12 +158,11 @@ void kernel_main() {
             sqrt_tile_init();
             sqrt_tile(var_dst);
         }
-#ifdef WELFORD_POST_MUL
-        // Apply the user scalar to the reduced output: var(s*x)=s^2 var(x), std(s*x)=|s| std(x).
-        // mul_unary_tile is an SFPU op operating on DEST at full fp32 precision.
-        binop_with_scalar_tile_init();
-        mul_unary_tile(var_dst, post_mul_scaler_bits);
-#endif
+        if (post_mul_scaler_bits != k_identity_scaler_bits) {
+            // var(s*x)=s^2 var(x), std(s*x)=|s| std(x). SFPU mul on DEST at full fp32.
+            binop_with_scalar_tile_init();
+            mul_unary_tile(var_dst, post_mul_scaler_bits);
+        }
         tile_regs_commit();
         dfb_var_obj.pop_front(onetile);
 

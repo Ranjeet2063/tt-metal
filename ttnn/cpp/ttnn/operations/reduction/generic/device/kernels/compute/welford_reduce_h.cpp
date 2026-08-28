@@ -15,15 +15,17 @@
 #include "api/compute/compute_kernel_hw_startup.h"
 #include "api/dataflow/dataflow_buffer.h"
 
-#ifdef WELFORD_POST_MUL
-// SFPU multiply-by-scalar (mul_unary_tile) applied to the reduced output. See issue #45222.
 #include "api/compute/eltwise_unary/binop_with_scalar.h"
-#endif
+#include "ttnn/cpp/ttnn/kernel_lib/reduce_helpers_common.hpp"
 
 void kernel_main() {
     // Runtime arg: number of independent column-reductions this core must perform.
     // Each column-reduction processes Ht tiles vertically and produces one output tile.
     uint32_t NCWt = get_arg_val<uint32_t>(0);
+    // Packed fp32 post-multiplier: var uses scalar^2, std uses |scalar|. Identity (1.0) is skipped.
+    const uint32_t post_mul_scaler_bits = get_arg_val<uint32_t>(1);
+    // Bessel's correction (divide by N-1 instead of N). Host rejects N < 2 when this is set.
+    const bool correction = get_arg_val<uint32_t>(2) != 0;
 
     // Compile-time args:
     // Number of tiles along the H (reduction) dimension.
@@ -32,15 +34,8 @@ void kernel_main() {
     constexpr uint32_t H = get_compile_time_arg_val(1);
     // Number of elements per tile in the H dimension (typically 32).
     constexpr uint32_t tile_height = get_compile_time_arg_val(2);
-#ifdef WELFORD_POST_MUL
-    // Packed fp32 post-multiplier applied to the reduced output via mul_unary_tile (SFPU).
-    // For var this is scalar^2, for std it is |scalar| (see welford_reduce_program_factory).
-    constexpr uint32_t post_mul_scaler_bits = get_compile_time_arg_val(3);
-#endif
-    // Whether to apply Bessel's correction (divide by N-1 instead of N).
-    constexpr bool correction = get_compile_time_arg_val(4) != 0;
     // Whether to compute standard deviation (sqrt of variance) instead of variance.
-    constexpr bool is_std = get_compile_time_arg_val(5) != 0;
+    constexpr bool is_std = get_compile_time_arg_val(3) != 0;
 
     constexpr uint32_t onetile = 1;
 
@@ -125,19 +120,18 @@ void kernel_main() {
                 // scale_idx controls the divisor for M2 -> variance conversion:
                 //   correction=false: scale_idx = H-1, reciprocal = 1/H  (population variance)
                 //   correction=true:  scale_idx = H-2, reciprocal = 1/(H-1) (sample variance)
-                constexpr uint32_t scale_idx = correction ? (H - 2) : (H - 1);
+                ASSERT(!correction || H >= 2);
+                const uint32_t scale_idx = correction ? (H - 2) : (H - 1);
                 welford_finalize_to_row<0>(mean_dst, scale_idx, {});
                 if constexpr (is_std) {
                     sqrt_tile_init();
                     sqrt_tile(var_dst);
                 }
-#ifdef WELFORD_POST_MUL
-                // Apply the user scalar to the reduced output: var(s*x)=s^2 var(x),
-                // std(s*x)=|s| std(x). mul_unary_tile is an SFPU op on DEST at full fp32
-                // precision .
-                binop_with_scalar_tile_init();
-                mul_unary_tile(var_dst, post_mul_scaler_bits);
-#endif
+                if (post_mul_scaler_bits != k_identity_scaler_bits) {
+                    // var(s*x)=s^2 var(x), std(s*x)=|s| std(x). SFPU mul on DEST at full fp32.
+                    binop_with_scalar_tile_init();
+                    mul_unary_tile(var_dst, post_mul_scaler_bits);
+                }
                 tile_regs_commit();
             }
             start_N += tile_height;

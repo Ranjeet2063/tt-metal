@@ -18,7 +18,8 @@ compute_program_hash() includes:
   input memory_config, input padded_shape.
 
 Scalar values (scaler / post_mul_scaler) are runtime args and are excluded from the
-hash (#54180). override_runtime_arguments() re-applies them on every hit.
+hash (#54180). Welford's scalar and correction are likewise runtime args.
+override_runtime_arguments() re-applies them on every hit.
 """
 
 import pytest
@@ -371,3 +372,60 @@ def test_single_core_hw_sum_pos_and_neg_scalar_share_cache(device, isolate_progr
     assert (
         after_pos == after_neg
     ), f"1-tile HW SUM compiled a new program for the opposite sign: {after_pos} -> {after_neg}."
+
+
+# Welford scalar and correction are runtime args (#54180 phase 3). std vs var stay
+# different programs (is_std is hashed).
+TORCH_WELFORD = {
+    ttnn.var: lambda x, dim, correction: torch.var(x, dim=dim, keepdim=True, correction=correction),
+    ttnn.std: lambda x, dim, correction: torch.std(x, dim=dim, keepdim=True, correction=correction),
+}
+
+
+@pytest.mark.parametrize("op", [ttnn.var, ttnn.std], ids=["var", "std"])
+@pytest.mark.parametrize("dim", [-1, -2, [-2, -1]], ids=["dim_w", "dim_h", "dim_hw"])
+def test_welford_scalar_value_does_not_add_cache_entries(device, isolate_program_cache, op, dim):
+    """Several distinct scalars on one std/var call must not grow the program cache."""
+    torch.manual_seed(0)
+    torch_a = (torch.rand([1, 1, 64, 64], dtype=torch.float32) + 0.1).bfloat16()
+    tt_a = ttnn.from_torch(torch_a, layout=ttnn.TILE_LAYOUT, device=device)
+    scalars = (1.0, 2.0, 0.5, -2.0)
+
+    entries = []
+    for scalar in scalars:
+        tt_out = op(tt_a, dim=dim, keepdim=True, scalar=scalar, correction=True)
+        assert_numeric_metrics(
+            TORCH_WELFORD[op](scalar * torch_a.float(), dim, True),
+            ttnn.to_torch(tt_out).float(),
+            pcc_threshold=0.999,
+            rtol=1e-02,
+            atol=1e-02,
+            frobenius_threshold=1e-01,
+        )
+        entries.append(device.num_program_cache_entries())
+
+    assert len(set(entries)) == 1, f"Welford cache grew with the scalar: entries={entries} for scalars={scalars}."
+
+
+@pytest.mark.parametrize("op", [ttnn.var, ttnn.std], ids=["var", "std"])
+@pytest.mark.parametrize("dim", [-1, -2, [-2, -1]], ids=["dim_w", "dim_h", "dim_hw"])
+def test_welford_correction_does_not_add_cache_entries(device, isolate_program_cache, op, dim):
+    """correction true/false must reuse one program; results still follow Bessel vs population."""
+    torch.manual_seed(0)
+    torch_a = (torch.rand([1, 1, 64, 64], dtype=torch.float32) + 0.1).bfloat16()
+    tt_a = ttnn.from_torch(torch_a, layout=ttnn.TILE_LAYOUT, device=device)
+
+    entries = []
+    for correction in (True, False):
+        tt_out = op(tt_a, dim=dim, keepdim=True, scalar=1.0, correction=correction)
+        assert_numeric_metrics(
+            TORCH_WELFORD[op](torch_a.float(), dim, correction),
+            ttnn.to_torch(tt_out).float(),
+            pcc_threshold=0.999,
+            rtol=1e-02,
+            atol=1e-02,
+            frobenius_threshold=1e-01,
+        )
+        entries.append(device.num_program_cache_entries())
+
+    assert len(set(entries)) == 1, f"Welford cache grew with correction: entries={entries}."

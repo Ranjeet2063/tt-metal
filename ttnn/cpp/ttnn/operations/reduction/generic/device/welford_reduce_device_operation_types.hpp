@@ -15,12 +15,12 @@ namespace ttnn::prim {
 struct WelfordReduceParams {
     tt::tt_metal::ReduceOpMath math_op{};
     tt::tt_metal::ReduceOpDim reduce_dim{tt::tt_metal::ReduceOpDim::H};
-    float scalar{1.0f};
+    float scalar{1.0f};  // runtime arg; excluded from the program hash
     tt::tt_metal::MemoryConfig output_mem_config;
     tt::tt_metal::DataType output_dtype{tt::tt_metal::DataType::INVALID};
     ttnn::DeviceComputeKernelConfig compute_kernel_config;
     std::optional<tt::tt_metal::CoreRangeSet> sub_core_grids;
-    bool correction{true};
+    bool correction{true};  // runtime arg; excluded from the program hash
     uint32_t reduce_batch_size{1};
 };
 

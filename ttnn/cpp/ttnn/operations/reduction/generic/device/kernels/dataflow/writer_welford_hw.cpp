@@ -110,14 +110,15 @@ void kernel_main() {
     const std::uint32_t dst_addr = get_arg_val<std::uint32_t>(0);
     const std::uint32_t NC_per_core = get_arg_val<std::uint32_t>(1);
     const std::uint32_t output_tile_start_id = get_arg_val<std::uint32_t>(2);
+    // Bessel's correction (divide by N-1). Host rejects N < 2 when this is set.
+    const bool correction = get_arg_val<std::uint32_t>(3) != 0;
 
     constexpr std::uint32_t Wt = get_compile_time_arg_val(0);
     constexpr std::uint32_t W = get_compile_time_arg_val(1);
     constexpr std::uint32_t tile_width = get_compile_time_arg_val(2);
     constexpr std::uint32_t H = get_compile_time_arg_val(3);
-    constexpr bool correction = get_compile_time_arg_val(4) != 0;
-    constexpr std::uint32_t reduce_batch_size = get_compile_time_arg_val(5);
-    constexpr bool combined_is_bf16 = get_compile_time_arg_val(6) != 0;
+    constexpr std::uint32_t reduce_batch_size = get_compile_time_arg_val(4);
+    constexpr bool combined_is_bf16 = get_compile_time_arg_val(5) != 0;
     static_assert(tile_width == welford_block_size);
 
     constexpr std::uint32_t num_partials = reduce_batch_size * W;
@@ -134,7 +135,7 @@ void kernel_main() {
     // cb_out: output tile packed by compute in the correct data format.
     constexpr auto dfb_out = tt::CBIndex::c_16;
 
-    constexpr auto dst_args = TensorAccessorArgs<7>();
+    constexpr auto dst_args = TensorAccessorArgs<6>();
 
     // welford_finalize_to_row stores 32 per-column values in tile row 0.
     // In tile format, row 0 spans Face 0 (columns 0-15) and Face 1 (columns 16-31).
@@ -241,13 +242,13 @@ void kernel_main() {
         }
 
         constexpr float inv_num_partials = 1.0f / static_cast<float>(num_partials);
+        constexpr std::uint32_t sample_count = num_partials * H;
         float final_var;
-        if constexpr (correction) {
-            constexpr std::uint32_t sample_count = num_partials * H;
+        if (correction) {
+            ASSERT(sample_count >= 2);
             // variance_sum / num_partials is the population variance. Folding the sample
             // count correction into it cancels num_partials from the divisor.
-            constexpr float correction_scale = static_cast<float>(H) / static_cast<float>(sample_count - 1);
-            final_var = combined.variance_sum * correction_scale;
+            final_var = combined.variance_sum * (static_cast<float>(H) / static_cast<float>(sample_count - 1));
         } else {
             final_var = combined.variance_sum * inv_num_partials;
         }

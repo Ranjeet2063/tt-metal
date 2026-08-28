@@ -22,7 +22,8 @@ void WelfordReduceDeviceOperation::validate_on_program_cache_miss(
         tensor_args.storage_type() == StorageType::DEVICE,
         "Operands to Std/Var reductions need to be on device! Got storage type: {}",
         tensor_args.storage_type());
-    TT_FATAL(tensor_args.buffer() != nullptr, "Operands to Std/Var reductions need to be allocated in buffers on device!");
+    TT_FATAL(
+        tensor_args.buffer() != nullptr, "Operands to Std/Var reductions need to be allocated in buffers on device!");
     TT_FATAL((tensor_args.layout() == Layout::TILE), "Inputs to Std/Var reductions must be tilized");
     TT_FATAL(
         tensor_args.dtype() == DataType::BFLOAT16 || tensor_args.dtype() == DataType::FLOAT32 ||
@@ -35,6 +36,17 @@ void WelfordReduceDeviceOperation::validate_on_program_cache_miss(
         tensor_args.logical_shape().rank());
     validate_reduce_sharded_buffer_types(
         tensor_args.memory_config(), operation_attributes.output_mem_config, "Std/Var reduction");
+}
+
+ttsl::hash::hash_t WelfordReduceDeviceOperation::compute_program_hash(
+    const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
+    // Zero the scalar and correction so the cache keys on is_std (math_op), not the values.
+    // override_runtime_arguments re-applies them.
+    operation_attributes_t hashed_attributes = operation_attributes;
+    hashed_attributes.scalar = 0.0f;
+    hashed_attributes.correction = false;
+    return ttsl::hash::hash_objects_with_default_seed(
+        ttsl::hash::type_hash<WelfordReduceDeviceOperation>, hashed_attributes, tensor_args);
 }
 
 WelfordReduceDeviceOperation::spec_return_value_t WelfordReduceDeviceOperation::compute_output_specs(
@@ -97,6 +109,17 @@ ttnn::Tensor welford_reduce(
         MathFidelity::HiFi4,
         /*default_approx_mode=*/false,
         /*default_fp32_acc=*/true));
+
+    // Always-on: correction is a runtime arg and no longer misses the cache.
+    if (correction) {
+        const auto& shape = input_tensor.logical_shape();
+        const uint64_t H = shape[-2];
+        const uint64_t W = shape[-1];
+        const uint64_t n = reduce_dim == tt::tt_metal::ReduceOpDim::W   ? W
+                           : reduce_dim == tt::tt_metal::ReduceOpDim::H ? H
+                                                                        : H * W * reduce_batch_size;
+        TT_FATAL(n >= 2, "Bessel's correction requires at least 2 elements, got {}", n);
+    }
 
     return ttnn::device_operation::launch<WelfordReduceDeviceOperation>(
         WelfordReduceParams{
