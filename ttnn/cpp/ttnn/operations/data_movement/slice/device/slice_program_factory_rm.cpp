@@ -38,8 +38,9 @@ struct ChunkingParams {
 // and misalignment are hash-constant per cache entry (slice_start, dtype, input memory_config are all
 // folded into compute_program_hash), so only the buffer address changes between dispatches. A plain
 // Buffer* binding can only re-emit the bare base, not base+offset, so this value instead rides on
-// SliceDeviceOperation::get_dynamic_runtime_args (re-emitted on every cache hit). create_descriptor and
-// get_dynamic_runtime_args both call this helper so the emitted value can never drift.
+// slice_rm_reader_dynamic_args, which patch_slice_program_addresses applies on every cache hit.
+// create_descriptor and slice_rm_reader_dynamic_args both call this helper so the emitted value can
+// never drift.
 inline uint32_t slice_rm_reader_base_address(const Tensor& input, const ttnn::Shape& slice_start) {
     const uint32_t begins_bytes = slice_start[-1] * input.element_size();
     const auto src_buffer_alignment = input.buffer()->buffer_type() == tt::tt_metal::BufferType::DRAM
@@ -102,8 +103,8 @@ inline std::vector<std::pair<std::vector<uint32_t>, std::vector<uint32_t>>> get_
     const uint32_t reader_page_size = per_shard_page_size_bytes(input_tensor, padded_row_size_bytes);
 
     std::vector<uint32_t> common_reader_kernel_args = {
-        // Aligned source base; re-emitted on every cache hit by get_dynamic_runtime_args (base+offset
-        // cannot be a plain Buffer* binding). Same helper as get_dynamic_runtime_args so it can't drift.
+        // Aligned source base; re-emitted on every cache hit by slice_rm_reader_dynamic_args
+        // (base+offset cannot be a plain Buffer* binding). Same helper, so the two cannot drift.
         slice_rm_reader_base_address(input_tensor, output_tensor_start),
         reader_page_size,
         unpadded_row_size_bytes,
