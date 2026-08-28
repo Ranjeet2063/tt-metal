@@ -203,6 +203,7 @@ Tensor reduce(
 
     // Mechanism from op semantics only; identity is skipped in the kernel. Int32 post-mul is
     // lossy for |result| > 2^24 (rounds through fp32). Accurate-fp32 mean applies 1/N here.
+    // Single-core HW overrides to PostMul at launch (REDUCE_SCALAR applies the tile twice).
     const ttnn::prim::ScalerMode scaler_mode =
         ttnn::prim::select_scaler_mode(reduce_math, prepared_input.dtype(), use_sfpu_fp32_reduce);
     const bool use_post_mul = scaler_mode == ttnn::prim::ScalerMode::PostMul;
@@ -235,12 +236,6 @@ Tensor reduce(
             return ttnn::neg(h_out, output_mem_config, std::nullopt, sub_core_grids);
         };
 
-    // The single-core HW path uses REDUCE_SCALAR mode, which applies the
-    // scaler twice internally (once per dimension).  The host compensates with
-    // sqrt(scaler) in ReduceSingleCoreHwProgramFactory::create.
-    // However, sqrt of a negative number is NaN, so negative scalers
-    // must take the two-step W-then-H path where the scaler is applied once.
-    //
     // INT32 SFPU reduce has no REDUCE_SCALAR primitive (ROW/COL only), so Int32 HW always uses
     // W-then-H. Fast-mode Float32 max HW can use single-core REDUCE_SCALAR (FPU) when num_tiles == 1;
     // multi-tile HW still uses W-then-H via is_multicore_hw. Applies to Int32 MAX/SUM/MIN.
@@ -253,8 +248,7 @@ Tensor reduce(
            reduce_math == tt::tt_metal::ReduceOpMath::MIN)) ||
          use_sfpu_fp32_reduce);
 
-    if (is_multicore_hw || use_two_step_hw_sfpu_reduce ||
-        (reduce_dim == tt::tt_metal::ReduceOpDim::HW && reduce_scaler < 0)) {
+    if (is_multicore_hw || use_two_step_hw_sfpu_reduce) {
         // Multi-core HW reduction: first reduce W, then reduce H on the result.
         // Keep the W intermediate in FP32 (only H packs to BF16) to preserve accumulation
         // precision. Applies to SUM only:
@@ -380,18 +374,25 @@ Tensor reduce(
         }
     }
 
+    // Single-core REDUCE_SCALAR applies the scaler tile twice. Identity + one post-mul
+    // is independent of the scalar value (including negatives).
+    const bool single_core_hw = reduce_dim == tt::tt_metal::ReduceOpDim::HW;
+    const float hw_scaler = single_core_hw ? 1.0f : reduce_scaler;
+    const float hw_post_mul = single_core_hw ? scaler : post_mul;
+    const ttnn::prim::ScalerMode hw_scaler_mode = single_core_hw ? ttnn::prim::ScalerMode::PostMul : scaler_mode;
+
     return ttnn::prim::reduce(
         prepared_input,
         prim_reduce_math,
         reduce_dim,
-        reduce_scaler,
+        hw_scaler,
         output_mem_config,
         output_dtype.value_or(input_tensor.dtype()),
         config,
         sub_core_grids,
         negate,
-        /*post_mul_scaler=*/post_mul,
-        /*scaler_mode=*/scaler_mode,
+        /*post_mul_scaler=*/hw_post_mul,
+        /*scaler_mode=*/hw_scaler_mode,
         /*row_major_w_dense_path=*/use_rm_dense_w,
         /*row_major_h_dense_path=*/use_rm_dense_h,
         /*use_sfpu_reduce=*/use_sfpu_fp32_reduce,

@@ -9,7 +9,6 @@
 #include <tt-metalium/tensor_accessor_args.hpp>
 #include <tt-metalium/program_descriptors.hpp>
 #include <bit>
-#include <cmath>
 #include <map>
 
 namespace ttnn::prim {
@@ -39,10 +38,12 @@ tt::tt_metal::ProgramDescriptor ReduceDeviceOperation::ReduceSingleCoreHwProgram
         "ReduceSingleCoreHwProgramFactory supports HW dim only, got dim enum value {}",
         static_cast<int>(operation_attributes.dim));
 
-    // REDUCE_SCALAR applies the scaler once per dim, so the reader gets sqrt(scaler). Negative
-    // scalars cannot use this path (sqrt is NaN) and take the two-step W-then-H path instead.
-    TT_FATAL(operation_attributes.scaler >= 0, "Scalar must be non-negative");
-    float scaler = std::sqrt(operation_attributes.scaler);
+    // REDUCE_SCALAR applies the scaler tile once per dim. The user scalar is a post-mul, so
+    // the tile is identity and this factory does not depend on the value (or its sign).
+    TT_FATAL(
+        operation_attributes.scaler_mode == ScalerMode::PostMul,
+        "Single-core HW reduce always post-multiplies; got scaler_mode {}",
+        static_cast<int>(operation_attributes.scaler_mode));
 
     TT_FATAL(
         H % tile_height == 0 && W % tile_width == 0, "Reduce HW expects tile-aligned padded shape H={}, W={}", H, W);
@@ -189,7 +190,7 @@ tt::tt_metal::ProgramDescriptor ReduceDeviceOperation::ReduceSingleCoreHwProgram
         .fp32_dest_acc_en = fp32_dest_acc_en,
     };
 
-    reader_desc.emplace_runtime_args(selected_core_coord, {a, num_tensor_tiles, 0u, std::bit_cast<uint32_t>(scaler)});
+    reader_desc.emplace_runtime_args(selected_core_coord, {a, num_tensor_tiles, 0u, std::bit_cast<uint32_t>(1.0f)});
 
     TT_FATAL(Ht != 0 && Wt != 0, "Height and width in tiles must be non-zero (Ht={}, Wt={}, H={}, W={})", Ht, Wt, H, W);
     uint32_t out_dim_divider = Ht * Wt;
@@ -216,11 +217,11 @@ void ReduceDeviceOperation::ReduceSingleCoreHwProgramFactory::override_runtime_a
     tensor_return_value_t& tensor_return_value,
     const std::optional<ttnn::MeshCoordinate>& /*mesh_dispatch_coordinate*/) {
     enum : uint32_t { kReader = 0, kWriter = 1, kCompute = 2 };
-    const uint32_t scaler_bits = std::bit_cast<uint32_t>(std::sqrt(operation_attributes.scaler));
     patch_cached_runtime_args(
         program,
         kReader,
-        {{0, tensor_args.mesh_tensor().mesh_buffer().get_reference_buffer()->address()}, {3, scaler_bits}});
+        {{0, tensor_args.mesh_tensor().mesh_buffer().get_reference_buffer()->address()},
+         {3, std::bit_cast<uint32_t>(1.0f)}});
     patch_cached_runtime_args(
         program, kWriter, {{0, tensor_return_value.mesh_tensor().mesh_buffer().get_reference_buffer()->address()}});
     patch_cached_runtime_args(program, kCompute, {{0, std::bit_cast<uint32_t>(operation_attributes.post_mul_scaler)}});

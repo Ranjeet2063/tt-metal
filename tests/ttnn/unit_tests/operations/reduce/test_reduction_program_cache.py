@@ -329,3 +329,45 @@ def test_reduce_scalar_value_does_not_add_cache_entries(device, isolate_program_
         f"cache grew with the scalar value: entries={entries} for scalars={scalars}. "
         "The scalar must be a runtime arg, not part of the program hash."
     )
+
+
+@pytest.mark.parametrize("op", [ttnn.sum, ttnn.max, ttnn.min], ids=["sum", "max", "min"])
+@pytest.mark.parametrize("scalars", [(1.0, 2.0, 0.25), (-1.0, -2.0, -0.5)], ids=["pos", "neg"])
+def test_single_core_hw_scalar_value_does_not_add_cache_entries(device, isolate_program_cache, op, scalars):
+    """1-tile HW: identity scaler tile + runtime post-mul. Sign used to pick W-then-H."""
+    torch.manual_seed(0)
+    row_ramp = 1.0 + torch.arange(32, dtype=torch.float32).reshape(1, 1, 32, 1) * 0.1
+    col_ramp = 1.0 + torch.arange(32, dtype=torch.float32).reshape(1, 1, 1, 32) * 0.05
+    torch_a = ((torch.rand([1, 1, 32, 32], dtype=torch.float32) + 0.1) * row_ramp * col_ramp).bfloat16()
+    tt_a = ttnn.from_torch(torch_a, layout=ttnn.TILE_LAYOUT, device=device)
+
+    entries = []
+    for scalar in scalars:
+        tt_out = op(tt_a, dim=[-2, -1], keepdim=True, scalar=scalar)
+        assert_numeric_metrics(
+            TORCH_REDUCE[op](scalar * torch_a.float(), [-2, -1]),
+            ttnn.to_torch(tt_out).float(),
+            pcc_threshold=0.999,
+            rtol=1e-02,
+            atol=1e-02,
+            frobenius_threshold=1e-01,
+        )
+        entries.append(device.num_program_cache_entries())
+
+    assert len(set(entries)) == 1, f"1-tile HW cache grew with the scalar: entries={entries} for scalars={scalars}."
+
+
+def test_single_core_hw_sum_pos_and_neg_scalar_share_cache(device, isolate_program_cache):
+    """SUM no longer forks topology on scaler sign (the old sqrt-NaN two-step)."""
+    torch.manual_seed(0)
+    torch_a = torch.rand([1, 1, 32, 32], dtype=torch.float32).bfloat16()
+    tt_a = ttnn.from_torch(torch_a, layout=ttnn.TILE_LAYOUT, device=device)
+
+    ttnn.sum(tt_a, dim=[-2, -1], keepdim=True, scalar=2.0)
+    after_pos = device.num_program_cache_entries()
+    ttnn.sum(tt_a, dim=[-2, -1], keepdim=True, scalar=-2.0)
+    after_neg = device.num_program_cache_entries()
+
+    assert (
+        after_pos == after_neg
+    ), f"1-tile HW SUM compiled a new program for the opposite sign: {after_pos} -> {after_neg}."
