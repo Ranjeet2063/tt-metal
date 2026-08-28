@@ -8,7 +8,7 @@
 - Report schema (must be updated with any metric rename): [tests/python_tests/helpers/perf_schema.py](../../tests/python_tests/helpers/perf_schema.py)
 - Host-side counter readback: [tests/python_tests/helpers/counters.py](../../tests/python_tests/helpers/counters.py)
 - Host-side derived metrics: [tests/python_tests/helpers/metrics.py](../../tests/python_tests/helpers/metrics.py)
-- Test driver: [tests/python_tests/helpers/perf.py](../../tests/python_tests/helpers/perf.py)
+- Test driver: [tests/python_tests/helpers/perf/core.py](../../tests/python_tests/helpers/perf/core.py)
 - Test sources: [tests/sources/](../../tests/sources/) (files ending in `_perf.cpp`)
 - Pytest CLI registration: [tests/python_tests/conftest.py](../../tests/python_tests/conftest.py)
 - Upstream tech report (metal-level): [tech_reports/PerfCounters/perf-counters.md](../../../../tech_reports/PerfCounters/perf-counters.md)
@@ -138,10 +138,10 @@ cd tt_metal/tt-llk/tests     # LLK_HOME is defaulted by conftest.py; you do not 
 export CHIP_ARCH=blackhole   # or wormhole; counters are not compiled on quasar
 
 # Phase 1 — build all variants (no HW access)
-pytest --compile-producer --enable-perf-counters -n 8 -x ./python_tests/perf_eltwise_binary_fpu.py
+pytest --compile-producer --enable-perf-counters -n 8 -x ./python_tests/perf_eltwise_binary.py
 
 # Phase 2 — run on HW
-pytest --compile-consumer --enable-perf-counters -x ./python_tests/perf_eltwise_binary_fpu.py
+pytest --compile-consumer --enable-perf-counters -x ./python_tests/perf_eltwise_binary.py
 ```
 
 Wipe the artefact root (`/tmp/tt-llk-build`, or `$RUNNER_TEMP/tt-llk-build`) when switching between the two builds: the variant hash and the build markers ignore the counter flags, so the ELFs are otherwise reused.
