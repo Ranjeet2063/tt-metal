@@ -11,7 +11,7 @@
 #endif
 
 // The one cross-thread rendezvous for the perf harness, outside every build guard so both builds
-// compile the same barrier. On a semaphore, not L1: symmetric release, no traffic on what is measured.
+// compile the same barrier. On semaphores, not L1: no traffic on what is being measured.
 
 namespace llk_barrier
 {
@@ -22,35 +22,43 @@ namespace llk_barrier
 
 constexpr std::uint32_t NUM_THREADS = 3; // unpack, math, pack
 
-// Unused by the LLK library, though some kernels under tests/sources/ do use it as a pack-to-unpack
-// handshake; safe today because sync_threads runs once and leaves the count at 0.
-constexpr std::uint8_t RENDEZVOUS_SEM = ckernel::semaphore::PACK_DONE;
+// ARRIVE is the perf-designated semaphore; the fuser also posts it, so arrivals are drained every
+// round rather than left to accumulate. RELEASE is unused by the ops and by every generated kernel.
+constexpr std::uint8_t ARRIVE_SEM  = ckernel::semaphore::PACK_DONE;
+constexpr std::uint8_t RELEASE_SEM = ckernel::semaphore::UNPACK_OPERAND_SYNC;
 
-// Everyone announces by incrementing; the action thread waits for all, runs action(), then drains back
-// to zero, and that return to zero is the release. Needs exactly one action thread and all to arrive.
+// Peers announce on ARRIVE and wait for a token on RELEASE; the action thread collects the arrivals,
+// runs action(), then hands out one token per peer. The release is a token each peer consumes, not a
+// level it has to observe, so a peer that samples late still finds its token: no timing assumption.
 template <typename Action>
 __attribute__((always_inline)) inline void rendezvous(bool is_action_thread, Action action)
 {
     ckernel::fence_compiler();
 
-    ckernel::semaphore_post(RENDEZVOUS_SEM);
-
     if (is_action_thread)
     {
-        while (ckernel::semaphore_read(RENDEZVOUS_SEM) < NUM_THREADS)
+        while (ckernel::semaphore_read(ARRIVE_SEM) < NUM_THREADS - 1)
         {
         }
-        action();
-        while (ckernel::semaphore_read(RENDEZVOUS_SEM) != 0)
+        while (ckernel::semaphore_read(ARRIVE_SEM) != 0)
         {
-            ckernel::semaphore_get(RENDEZVOUS_SEM);
+            ckernel::semaphore_get(ARRIVE_SEM);
+        }
+
+        action();
+
+        for (std::uint32_t i = 0; i < NUM_THREADS - 1; ++i)
+        {
+            ckernel::semaphore_post(RELEASE_SEM);
         }
     }
     else
     {
-        while (ckernel::semaphore_read(RENDEZVOUS_SEM) != 0)
+        ckernel::semaphore_post(ARRIVE_SEM);
+        while (ckernel::semaphore_read(RELEASE_SEM) == 0)
         {
         }
+        ckernel::semaphore_get(RELEASE_SEM);
     }
 
     ckernel::fence_compiler();

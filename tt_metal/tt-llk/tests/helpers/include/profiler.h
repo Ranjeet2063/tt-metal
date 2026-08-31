@@ -125,6 +125,9 @@ __attribute__((always_inline)) inline void sync_threads()
         }
     }
 #else
+    // The barrier hands out one release token per peer, so its count must match the threads that
+    // actually reach it, and NUM_CORES is where that count is decided.
+    static_assert(llk_barrier::NUM_THREADS == NUM_CORES, "llk_barrier::NUM_THREADS disagrees with llk_profiler::NUM_CORES");
     llk_barrier::rendezvous(llk_barrier::is_action_thread());
 #endif
 }
