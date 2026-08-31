@@ -14,13 +14,7 @@ MARKER = "marker"
 
 # Zone/marker names emitted by MEASURE_PERF_COUNTERS, in ID order. These must
 # match the marker values the kernels record; a mismatch silently empties the
-# TILE_LOOP mask in postprocess_tile_loop (no KeyError raised).
-INIT_MARKER = "INIT"
-TILE_LOOP_MARKER = "TILE_LOOP"
-
-
-# Values the kernels record in the `marker` column, one report row per zone. A mismatch silently empties
-# the TILE_LOOP mask in perf.py::_postprocess_tile_loop rather than raising.
+# TILE_LOOP mask in perf/core.py::postprocess_tile_loop (no KeyError raised).
 INIT_MARKER = "INIT"
 TILE_LOOP_MARKER = "TILE_LOOP"
 
