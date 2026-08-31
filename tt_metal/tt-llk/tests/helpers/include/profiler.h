@@ -64,18 +64,8 @@ enum class EntryType : std::uint32_t
     ZONE_END       = 0b1011
 };
 
-// Initialize id of the core executing the kernel
-#if defined(LLK_TRISC_UNPACK)
-constexpr std::uint32_t TRISC_ID = 0;
-#elif defined(LLK_TRISC_MATH)
-constexpr std::uint32_t TRISC_ID = 1;
-#elif defined(LLK_TRISC_PACK)
-constexpr std::uint32_t TRISC_ID = 2;
-#elif defined(LLK_TRISC_ISOLATE_SFPU)
-constexpr std::uint32_t TRISC_ID = 3;
-#else
-#error "Profiler can only be used on TRISC cores"
-#endif
+// One mapping, owned by barrier.h because the barrier needs it first.
+constexpr std::uint32_t TRISC_ID = llk_barrier::THREAD_ID;
 
 constexpr std::uint32_t BUFFER_LENGTH  = 0x400; // 1024 entries per core
 constexpr std::uint32_t ZONE_END_WORDS = 2;     // words written per ZONE_END on scope exit
@@ -87,6 +77,8 @@ constexpr std::uint32_t BUFFERS_END = 0x16F000;
 constexpr std::uint32_t NUM_CORES   = 3;
 constexpr std::uint32_t BUFFERS_END = 0x16E000;
 #endif
+static_assert(llk_barrier::NUM_THREADS == NUM_CORES, "llk_barrier::NUM_THREADS disagrees with llk_profiler::NUM_CORES");
+
 constexpr std::uint32_t BUFFERS_START = BUFFERS_END - (NUM_CORES * BUFFER_LENGTH * sizeof(std::uint32_t));
 
 constexpr std::uint32_t BARRIER_END   = BUFFERS_START;
@@ -106,27 +98,7 @@ extern std::uint32_t reserved_words_count;
 
 __attribute__((always_inline)) inline void sync_threads()
 {
-#if defined(ARCH_QUASAR)
-    // Quasar has no spare semaphore, so it keeps the L1 form. The generation is relative because the
-    // old absolute sentinel stopped being a barrier after the first launch (the array is never cleared).
-    auto& barrier           = *barrier_ptr;
-    const std::uint32_t gen = barrier[TRISC_ID] + 1;
-    barrier[TRISC_ID]       = gen;
-    ckernel::invalidate_data_cache();
-    for (std::uint32_t i = 0; i < NUM_CORES; ++i)
-    {
-        if (i == TRISC_ID)
-        {
-            continue;
-        }
-        while (barrier[i] != gen)
-        {
-            ckernel::invalidate_data_cache();
-        }
-    }
-#else
     llk_barrier::rendezvous(llk_barrier::is_action_thread());
-#endif
 }
 
 // Quasar's rendezvous above is the only remaining user of these L1 words. They stay reserved on every
