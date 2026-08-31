@@ -13,7 +13,6 @@ from .device_io import read_words_from_device
 from .test_config import TestConfig
 
 
-# Length of the shared config array (matches counters.h COUNTER_SLOT_COUNT).
 class CounterConfigError(RuntimeError):
     """The capture did not match what was requested, so the numbers are not usable."""
 
@@ -66,8 +65,6 @@ def _parse_hw_counters(text: str) -> dict:
     """Parse one hw_counters.h into {bank: {id: name}}; L1 is keyed by (id, mux)."""
     banks = {bank: {} for bank in COUNTER_BANK_NAMES.values()}
 
-    # Locate each `<name>_counters = ...` array, then read up to its terminating `};`.
-    # Slicing by declaration position is robust to the nested `{{...},{...}}` braces.
     decls = list(re.finditer(r"(\w+_counters)\s*=", text))
     for i, decl in enumerate(decls):
         name = decl.group(1)
@@ -103,8 +100,7 @@ def _load_counter_names(arch: ChipArchitecture) -> dict:
         return {bank: {} for bank in COUNTER_BANK_NAMES.values()}
     header = _metal_root() / f"tt_metal/hw/inc/internal/tt-1xx/{arch_dir}/hw_counters.h"
     banks = _parse_hw_counters(header.read_text())
-    # Fail loudly, not open: if the regex stops matching, every column becomes UNKNOWN and metrics.py
-    # turns the misses into 0.0, so the report is a page of plausible zeros with no error.
+    # Silently, every column becomes UNKNOWN and metrics.py turns the misses into a page of zeros.
     missing = [
         b
         for b in ("INSTRN_THREAD", "FPU", "TDMA_UNPACK", "TDMA_PACK", "L1")
@@ -118,8 +114,8 @@ def _load_counter_names(arch: ChipArchitecture) -> dict:
     return banks
 
 
-# The L1 group names from hw_counters.h are UNVERIFIED and several are wrong: the mux routes
-# interfaces at count time, so these are labels on indices, not confirmed client functions.
+# These L1 group names are unverified and several are known wrong: they label mux indices, not
+# confirmed client functions.
 COUNTER_NAMES = _load_counter_names(get_chip_architecture())
 
 
@@ -216,8 +212,8 @@ def _read_zone_counters(location: str, zone: int, zone_name: str) -> list[dict]:
         bank_name = COUNTER_BANK_NAMES.get(bank_id, f"UNKNOWN_{bank_id}")
 
         if bank_name == "L1" and l1_mux != TestConfig.PERF_L1_MUX_GROUP:
-            # The group is baked into brisc.elf, and nothing keys a rebuild on it, so a stale ELF
-            # would otherwise return a self-consistently labelled duplicate dataset.
+            # The group is baked into brisc.elf and nothing keys a rebuild on it, so a stale ELF
+            # would otherwise return a self-consistently mislabelled dataset.
             raise CounterConfigError(
                 f"L1 counters were captured with mux group {l1_mux}, but "
                 f"LLK_PERF_L1_MUX_GROUP={TestConfig.PERF_L1_MUX_GROUP} was requested. The ELF predates "

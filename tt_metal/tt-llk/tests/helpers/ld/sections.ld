@@ -132,10 +132,6 @@ SECTIONS
     *(.bss .bss.* .gnu.linkonce.b.*)
     *(COMMON)
     . = ALIGN(4);
-    /* Counter-build only, so it goes last: its presence must not shift other globals' gp-relative
-       offsets between builds. Inside [__ldm_bss_start, __ldm_bss_end), so do_crt0() zero-inits it. */
-    *(.perf_counters_bss)
-    . = ALIGN(4);
     __ldm_bss_end = .;
   } > REGION_DATA
 
