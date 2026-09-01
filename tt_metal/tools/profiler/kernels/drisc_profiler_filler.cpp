@@ -28,13 +28,7 @@ constexpr uint32_t kDoneAddr = get_named_compile_time_arg_val("done_addr");
 // Host writes 1 = quiesce, 2 = free the NIU.
 constexpr uint32_t kStopAddr = get_named_compile_time_arg_val("stop_addr");
 constexpr uint32_t kSocketConfigAddr = get_named_compile_time_arg_val("socket_config_addr");
-constexpr uint32_t kMaxSweeps = get_named_compile_time_arg_val("max_sweeps");
 constexpr uint32_t kMaxCores = get_named_compile_time_arg_val("max_cores");
-// Idle pacing seed; 0 = continuous.
-constexpr uint32_t kGapCycles = get_named_compile_time_arg_val("gap_cycles");
-// 0 only to reproduce the stale-mirror wedge.
-constexpr uint32_t kNocInit = get_named_compile_time_arg_val("noc_init");
-constexpr uint32_t kPcieEncOverride = get_named_compile_time_arg_val("pcie_enc_override");
 // Static VC for PCIe pushes, spread across fillers by the host.
 constexpr uint32_t kWriteVc = get_named_compile_time_arg_val("write_vc");
 // Ship threshold, percent of one ring. Binds on the core's fullest LANE, not its span: the
@@ -128,13 +122,11 @@ void kernel_main() {
     // Resync the software NoC counter mirrors from hardware. They persist across launches on this
     // never-reset core and firmware only initialises them at boot, so a previous run that ended
     // with unacked writes would wedge this run's first barrier.
-    if constexpr (kNocInit) {
-        noc_local_state_init(NOC_INDEX);
-        noc_local_state_init(kReadNoc);
-    }
+    noc_local_state_init(NOC_INDEX);
+    noc_local_state_init(kReadNoc);
 
     SocketSenderInterface sender = create_sender_socket_interface(kSocketConfigAddr);
-    const uint32_t pcie_xy_enc = kPcieEncOverride != 0 ? kPcieEncOverride : sender.d2h.pcie_xy_enc;
+    const uint32_t pcie_xy_enc = sender.d2h.pcie_xy_enc;
     const uint64_t pcie_base = (static_cast<uint64_t>(sender.d2h.data_addr_hi) << 32) | sender.downstream_fifo_addr;
     set_sender_socket_page_size(sender, kPageBytes);
     // Egress write command state, programmed once: nothing else on this core touches write_cmd_buf
@@ -184,7 +176,7 @@ void kernel_main() {
 
     uint32_t frames = 0;
     uint32_t sweeps = 0;
-    uint32_t gap = kGapCycles;  // idle pacing; seeded at 0 so the first sweep runs immediately
+    uint32_t gap = 0;
     // Ship-threshold arming. Batching must never hold pre-burst trickle across a burst onset (a
     // pre-loaded ring tips over during the detection latency), and occupancy alone cannot tell
     // one-shot trickle from a light workload's steady sub-threshold lanes. Growth persistence can:
@@ -506,7 +498,7 @@ void kernel_main() {
     // silently truncated captures.
     uint64_t stop_seen_at = 0;
     uint32_t frames_at_stop_check = 0;
-    while (sweeps < kMaxSweeps) {
+    for (;;) {
         invalidate_l1_cache();
         if (*stop != 0) {
             if (stop_seen_at == 0) {

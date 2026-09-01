@@ -61,18 +61,6 @@ namespace tt::tt_metal {
 namespace pz = tt::tt_metal::profiler;
 
 namespace {
-// TT_METAL_PERF_DEBUG_DRISC_GAP: fixed inter-sweep gap in device cycles for the DRISC drainer. 0 (default)
-// means continuous sweeping -- peak throughput. Bulk reads cost 41x the NoC bytes of the old poll, so a
-// non-zero gap is how that traffic gets bounded once peak is no longer the goal; this is the knob a pacing
-// controller would drive.
-uint32_t drisc_gap_cycles() {
-    static const uint32_t v = [] {
-        const char* s = std::getenv("TT_METAL_PERF_DEBUG_DRISC_GAP");
-        return (s == nullptr || *s == '\0') ? 0u : static_cast<uint32_t>(std::strtoul(s, nullptr, 10));
-    }();
-    return v;
-}
-
 
 // TT_METAL_PERF_DEBUG_NO_STATIC_TLB: skip configuring a static TLB window for the DRISC drainer, leaving the
 // socket's ack write on UMD's dynamic (reconfigure-per-access) path. Exists so static-vs-dynamic can be A/B'd
@@ -86,18 +74,6 @@ bool no_static_tlb() {
 }
 
 
-// TT_METAL_PERF_DEBUG_NO_NOC_INIT: do not resync the drainer's software NoC counter mirrors from hardware at
-// kernel entry. That resync is what fixes the slow-dispatch wedge (a resident core's mirrors persist across
-// launches, so a run that ends with writes unacked leaves the next run's write barrier unsatisfiable). This
-// knob exists to bring the wedge BACK on the same binary -- a fix you cannot un-apply is a fix you cannot
-// prove. Diagnostic only; it deliberately reintroduces a hang.
-bool no_noc_init() {
-    static const bool v = [] {
-        const char* s = std::getenv("TT_METAL_PERF_DEBUG_NO_NOC_INIT");
-        return s != nullptr && *s != '\0' && *s != '0';
-    }();
-    return v;
-}
 
 // ABLATION: strip the drain loop to EGRESS ONLY -- no worker reads, no per-core processing; the drainer
 // re-ships pre-staged mock bytes forever. Pair with NO_DECODE=1, since the payload is mock.
@@ -354,22 +330,6 @@ bool filler_assign_xsplit() {
         const char* s = std::getenv("TT_METAL_PERF_DEBUG_FILLER_ASSIGN");
         return s != nullptr && std::string_view(s) == "xsplit";
     }();
-    return v;
-}
-
-// TT_METAL_PERF_DEBUG_PCIE_SPLIT=1: point odd-numbered fillers at the SECOND PCIe tile.
-//
-// Blackhole has two PCIe tiles (NOC0 (2,0) and (11,0)), and D2HSocket always takes pcie_cores.front(), so
-// all six fillers' egress arcs converge on one tile and share links. Per-filler service interval spreads
-// 45% with no assignment scheme able to move it (band permutation, subchannel, bank roster and NoC-half
-// splits are all null), and arc contention on the shared egress path is the remaining explanation.
-//
-// DIAGNOSTIC, and it may simply not work: on the PinnedMemory/IOMMU path the tile comes from UMD's mapping
-// of the host buffer, so the second tile is not necessarily wired to the same buffer. The existing comment
-// on pcie_enc_override records the failure mode -- pages still flow but decode yields ZERO markers -- so
-// treat a zero-marker capture as "the second tile does not reach this buffer", not as a perf result.
-bool pcie_split() {
-    static const bool v = perf_debug::env_flag("TT_METAL_PERF_DEBUG_PCIE_SPLIT");
     return v;
 }
 
@@ -1593,36 +1553,6 @@ bool PerfDebugProfiler::boot_device(
                 sizeof(zero4),
                 tt_cxy_pair(device_id, ctx.drisc_virtual[d]),
                 ctx.drisc_l1_noc[d] + (ctx.stop_addr[d] - ctx.drisc_l1_base[d]));
-            // Mirrored PCIe-tile encoding for NoC 1 (see drain_noc()). 0 => kernel uses the socket's NOC0 value.
-            // Always the socket's own PCIe encoding, on both NoCs. Mirroring the tile for NoC 1 was
-            // MEASURED WRONG: pages still flow (socket credits are a separate path) but decode yields ZERO
-            // markers, because the encoding is in TRANSLATED space (PCIE_NOC_X=19, PCIE_NOC_Y=24, outside
-            // the 17x12 NOC0 grid) while NOC_0_X_PHYS_COORD mirrors WORKER coordinates.
-            uint32_t pcie_enc_override = 0;
-            if (pcie_split()) {
-                const auto& pcie_cores = soc.get_cores(tt::CoreType::PCIE, tt::CoordSystem::NOC0);
-                std::string all;
-                for (const auto& c : pcie_cores) {
-                    all += fmt::format(" ({},{})", c.x, c.y);
-                }
-                log_info(
-                    tt::LogMetal,
-                    "[perf-debug profiler] filler {}: {} PCIe tile(s) ->{}",
-                    d,
-                    pcie_cores.size(),
-                    all);
-                if ((d & 1u) != 0 && pcie_cores.size() > 1) {
-                    pcie_enc_override = MetalContext::instance().hal().noc_xy_pcie64_encoding(
-                        pcie_cores[1].x, pcie_cores[1].y);
-                    log_info(
-                        tt::LogMetal,
-                        "[perf-debug profiler] filler {} egress -> SECOND PCIe tile ({},{}) enc 0x{:x}",
-                        d,
-                        pcie_cores[1].x,
-                        pcie_cores[1].y,
-                        pcie_enc_override);
-                }
-            }
 
             ctx.drain_program[d] = std::make_unique<Program>(CreateProgram());
             // Compile-time arguments by NAME: the kernel reads them with
@@ -1634,11 +1564,7 @@ bool PerfDebugProfiler::boot_device(
                 {"done_addr", ctx.done_addr[d]},
                 {"stop_addr", ctx.stop_addr[d]},
                 {"socket_config_addr", ctx.sockets[sk]->get_config_buffer_address()},
-                {"max_sweeps", 0xFFFFFFFFu},
                 {"max_cores", 128},
-                {"gap_cycles", drisc_gap_cycles()},
-                {"noc_init", no_noc_init() ? 0u : 1u},
-                {"pcie_enc_override", pcie_enc_override},
                 // With the egress NoC alternating on d&1, d&2 splits each NoC's pushers across two of
                 // the four unicast request VCs; TT_METAL_PERF_DEBUG_FILLER_VCS (comma-separated, one
                 // entry per filler) overrides the whole assignment for arbitration experiments at the
