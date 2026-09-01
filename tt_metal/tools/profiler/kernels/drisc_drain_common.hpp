@@ -72,10 +72,14 @@ inline void write_to_host_chunked(uint32_t pcie_xy_enc, uint32_t src_l1, uint64_
 // Returning false means "ship nothing this time"; the caller drops the frame. That is the right trade --
 // the heads have already been written back, so the producers keep running and only capture is lost.
 inline bool reserve_pages_bounded(
-    const SocketSenderInterface& socket, uint32_t num_pages, uint64_t deadline, volatile tt_l1_ptr uint32_t* stop) {
+    const SocketSenderInterface& socket, uint32_t num_pages, uint64_t wait_cycles, volatile tt_l1_ptr uint32_t* stop) {
     const uint32_t num_bytes = num_pages * socket.page_size;
     volatile tt_l1_ptr uint32_t* acked = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(socket.bytes_acked_base_addr);
     const uint32_t acked_end = socket.bytes_acked_base_addr + socket.num_downstreams * bytes_acked_size_bytes;
+    // The deadline arms only on a failed poll (here and in the two barriers below): a no-wait pass must
+    // never read the wall clock -- these run per batch, and clock reads on the service path measurably
+    // stall producers at the saturation boundary.
+    uint64_t deadline = 0;
     while (reinterpret_cast<uint32_t>(acked) < acked_end) {
         for (;;) {
             invalidate_l1_cache();
@@ -83,6 +87,9 @@ inline bool reserve_pages_bounded(
             const uint32_t bytes_free = socket.downstream_fifo_total_size - (socket.bytes_sent - *acked);
             if (bytes_free >= num_bytes) {
                 break;
+            }
+            if (deadline == 0) {
+                deadline = get_timestamp() + wait_cycles;
             }
             if (*stop != 0 || get_timestamp() >= deadline) {
                 return false;
@@ -111,7 +118,7 @@ inline bool reserve_pages_bounded(
 // spinning -- a hardware ack counter frozen against its software mirror is indistinguishable from a
 // stalled NoC in every other readout, and they are different bugs.
 template <bool sent_only = false, uint32_t dbg_addr = 0>
-inline bool write_barrier_bounded(uint64_t deadline) {
+inline bool write_barrier_bounded(uint64_t wait_cycles) {
     // Bounded on ITERATIONS as well as cycles: the cycle deadline assumes get_timestamp() advances AND
     // that the loop gets to evaluate it, and a wedged NIU breaks both. The cap does not actually free a
     // wedged core -- measured; control never returns from the flush check -- but a barrier bounded two
@@ -119,6 +126,7 @@ inline bool write_barrier_bounded(uint64_t deadline) {
     // 4M iterations is far beyond any healthy flush (worst observed is a handful).
     constexpr uint32_t kMaxSpins = 4u << 20;
     uint32_t spins = 0;
+    uint64_t deadline = 0;
     while (sent_only ? !ncrisc_noc_nonposted_writes_sent(NOC_INDEX)
                      : !ncrisc_noc_nonposted_writes_flushed(NOC_INDEX)) {
         if constexpr (dbg_addr != 0) {
@@ -127,6 +135,9 @@ inline bool write_barrier_bounded(uint64_t deadline) {
             dbg[1] = sent_only ? noc_nonposted_writes_num_issued[NOC_INDEX] : noc_nonposted_writes_acked[NOC_INDEX];
         }
         invalidate_l1_cache();
+        if (deadline == 0) {
+            deadline = get_timestamp() + wait_cycles;
+        }
         if (++spins >= kMaxSpins || get_timestamp() >= deadline) {
             return false;
         }
@@ -160,9 +171,12 @@ inline void dma_read_unchecked(uint8_t stream, uint64_t src_gddr, uint32_t dst_l
 // Bounded dma_async_write_wait_n (gddr_dma.h): the spool-mode staging-reuse gate. Completion, not "sent" --
 // the DMA engine has no sent analog, and completion (AXI write response received) is also what makes the
 // spool bytes observable to the stream-1 reads that consume them.
-inline bool dma_wait_writes_bounded(uint8_t stream, uint8_t n, uint64_t deadline) {
+inline bool dma_wait_writes_bounded(uint8_t stream, uint8_t n, uint64_t wait_cycles) {
+    uint64_t deadline = 0;
     while (experimental::dma_get_writes_outstanding(stream) > n) {
-        if (get_timestamp() >= deadline) {
+        if (deadline == 0) {
+            deadline = get_timestamp() + wait_cycles;
+        } else if (get_timestamp() >= deadline) {
             return false;
         }
     }
