@@ -9,13 +9,8 @@
 // Producers are lossless: a full ring blocks the worker, so the whole pipeline is flow-controlled
 // end to end and the producer stall counter is the perturbation ground truth.
 //
-// Wire format and placement history: tools/drisc_drain/FINDINGS.md. The diagnostic tiers this file
-// used to carry (phase counters, service histograms, the drainer's own device zones, the NIU
-// footprint sampler, the sync fiducial) and the results buffer they reported through were removed
-// on 2026-09-01; tools/drisc_drain/INSTRUMENTATION_NOTES.md records their layouts and findings.
-//
-// Compile-time arguments are passed by NAME, so adding or retiring one is a local edit -- the
-// positional form made every index a JIT cache key and forced dead slots to stay occupied.
+// Wire format and placement history: tools/drisc_drain/FINDINGS.md; the retired diagnostic tiers
+// and their findings: tools/drisc_drain/INSTRUMENTATION_NOTES.md.
 
 #include "drisc_drain_common.hpp"
 
@@ -248,10 +243,8 @@ void kernel_main() {
     bool notify_pending = false;    // pump ships owe the host a bytes_sent notify (batched per sweep)
     // Pump effort, a pure function of spool occupancy. 0: idle sweeps and the pace gap only.
     // 1: one post-sweep pass every other sweep. 2: post-sweep every sweep. 3: also inline per-batch
-    // and in the read-wait spin. Graduated because the bang-bang predecessor (engage 5/8, release
-    // 1/16) applied a +2.4 us step to sweeps running a couple of microseconds from ring-full; each
-    // graduated step costs well under a microsecond, and at sustained equilibrium the stream flows
-    // continuously instead of in ~50 ms sawtooth dumps.
+    // and in the read-wait spin. Graduated, not bang-bang: one step is well under a microsecond,
+    // where a single engage/release threshold added +2.4 us to sweeps already near ring-full.
     uint32_t pump_level = 0;
     // The freshness deadline wants at least a per-sweep trickle. Latched: a light workload that
     // never reaches the occupancy bands degrades into a permanent trickle after the first deadline,
@@ -704,13 +697,10 @@ void kernel_main() {
                     const uint32_t ring_src = cv_src + (kCtrlWords + r * kRingWords) * 4u;
                     const uint32_t hm = start & (kRingWords - 1u);
                     if (img) {
-                        // A near-full wrapping run ships as its whole ring image in one read;
-                        // the decoder linearises by head using the same shared predicate. This
-                        // is nearly every lane at the saturation boundary, where the wrap
-                        // split's second issue is pure loss. One ring per read is also the
-                        // measured optimum: coalescing adjacent whole-ring lanes into bigger
-                        // reads starves the producer's own L1 port (a clean dose-response, up
-                        // to ~70x the stall floor at five rings per read).
+                        // A near-full wrapping run ships as its whole ring image in one read
+                        // (the decoder linearises by head with the same predicate). Never coalesce
+                        // adjacent ring images into one read: it starves the producer's L1 port,
+                        // up to ~70x the stall floor at five rings per read.
                         ncrisc_noc_read_with_state<DM_DEDICATED_NOC, true, false>(
                             kReadNoc, read_cmd_buf, ring_src, slot + off * 4u, kRingWords * 4u);
                         off += kRingWords;
