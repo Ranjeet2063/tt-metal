@@ -1722,28 +1722,26 @@ void kernel_main() {
                     if (gen_shipped[gen]) {
                         I_BAR_BEGIN();
                         *phase = kPhBar1;
-                        bool flushed;
                         {
                             I_ZONE_BAR();
+                            // Bare waits: both predicates complete on this device alone (the DMA
+                            // engine's writes to GDDR, the NIU's sent counter), so no consumer
+                            // state can hang them. Host-gated waits keep their bounds.
                             if constexpr (kSpool) {
-                                // Wait for this generation's ship writes only: stream completion is
-                                // FIFO, so outstanding <= later-issues means this generation
-                                // retired.
+                                // This generation's ship writes only: stream completion is FIFO,
+                                // so outstanding <= later-issues means this generation retired.
                                 const uint32_t since = dma_issued - gen_dma_mark[gen];
-                                flushed = dma_wait_writes_bounded(
-                                    kDmaShip, since > 15u ? 15u : static_cast<uint8_t>(since), kCreditWaitCycles);
+                                const uint32_t cap = since > 15u ? 15u : since;
+                                while (experimental::dma_get_writes_outstanding(kDmaShip) > cap) {
+                                }
                             } else {
                                 // Sent-only is legal here because the staging slots' next writer is
                                 // this core's own NIU read responses.
-                                flushed = write_barrier_bounded<true, kInstr != 0 ? kDoneAddr + 12u : 0u>(
-                                    kCreditWaitCycles);
+                                while (!ncrisc_noc_nonposted_writes_sent(NOC_INDEX)) {
+                                }
                             }
                         }
                         I_BAR_END();
-                        if (!flushed) {
-                            egress_dead = true;
-                            break;
-                        }
                         gen_shipped[gen] = false;
                     }
 
