@@ -6060,133 +6060,568 @@ the numerator is exact; the soft-div is gone, the max config fits with ~180 B of
 inlining changed anywhere. Lesson for this code region: a single 64-bit divide costs more text than
 any feature; the FAILED-TO-LOAD message now says so.
 
-## §N+65 — The "knee regression" audit: historical knees were RUNWAY measurements, the sustained wall is the MOVER's per-frame rate, and NO_DECODE is not the gentlest host (bh-05 + bh-26, 2026-08-24)
+## §N+65 — kimi_k2 8-chip producer stalls: the DRAM ring FILLING was the mechanism; ship threshold + predictive valve + CV-first take 71,446 → 0 (yyz 8xp150, 2026-08-21)
 
-The question: production (4F+2M) with NO_DECODE showed stall onset at delay 100 / clean at 150
-(bh-05, fast, iters 10k), against remembered era knees of 40-50 (harness) and 15 (§N+40). Audit
-verdict: **no device-side service regression — the gap is four confounds, dominated by CAPTURE
-VOLUME**, plus one real (and newly named) sustained-regime wall.
+Workload: `test_sparse_layer_backed[...1000iter...kimi_k2-fabric_2d]`, 8 chips, one on-device loop,
+~80 zones/RISC/iteration (~240 words vs the 506-word ring; iteration ~150 us, burst ~150 ms/chip).
 
-### 1. Capture volume is the dominant confound: every era knee was a BURST number
+**Mechanism, measured (stall-timeline CSV + per-ring high-water).** Fillers staged every live core's raw
+10,560 B slot at ~37% mean fill — ~11 GB/s of slots against the two movers' ~12 GB/s. The 64 MiB DRAM
+ring absorbed the deficit for ~250 iterations, FILLED (high-water 6355/6355, ring-room waits 400–3000 per
+filler on 5 of 8 chips), and from then every sweep blocked on ring room: sweeps stretched to 100–777 us
+(wr-barrier/ring-wait bound), all 130 cores' L1 rings overflowed, and producers stalled CONTINUOUSLY for
+the last ~104–114 ms of the run. Whole rows of cores share one first-stall iteration — a service outage,
+not hot lanes. The 148 us pace-gap ceiling was NOT the cause: the two clean chips ran pinned at it with 0
+stalls. Proof by construction: `ROLE_RING_MB=256` alone → 0 stalls on all 8 chips (peak backlog 174 MiB).
 
-Same code (80bbf89e439), same box, same dispatch, same delay, NO_DECODE:
+**The ladder** (total stalls, all 8 chips, same workload):
 
-| | iters 500 (5k zones/RISC — every historical knee) | iters 10k (100k zones/RISC — every recent knee) |
-|---|---|---|
-| bh-05 fast d100 | **0** | **32,219** |
-| bh-05 fast d40  | **0** | 299k (earlier log) |
-| bh-26 slow d40  | **0** | 275-283k |
+| config | stalls |
+|---|---:|
+| baseline (old split-pair format) | 263,663* |
+| baseline (atomic zone format) | 71,446 |
+| + ship threshold 50% (arg 39), 64 MiB ring | 16,750 |
+| + predictive valve, 128 MiB ring | 1,211 |
+| + CV-first sweeps (arg 40) | **0** |
 
-At 5k zones/RISC the 4x64 MiB DRAM rings are runway for the entire capture (§N+39 said this — the
-volume knee at 20k zones/RISC — and it was not carried into any later knee comparison). At 100k
-zones/RISC the measurement becomes SUSTAINED service rate. Era-volume burst absorption on today's
-build is clean at fast delay 40 = 5.04 Gw/s offered — **1.9x above the era conduit's best documented
-clean point** (2.66 Gw/s = §N+23's clean-at-100, old wire), and clean where the era stalled (§N+23:
-21k at delay 50 = 4.81 Gw/s).
+*earlier measurement, for scale. Residues en route, both measured: a fixed half-ring valve stalls at
+burst ONSET (first visit reads peak ~240, ring blows through 506 before the next 148 us visit — first
+stalls at loop iteration 3 on 7/8 chips); the valve must be predictive (`peak + growth-since-last-visit
+>= 3/4 ring`). And one mover pair per chip can transiently exceed 6355 frames even at ~1700 w fill.
 
-Unit conversion used throughout (measured, §N+52): 1 delay = 7.407 ns; zone period = delay x 7.407 +
-86.7 ns (2-marker wire, 4 w/zone) or + ~31 ns (atomic wire, 3 w/zone). v5 clean-at-200-old-wire ==
-v6 clean-at-150-atomic == ~1.4 Gw/s: the v5→v6 delay-axis shift is entirely the producer getting
-faster (117→42 cyc/zone), zero device change. Box confound: **zero** (bh-26 on the same commit:
-fast d100 = 32.5-33.5k, d150 = 0-12 — identical to bh-05). Dispatch confound: only mattered for
-§N+40's "knee 15" (bh-26 + slow + iters 500); at iters 10k slow dispatch flatters nothing
-(d15 = 319-320k, matching §N+51's bh-18 floor of ~290k).
+**CV-first** (`TT_METAL_PERF_DEBUG_CV_FIRST`, default on; needs the spare odd staging slot, so mutually
+exclusive with DRISC self-zones): the filler reads each core's 128 B ring-progress words per sweep,
+makes the ship decision from those, and bulk-reads spans ONLY for the ship set; the fill-driven pace
+controller is bypassed for collapse-on-work / creep-to-20 us. Result: idle sweep 8.5→5.0 us at 128 B/core
+instead of 10,496 B/core (standing NoC reads ~40x down; filler read share 20–28% → 7.4% of residency),
+busy sweep 9.4 us, WORST sweep 26–35 us (was 100–777), stalls 0, capture lossless AND ordered (resyncs 0,
+drops 0, order regressions 0 — the 202k order regressions in the baseline run were a symptom of the
+backpressure regime, 320/325-per-stream base rate aside).
 
-### 2. The sustained wall: the MOVER's per-frame rate, pinned at ~1.7 frames/us
+**Ship threshold default is 50 — 65 was tried and REGRESSED** (35 stalls vs 0, same workload): it cut
+frames only ~10% (24.2k→21.7k), barely moved the host-ack-driven ring spike (98.8% → 91.7% of 128 MiB;
+the spike source is in-burst decode saturation, ~33 GB/s offered vs ~29 GB/s decode, buffered in RAW
+slots), and let worker rings ride ~380 words higher before shipping — and a core whose emission
+concentrates in one or two lanes can never reach a whole-span threshold that high, so it lives on the
+peak valve with less slack. Ring default stays 128 MiB until the packed ring lands: packing the DRAM
+ring (filler gather-writes live extents; mover ships pre-packed contiguous chunks) removes the 1.6–2.75x
+raw-slot amplification, so ring backlog = true payload deficit (~20–40 MB) and 64 MiB regains ~2x
+headroom — while DELETING the mover's pack_frame_words/per-frame gather (~11 PCIe write issues/frame →
+~2–4 per batch) and cutting its DRAM read per frame ~35%.
 
-At the iters-10k knee (bh-05 fast d100, split-on): all 4 DRAM rings at 100.0% high-water with
-3.7-4.0k ring-room waits per filler; filler worst sweep 84.6-95.0 us of which 68-81 us is c_reserve
-(= DRAM ring room for a filler); mover worst HOST credit-wait 0.1 us (host absent); movers at max
-batch 14 every busy sweep, 16.3 us/sweep = **1.16 us/frame**. System frame rate is pinned at the
-mover ceiling at both measured delays (1.70 f/us @150, 1.73 @100). Frames are fixed 2,640-word slots
-at 33-46% fill under fast-dispatch-synchronized producers + 4 fast quarter-grid fillers, so
-sustained words = 1.7 f/us x fill x 2,640 = the measured 1.44 Gw/s clean.
+**Open**: (1) packed DRAM frames — filler gather-writes live extents into a byte-ring so mover cost is
+per-marker, not per-frame (~2–3x mover headroom; retires the ring-size question); (2) the mover's rare
+~0.5 ms socket-credit waits (host ack hiccup — scheduling, not throughput; decode busy was ~200 ms
+total); (3) source deletion of the now compile-time-dead non-CV paths (old controller, READ_SPLIT,
+in-scan threshold) once CV-first has soak time. Stall observability kept: TT_METAL_PERF_DEBUG_STALL_CSV
+(stall/DRISC zone timeline), per-RISC + top-core stall breakdown, first-stall loop iteration
+(SPSC_LOOP_ITER/SPSC_STALL_FIRST_ITER), ship-deferral counters, c_pace in the phases line.
 
-Confirmations: ROLE_RING_MB 64→256 MiB: 32,219 → 5,289 (pure runway; rings still filled).
-ROLE_SPLIT=0 (direct-ship, no DRAM hop): 32,219 → ~1.0-1.2k at d100, clean at 125 — the split costs
-~1.2x sustained clean rate. Forcing RAW shipping (kPackMaxPayload=0): WORSE (38k; D2H 17.9 GB/s hits
-the byte wall) — the mover is pinched between issue-bound (packed) and byte-bound (raw); the 2/3
-threshold is right. Pacing proven out of the loop THREE ways: valve logic (gap=0 at max_run >= 384),
-occupancy 507 >> 384 at the knee, and FILL_PCT=0 ablation (32.8/33.0k vs 32.2k — no change).
-§N+40's "more fillers" lever OPTIMIZED THE BURST REGIME; in the sustained regime it back-fires
-(faster fillers → emptier frames → more frames/word → mover binds sooner). The sustained lever is
-frames-per-word: gate per-core staging on run size (fill 46% at d100 ⇒ ~2x capacity headroom).
+### §N+65 addendum — run-to-run variance is HOST-side: one writer stall >50 ms per ~3 runs (2026-08-21)
 
-**Rule: quote a knee with dispatch mode, box, ack-probe, wire version, AND capture volume vs runway.**
+Three runs of the final config (threshold 50 + valve + CV-first + 128 MiB ring): 0 stalls / 35 stalls /
+1,841 stalls. The bad run decomposes to ONE stream (d3/s0): the host writer stopped acking long enough
+that the mover's 50 ms bounded credit wait EXPIRED (drop-by-design: 7 frames, 35 decoder resyncs /
+11,037 words around them) and the ring filled (12,710/12,710, 266 ring-room waits) -- 1,681 of the run's
+stalls are that one episode, first stall at iteration 910. Every other stream: 0 resyncs, 0 drops,
+baseline-only regressions. So the device-side mechanisms hold; residual stalls are gated on host writer
+availability during the burst. Paths to hard-zero: (a) find the >50 ms writer stall (scheduling/NUMA --
+same territory as the earlier numa_pin logs), (b) packed ring as planned (64 MiB packed absorbs ~50 ms
+of per-ring payload; 128 MiB packed ~120 ms), (c) accept rare lossless throttling when the host stalls.
+The 320/325 one-regression-per-lane decode baseline appears on a rotating subset of streams and remains
+unexplained (independent of load).
 
-### 3. Env-lever floor for the slow-dispatch knee (no code changes)
+### §N+65 final state — tails-only CV reads, saturation bypass, self-zones coexistence (2026-08-21)
 
-ROLE_RING_MB=448 (the per-bank region max; 44,485 frames/ring): slow iters-10k NO_DECODE knee moves
-150 → **clean at 25, 3/3 warm reps** (8.3 Gw/s offered). d22 = ~420, d20 = 32.5k. Below ~22 the
-constraint changes identity: filler worst sweep 17.5-19.5 us with credit-wait 0.5 us and rings <=62%
-— the §N+51 cadence floor (worker 512-word ring refills in ~30 us at d20 vs ~17-26 us revisit). No
-env knob touches it: READ_SPLIT regresses (32.5k→85k), NSTAGE=14 and FILL_PCT=0/90 are no-ops.
-Caveat: 448 MiB x 4 is runway — quote with iters; drain tail grows (wall 91→137 ms at 256 MiB).
+The per-sweep CV read shrank 128 B -> 32 B/core (TAILS ONLY: the drainer's head mirror IS the head --
+the drainer is the only agent that advances heads -- so heads are fetched once, by shipping an unseeded
+core on first sight; the span read seeds it as before). Tails staging moved into the self frame's
+structurally-dead ring 1..4 space, DELETING the CV-first/self-zones exclusivity. SATURATION BYPASS: when
+>= 7/8 of the grid makes the ship set the tails pass is skipped and the sweep runs the old full-span way
+(saturated throughput pays zero CV overhead); exits when the authoritative scan sees > 1/8 of cores below
+threshold (idle cores count, so sparse phases exit immediately).
 
-### 4. Onset anatomy (Tracy captures, on Mac ~/Projects/tt-captures/)
+Four runs of the final architecture: 0 / 35 / 1,841 / 8,030 stalls -- every non-zero run decomposes to a
+single HOST writer/ack episode on one stream (ring pair fills, producers throttle losslessly; the 8,030
+run had ZERO drops/resyncs/regressions -- the throttle working as designed). Device-side behavior is
+stable across all four: filler idle sweep 5.0 us at 32 B/core, busy 9.5 us, worst sweep 26-35 us, ~24k
+frames @ ~1590 w, capture complete. Remaining paths to hard-zero regardless of host weather: fix the
+>50 ms host writer stalls (thread scheduling/NUMA pinning of the receiver threads -- same territory as
+the perf_debug_numa_pin logs), and/or packed DRAM frames (backlog = payload, ~2x absorbency, 64 MiB
+default restored). Re-baseline the synthetic delay suite before trusting the new defaults beyond kimi_k2.
 
-Onset = ceiling-grazing, not capacity failure: at slow d22/RING=448 (full pipeline), exactly 3,376
-PRODUCER-STALL zones (matches L1 counters to the digit), mean 0.2 us / max 1.3 us / total 0.67 ms
-across 600 lanes (~0.006% perturbation), drizzled over the whole 19 ms run on 81 cores; filler
-sweeps p50/p99/max = 13.3/14.1/14.7 us vs 32.7 us fill window. Instrumentation cost measured by
-onset shift at constant regime: DRISC_ZONE_DETAIL=1 raises filler sweeps 13.3→16.3 us (+23%) and
-onset delay 22→30 (~35%); the workload's 3 point markers/iter (PP_EVENT + 2x PP_DATA — the
-BR/NC_Flag/_Data/_Iter rows) are worth ~45% of onset delay (pure zonescopes: onset 22→15).
+### §N+65 NIU-measured footprint under CV-first (2026-08-21)
 
-### 5. OPEN — NO_DECODE shows ~9x MORE onset stalls than the full Tracy pipeline
+Filler RESIDENT LIFETIME (device open -> teardown, ~450 s): NoC1 rd 34.2-35.3 GB in ~557-570M txns --
+mean 64 B/txn, i.e. the read stream is now almost entirely 32 B tail polls billed at the NIU's 64 B word
+floor (~76 MB/s standing per filler, ~0.3 GB/s per chip, vs ~2 GB/s per filler = ~8 GB/s per chip for the
+old full-span sweeps: ~26x, hardware-counted). NoC0 wr 242-252 MB per filler = exactly the ~24k staged
+frames x 10.5 KB. Instrument cost 275 cyc/sweep. Read-traffic caveat baked into the number: a 32 B read
+costs a full 64 B NoC word, so the tails poll pays 2x its byte size -- reading 64 B of tails would be
+free by comparison if anything else ever wants to ride along. Run also drew the host-writer lottery on
+two chips (1,677 / 3,833 stalls, six chips at 0) -- consistent with the §N+65 final-state attribution.
 
-Same box (bh-05), same device config (slow, d15, RING=448, pure zonescopes), same day:
-NO_DECODE = 2,183 / 2,413 / 2,470 / 2,633 (4 warm reps, 66-71 cores) vs full decode+Tracy = 262
-(39 cores). The L1 counters are host-independent, so this is a real device-visible host-mode effect.
-Working hypothesis: instant acks let the movers burst DRAM-ring reads + L1 handshake traffic
-flat-out, and at a 0.2-us-graze onset the added DRAM/NoC/L1-port contention against filler scans and
-stage-writes manufactures grazes; decode-paced acks spread mover traffic. NOT yet confirmed —
-resolve via filler sweep-time deltas across host arms (NO_DECODE vs decode-no-consumer vs
-decode+Tracy). Until resolved: NO_DECODE is the CONSERVATIVE onset count, not the gentlest host.
+### §N+66 — Synthetic knee re-baseline on the new defaults; the mover is leaving the GDDR DMA engine unused (yyz 8xp150, 2026-08-21)
 
-## §N+66 — RESOLVED: the NO_DECODE onset inversion is MOVER BURST DENSITY; decode-paced acks are an accidental traffic-shaper (bh-05, 2026-08-24)
+Knee sweep, 8 parallel single-device processes, gx11 gy10 iters10k (the 02:24 documented params):
 
-§N+65's OPEN item, closed by a three-arm host matrix at the sensitive point (slow, d15, RING=448,
-pure zonescopes, iters 10k; producer stalls from L1 counters, host-independent):
+| delay | old code (02:24 run) | new defaults | |
+|---|---|---|---|
+| 0 / 5 | — | ~377.5k/dev (spread +/-10 at delay 0) | deterministic lossless throttle |
+| 15 | (bh-18 floor ~290-361k/dev) | ~292k/dev | lands ON the §N+51 device floor: no regression |
+| 50 | ~2.45M total | **1.02M total** | **2.4x better at the documented A/B point** |
+| 100 | — | 140.7k | |
+| 200 / 400 | — | **0** | 8-dev-parallel knee sits in (100, 200] |
 
-| arm | acks | producer stalls |
-|---|---|---|
-| A: NO_DECODE (pop+ack only) | instant | 2,183 / 2,340 / 2,367 / 2,413 / 2,470 / 2,633 |
-| B: decode, NO consumer | decode-paced | **164 / 180 / 212** |
-| C: decode + Tracy consumer + tracy-capture | decode-paced | 262 |
+CV-first + saturation bypass did NOT harm the saturated floor -- it improved the delay-50 point 2.4x.
+(Caveat: the old run had 64 MiB rings, new 128; attribution is policy+ring jointly.) Single-device sweep
+(delays 15/25/50/100) queued for the bh-18-comparable knee.
 
-**B == C, so Tracy is irrelevant — the whole 9-14x inversion is ack pacing.** The phase reports
-locate the mechanism on the MOVERS: identical frames moved and ~identical busy-sweep counts in all
-arms, but arm A compresses the work into HALF the time per sweep (busy 10.6-12.6 us, credit-wait
-0.1 us) where arm B/C spread it (busy 26.7-30.5 us of which ~30 us IS the credit wait). Same bytes,
-2.4x the instantaneous burst density on the DRAM banks (ring reads), the NoC (socket pushes), and
-the filler-L1 handshake.
+**What the mover is doing wrong, learned from the tensor prefetcher** (impl/buffers/kernels/
+tensor_prefetcher.cpp): (1) it reads its DRAM ring over the NoC when the DRAM core has a dedicated
+GDDR<->L1 DMA engine (experimental/gddr_dma.h: 2 streams, 255 outstanding reads, 262 KB/transfer) --
+DMA reads don't occupy the NIU, so reads and PCIe writes would run on separate hardware; (2) it
+serializes read-barrier -> write -> write-barrier where the prefetcher runs a 3-slot depth-2 pipeline
+with flushes deferred to slot-reuse points; (3) it uses non-posted chunked writes where the prefetcher
+uses posted set_state/with_state packets. Constraint: the DMA engine is same-channel, so each mover's
+two rings must RELOCATE into the mover's own bank (fillers already NoC-write cross-channel today; only
+addresses move; wire format and frame-count handshake unchanged). 2 x 64 MiB co-located rings per mover
+bank = today's 128 MiB/bank reservation, i.e. the 64 MiB-per-ring goal falls out. Risk to validate:
+rings-on-mover-bank pairs host-facing egress with same-channel GDDR traffic (N+29-adjacent; needs a
+hang-harness block). A mover bounded by the PCIe write path (~37-45 GB/s measured ceilings) instead of
+~6 GB/s makes raw-slot amplification irrelevant and OBSOLETES the packed-frame redesign.
 
-The FILLERS' own counters barely move (busy mean +0.3 us ~ 2%, worst sweep flat at 17.6-19.7 us in
-both arms) -- which is the tell. The one leg no filler-side counter can see is the per-core HEAD
-WRITE-BACK: a POSTED NoC write whose ISSUE the filler's clock records, but whose LANDING is what
-releases a blocked producer. At the d15 onset the graze margin is fractions of a us (mean stall
-0.2 us, §N+65 §4), so a mover-burst-inflated landing-latency tail converts directly into grazes
-without any filler phase changing. Every other channel is excluded by measurement: host credit-wait
-0.1 us (A) cannot touch producers, filler cadence flat, rings <=44% with 0 ring-room waits.
+Single-device sweep (same params): delay 15 -> 285,025 (at/below the bh-18 §N+51 floor), 25 -> 228,464,
+50 -> 139,793 (old code ~306k/dev: ~2.2x better), 100 -> 13,092; knee in (100, 200]. Single-device and
+8-parallel per-device counts nearly coincide at every point, so this box's knee is DEVICE-side (filler
+service vs ring refill), not host-sharing -- the number generalizes, and it is the floor the DMA-mover
+rework (§N+66) targets next.
 
-Consequences:
-1. **The host is not the bottleneck in ANY arm** — worst mover credit-wait is 0.1 us (A) / ~30-54 us
-   (B/C, absorbed entirely by the DRAM-ring runway). The onset bottleneck is the pipeline's own
-   internal traffic: filler revisit cadence vs the 512-word worker ring, with the margin eroded by
-   mover burst density.
-2. **NO_DECODE is the conservative (higher) onset count, not the gentlest host.** Quote onset
-   numbers with the host arm. Sub-knee/deep-saturation counts are unaffected (§N+65: NO_DECODE ==
-   full pipeline from delay 40 down).
-3. **Deliberate mover pacing is protective at onset.** The mover controller's "never pace a
-   productive consumer" rule (gap=0 the instant frames exist) is exactly what maximizes burst
-   density; decode-paced acks accidentally provided the shaping. A small fixed mover gap (or credit
-   budget) at high ring runway would give arm-A capture modes arm-B onset behavior — code change,
-   measured motivation here.
-4. The +2% filler busy-sweep inflation under bursts is real but secondary; the landing-latency tail
-   is the scaling term (2% cadence cannot explain 14x stalls; a us-scale tail on release latency at
-   a 0.2-us margin can).
+## §N+67 — DMA-mover landed: rings on the mover's banks, GDDR-DMA reads, deterministic per-frame seq verification (yyz 8xp150, 2026-08-21)
 
-Direct confirmation would need a device-side probe that timestamps head-writeback LANDING (e.g. a
-worker-side release-latency counter) — not in the current instrumentation, deliberately left as the
-follow-up.
+The §N+66 rework is in (`TT_METAL_PERF_DEBUG_DMA_MOVER`, carg 41, default on). Rings co-locate 2 x 64 MiB
+per mover bank (banks 0,3; fillers 0/2 -> bank 0, 1/3 -> bank 3; `ROLE_RING_BANKS` is ignored with a
+warning), ring default back to 64 MiB, channel-local DMA base addresses as cargs 42/43. The mover drains
+each visit in kGenSlots-frame sub-batches pipelined across two staging generations: wait DMA(k), verify,
+issue DMA(k+1) into the other generation, release ring credit, ship. Per-visit cap 64*kGenSlots frames
+(192): an uncapped visit measured a whole 6,355-frame ring in one 6.7 ms sweep while the mover's other
+ring filled — the cap is PEER FAIRNESS, not throughput (a deficit round-robin would be the deterministic
+next shape if two hot rings ever need weighting).
+
+Five hardware/protocol findings, each of which cost a run to learn:
+
+1. **WR_ACK does not order GDDR-DMA reads** (GDDR_ss_MAS §2.7: NoC and DMA enter the tile through separate
+   ports; same-address cross-port ordering is undefined; WR_ACK = "landed at destination", not a fence
+   against another master). First tight-chase run: 85,223 clean-framing order regressions = stale DMA
+   reads of frames the filler had *acked* microseconds earlier. John's tensor prefetcher has the same
+   formal gap (WAIT_CQ = CQ order + slack, no fence) — it works because of the slack, not a contract.
+2. **Resolution is deterministic, not a distance heuristic.** A "stay 8 frames behind head" chase guard
+   worked but withheld frames at every quiesce point (wedged the host's teardown drain-wait; stranded
+   exactly the withheld frames). Replaced by per-frame sequence verification: the filler stamps prefix
+   word 2 of every frame with its 1-based monotonic ring index (fence before the DRAM write); the mover
+   verifies after each DMA, re-reads on mismatch (32 tries), falls back to the NoC read (the ordered
+   path), and only a post-NoC mismatch — genuine corruption — kills egress. Counters in result words
+   174/175. Measured across the full kimi_k2 run AND a delay-15 synthetic hammer: **0 re-reads, 0
+   fallbacks** — the pipelined mover always trails the head probe by a sub-batch, so the visibility
+   window never opens; the verification is free insurance.
+3. **The posted/non-posted bit is command-buffer state** (`noc_write_init_state<cmd_buf, CQ_NOC_mkP>`),
+   not the per-write template arg — the template only picks the SW counter. Setting one without the
+   other freezes the flush predicate (HW acks accumulate, SW mirror doesn't) and egress dies silently at
+   the first barrier. Even initialized correctly, the posted-sent equality (HW POSTED_WR_REQ_SENT vs SW
+   issued) diverged slowly on the DRISC->PCIe path and killed movers after ~24k frames — posted pushes
+   are PARKED behind `TT_METAL_PERF_DEBUG_POSTED_PUSH` (carg 44, default off) with the HW/SW pair
+   published as debug words for a cheap future bring-up. Related trap, comment pinned in ship_once:
+   `socket_notify_receiver`'s D2H path re-inits the shared write_cmd_buf to NON-posted, so posted state
+   must be re-initialized per push.
+4. **A sent-based barrier is NOT a safe source-reuse gate against the DMA engine — negative result.**
+   The inter-sub-batch barrier looks like pure source-buffer safety (staging slots are the next DMA's
+   destination), and dispatch's rule for that is the SENT predicate (NONPOSTED_WR_REQ_SENT), not WR_ACK.
+   Tried it: one kimi run produced 77,905 and 42,197 decode order regressions on two streams — data
+   corruption — with stalls improved (4,510 on one chip) and every other counter green. "Sent" orders
+   the NIU against CPU refills of the buffer; it evidently does not order it against the GDDR-DMA
+   engine's L1 writes (another master, another port — the §2.7 lesson again, from the other side).
+   Reverted to the acked flush; the constraint is pinned as a comment on write_barrier_bounded. The ack
+   RTT (~1-2 us/sub-batch) stays until posted pushes are brought up.
+5. **Batched notifies must fire on the drop path too.** Deferring socket_notify to the last sub-batch of
+   a visit deadlocked when a mid-visit push hit the credit wall: the receiver was never told about the
+   pages already pushed, so credits never returned. `notify_pending` now flushes on the drop path and at
+   exit before the socket barrier.
+
+Two smaller fixes: the stop-path drain deadline was 100 ms — less than one full-ring drain — and expired
+mid-drain, stranding 12-16k words/device; it is now 1 s (host waits 10 s). And a self-inflicted arithmetic
+bug worth its lesson: the verify's expected index added `done` on top of `mv_tail`, but `mv_tail` is
+bumped per sub-batch (incremental tail release), so the formula double-counted and killed every mover at
+the FIRST multi-sub-batch visit — while passing every single-sub-batch visit (done=0 degenerates to
+correct), i.e. every light-load test. When a counter moves inside the loop, audit every expression that
+also adds the loop accumulator. Debug recipe that cracked it: publish got/expected through the live hs
+probe words on the death path and reproduce on the synthetic harness (~90 s) instead of 12-min workload
+runs.
+
+Validation (kimi_k2 8-chip, full config): PASSED, 8/8 devices 650/650 lanes complete, 0 words stranded,
+0 seq re-reads/fallbacks, order regressions at the known one-per-lane artifact only. Producer stalls
+5,259 across 4 chips / 0 on the other 4 (pre-fix §N+65 config: 0/35/1,841 across runs at 128 MiB) — the
+residue is burst margin at 64 MiB with the acked barrier still in (run predates finding 4). Mover work
+per push (3 frames): pack 0.32 us + noc-chunk 2.09 us + push_pages 0.04 us + notify 0.04 us. Pack cost
+0.11 us/frame (~4%) retires the filler-precomputed-descriptor idea. NoC footprint after relocation: the
+mover's ring reads leave the NoC entirely (GDDR-DMA); its NIU carries only PCIe pushes. Filler ring
+writes remain NoC writes, now cross-channel into the mover's bank — same bytes, different destination.
+
+## §N+68 — The host decoder was the hidden half of every stall story: atomic zones had silently halved it (yyz 8xp150, 2026-08-21/22)
+
+The >50 ms "host writer stall" episodes and the kimi run-to-run variance finally decompose. The
+load-bearing discovery: **PP_ZONE_ATOMIC records never had a vectorized decode path.** The AVX2
+emit_zones8 screen accepts 2-word START/END pairs only; every 3-word atomic record was "rejected"
+into the scalar walk (the code even said so). The atomic-format stopgap therefore silently took host
+decode from ~12 GB/s to ~6.5 GB/s the day it landed — and since kimi's burst offer (~80 zones/RISC per
+150 us iteration x 5 RISCs x 130 cores ~ 350M zones/s) sits right at that crippled ceiling, the host ran
+saturated with zero headroom, and every scheduler burp became a producer-stall episode. The old
+128 MiB rings ABSORBED most of those episodes (the 0/35/1,841 band); the DMA config's budget-neutral
+64 MiB rings stopped absorbing them (5,259/4,510/7,763) — the DMA mover was blamed for exposing a host
+regression it had nothing to do with.
+
+Fixes, both host-only, decoder-side (survive Mo's emit rework):
+1. **emit_atomic8** — stride-3 deinterleave (3 loads, 9 lane-permutes, 6 blends per 8 records), same
+   NT-store shape as zones8 plus the duration quadword. 6.45 -> 9.3-10 GB/s.
+2. **Count-limited blocks** — the type screen's movemask names the leading run of atomic lanes
+   (countr_zero of the inverted mask), so a block containing a sticky or a run-tail emits its leading k
+   records through the vector path instead of bailing scalar and rescanning per-record. Vectorized
+   records 78% -> 88%; scalar records and wasted reject-scans both halved. The residual ~12% on the
+   SYNTHETIC is per-launch STICKY_PROG density (100k tiny launches = one sticky per ~6 records); on
+   kimi-shaped traffic (one per ~80 records) effective vectorization is ~98%. Format note for the emit
+   rework: a 3-word prog record (full 32-bit id in w1; kills PROG_EXT too) makes launch-dense workloads
+   fully vectorizable via the existing count-limited path — worker launch-preamble change only,
+   deliberately NOT done in the stopgap.
+
+Measurement discipline this section paid for twice over:
+- perf (unlocked via a privileged-container sysctl; paranoid=1 resets on reboot) attached to the decode
+  threads during a stalling synthetic run showed 3.3-3.6 GHz, IPC 2.9-3.4 — HEALTHY. Synthetic
+  delay-150/175 stalls are plain saturation (offered > sustainable, by design), not the episode defect;
+  hours went into conflating them.
+- The receiver's "busy GB/s" is confounded by pass size (backlogged = big passes = fast per byte;
+  keeping-up = small passes = slow per byte). Never compare it across runs as a capability metric.
+- Nearest-symbol attribution lies for code AND data under ICF/hot-cold splitting: a run of samples
+  "inside ~D2HSocket" mid-capture was disproven by a breakpoint-with-backtrace run (destructor fires
+  exactly twice, at teardown). gdb-as-parent with breakpoints is a serviceable unprivileged perf
+  substitute (yama scope=1 requires ancestry); ptrace RIP sampling needs the maps snapshot from the
+  SAME process instance and its samples' wall-position checked against run-phase log markers.
+- The mover's 300-400 us credit-waits at saturation are the visit-batched notify (do_notify per visit)
+  presenting bytes_sent in visit-sized steps: normal backpressure, not a defect. Both credit-poll loops
+  (socket_api and the drain kernel's bounded replacement) invalidate correctly; pages_available carries
+  the full clflush/lfence discipline.
+
+State after the fixes, kimi 8-chip, DMA mover at Mo's exact 1 GiB budget (64 MiB rings): four runs
+{0, 1360, 3184, 5652} producer stalls — first hard-zero ever recorded on this workload, capture
+integrity perfect on every run (650/650 lanes, 0 stranded, ordering clean). The residual is the
+episodic host hole (1-2 chips per run, tens of ms), which 128 MiB rings used to absorb; hunting it with
+per-second perf timelines on all 16 decode threads during kimi is the open item, now fully tooled.
+
+## N+69: The cleanup-surgery corruption was a hardcoded experimental read path
+
+Post-surgery gates showed 25-537 anomalies/stream (rate-proportional, packed frames only, word-slipped
+final records). Three expensive false leads first: barrier removal (restoring acked-publish changed
+nothing), seq stamps/verify (disabling them changed nothing -- and that diagnostic itself was incoherent:
+issue-time publish + sent-only barriers are only sound UNDER stamp verification, so the diag state
+manufactured a second, real race that muddied every gate), and decoder over-read (frame_words=0 changed
+nothing).
+
+The decisive discriminators, in order:
+1. **Force-raw** (kPackMaxPayload=0): near-clean (3 vs ~500) => staged bytes fine, packed lane suspect.
+   Earlier "raw frames decode clean" evidence was VACUOUS -- at gate fills nearly all frames pack, so the
+   raw-path counters were idle, not exonerating.
+2. **Anomaly-site counters**: all hits at one linear-walk site, dumps perfectly regular -- always the
+   final record, contents [ts,dur,w0] = previous-lap bytes phase-shifted by 2 (512-word ring % 3-word
+   records = 2).
+3. **Lane arithmetic**: every offending lane was r2/r3 (lane % 5) -- exactly the lanes in the SECOND HALF
+   of a split span read.
+
+Root cause: the surgery flattened `kReadSplit` to the split-2 arm (half-span reads on both NoCs). But
+`read_split()` on the host **defaults to 0** and the env knob was never set: the live config had always
+been ONE whole-span read per core. The split arms were opt-in experiments. With the split hardcoded on,
+the control vector (first half, NoC A) and lanes r2-r4's data (second half, NoC B) complete in either
+order, so a tail can claim a record the other NoC's capture predates -> the final record reads stale
+previous-lap bytes. The frame's own CV is only trustworthy because a single ascending read captures every
+tail BEFORE the data it points at -- an invariant now stated at the read site.
+
+Fix: restored the whole-span single-NoC read (and deleted noc_b entirely). d150-10K: anomalies 0, order
+regressions 0, both streams.
+
+Lessons: (a) when flattening a compile-time knob, flatten to the LIVE value (host default / env), not the
+arm most recently worked on -- check the host side before deleting the selector; (b) never stack
+diagnostics that disable a safety mechanism (stamps) while leaving the machinery that depends on it
+(issue-time publish) -- the diag itself then generates corruption and every subsequent A/B is polluted;
+(c) per-site anomaly counters + a 4-shot context dump located in one run what three days of A/B gates
+could not.
+
+## N+70: The kimi stall regression is per-STREAM host-ack starvation, not device-side (yyz 8xp150, 2026-08-22)
+
+Post-merge kimi runs PASS with anomalies 0 everywhere, but 4-5 of 16 streams "die": ~2-6k frames moved
+(vs ~70-125k healthy), the stream's mover at ~30% socket credit-wait with ~4,300 bounded 50 ms timeouts
+(worst sweep 550 ms = 11 back-to-back), its fillers' DRAM rings at 100% with producers stalling grid-wide
+on those chips, and 12k+ frames dropped per victim. Localization chain:
+
+1. Device side EXONERATED: healthy drainers idle at 0.6% ring; decode is fast (372 MB in 202 ms); the
+   per-lane trigger cut synthetic stalls 34k -> 4k and ring pressure 81% -> 20% but did not move kimi --
+   the kimi stalls are Mode A (downstream hole), not filler service.
+2. The dead set MOVES between runs (valve run: d1/4/5/6/7 s0; trigger run: d0/2/3/4 s0) -- not a device,
+   socket index, or topology property. Decided at bring-up, sticky for the run.
+3. NOT thread starvation: with DECODE_THREADS=4, thread 0 owned d0/d2/d4/d6 s0 and served three at ~70k
+   while d6/s0 got 485 -- a healthy thread polled the victim all run and pages_available() stayed 0.
+4. NOT a torn socket config: victims TRICKLE (~1 data-pass per ~3 s, 12-56 frames each; below the
+   receiver's starvation watchdog) -- the path works, so one leg of the credit loop (mover's ack-read
+   visibility or notify-write landing) runs seconds-slow for that one socket instance.
+5. Weak-N observation: 16 threads -> 4-5 victims (2 runs); 4 threads -> 1 victim (1 run, repeat pending).
+   Could be scheduling pressure on the probe/ack path or bring-up timing luck.
+
+Same failure CLASS as the pre-merge "one-chip >50 ms writer episode" (final-state variance 0/35/1841) --
+the merge amplified incidence, not invented it. Candidates for the slow leg: UMD static-vs-dynamic TLB
+path for the socket's ack writes under 16-stream contention (171 vs 382 ns/write measured, but contention
+behavior unmeasured), and per-socket TLB window assignment luck. Next: per-stream ack/notify timing
+instrumentation on a victim run; check init_sender_tlb's static-path decision per victim stream.
+
+Also of record: two intermittent bring-up hazards resurfaced during the hunt -- the N+29-class niu-mode
+LaunchProgram MMIO timeout (~2/7 attempts under dense reset cycling; survives tt-smi -r once wedged), and
+an uncaught second UmdException after a HANDLED profiler-init failure that core-dumps the whole pytest
+instead of running captureless (robustness gap, host).
+
+### N+70 addendum: the dead-stream amplification is BOX STATE, not the merge (controlled, 2026-08-22 ~03:00)
+
+The pre-merge tree (yusuf/drisc-atomic, clean at 21:13 with in-band stalls) rerun UNMODIFIED on the
+late-night box: d5/s0 dead at 3,577 frames, its chip at 86,458 stalls, the other seven chips at 0-160.
+Identical failure on code that predates the integration -- so the per-socket credit-loop episode is
+environmental, its incidence loaded by accumulated box/link state (a night of ~12 resets, several
+aborted bring-ups, the N+29/N+31 wedge storm). tt-smi -r does NOT clear this state class (measured
+surviving consecutive resets). Escalation lever: tenstorrent driver reload (root; the privileged-docker
+path) or host reboot, then ONE validation run. The N+70 line "the merge amplified incidence" is hereby
+corrected: the MERGE was exonerated by this control; the NIGHT did the amplifying. Integration verdict:
+Mo's device producer + our host + split kernels is correctness-green everywhere and stall-behavior is
+indistinguishable from pre-merge at equal box state.
+
+### N+70 second addendum: every software lever eliminated; it is the PRE-EXISTING episode class (2026-08-22 ~03:45)
+
+Eliminated by direct experiment tonight, in order: the v6 host rework (restored our host: still fails),
+Mo's device producer (pre-merge tree: still fails), driver state (module reload: still fails, arguably
+worse), CPU contention (no hogs; k8s daemons predate the clean run), PCIe/IOMMU error state (30-day
+kernel log: zero AER/AMD-Vi entries), and the blaze worker_l1_size edit (TRUE control -- pre-merge tree
++ original L1, the exact 21:13-clean bytes -- still fails: d1/s1 dead, 71k stalls, 7 chips at ZERO).
+
+Conclusion: the per-run one-victim host-writer/socket episode documented pre-merge (final-state variance
+0/35/1841) is the phenomenon; 21:13's zero was its lucky face. Whether late-night incidence (1-6
+victims/run) is elevated vs the base rate, and whether any tree shifts it, needs an N-run comparison --
+single runs cannot distinguish luck from rate at these numbers. Recommended: power-cycle the box (the
+one reset lever not yet tried), then N>=5 runs per tree if the rate question matters before Monday.
+The victim signature for whoever hunts it: pages_available() ~0 for the whole run on one stream while
+its mover credit-waits and trickles 12-56 frames every ~3 s -- decided at bring-up, sticky for the run.
+
+### N+70 third addendum: 2-MINUTE MODEL-FREE REPRODUCER (2026-08-22 ~04:20)
+
+TT_METAL_PERF_DEBUG_FULL_MESH=RxC on test_perf_debug_zones opens the whole mesh in ONE process and
+launches the workload on every device concurrently (slow dispatch: no-wait launches, then wait-all) --
+kimi's exact bring-up shape at synthetic speed. First loaded run: 4 dead sockets (d0/s0 7,327 / d0/s1
+594 / d1/s1 2,361 / d2/s0 1,610 vs ~42-43k healthy), victim chips at 56-108k producer stalls, anomalies
+0 -- the full episode signature in ~2 minutes. It also reproduces the intermittent niu-mode bring-up
+MMIO wedge (1 of 3 mesh bring-ups tonight) and the uncaught-second-UmdException crash after a handled
+init failure. NOT kimi-specific; NOT single-device (unit-mesh runs never showed it all week). Root-cause
+loop from here: per-leg (notify-visibility vs ack-landing) timing on a victim, bring-up-order experiments
+(the week's tally skews ~6:1 toward s0, the first-constructed socket), UMD static/dynamic window path per
+victim -- at 2 min/sample.
+
+## §N+71 — Direct push now BEATS the ring design: gather-READ packing, one PCIe write per frame (bh-lb-120, 2026-08-25)
+
+The direct-push regression (commit c5ed6346d98: zero-stall knee 112 -> ~200, "the wall is PCIe-tile
+write arbitration") is closed and inverted. Three filler-side changes; the wire format, the decoder and
+the host pipeline are untouched.
+
+**1. GATHER-READ packing.** The filler no longer bulk-reads the whole 10,496 B span and NIU-gathers 6-11
+per-run writes into the PCIe tile. The CV pass's tails are now authoritative: a frame claims exactly
+[mirror, tail-at-the-CV-read), which is safe at any gather lag because a producer only appends PAST a
+published tail (its marker stores are fenced before the tail publish), so data below the tail is
+immutable. issue_core computes the packed layout from those tails and gather-reads each live run
+STRAIGHT to its packed wire offset in the staging slot -- the same pack-pad rule serves both hops (read
+src==dst and PCIe-write src==dst congruence, both mod 16 B) -- so a staged slot IS its frame's wire
+image and ships as ONE write_to_host_chunked (two across the FIFO wrap). The frame's control words are
+synthesized from the mirror, the tails and coords[] (heads, tails and SPSC_CORE_XY are all the decoder
+reads). Reads fan out across the slice's ~21 worker cores; the write side, where six fillers converge on
+one PCIe tile, drops from 6-11 arbitration events per frame to one.
+
+**2. The write barrier left the sweep.** gen_shipped[] persists across sweeps: a generation's flush is
+waited on at its slots' next refill, so a sweep's final ship drains under the pace gap or the next
+sweep's CV pass instead of on the sweep's critical path.
+
+**3. Self frames ship RAW** (SPSC_SPAN_RAW_FLAG): the decoder walks raw rings circularly, so the marker
+ring never needs packing into wire order; geometry is constant and staged once. The CV staging in the
+self slot's dead rings ships as bytes nobody decodes.
+
+Deleted outright: the span read, emit_run's per-run gather-write walk, and the saturation bypass
+(cv_bypass) -- CV-first is the only path now because it feeds the gather geometry.
+
+**Measured, 150k iters, 11x10 grid, single device.** Every clean run count-exact at 957,000,550 records
+with anomalies / bad frames / resyncs / unknown-core 0 and per-socket order regressions <= 3 (the
+pre-change baseline shipped up to 5); runs WITH stalls stay count-exact at +2/stall (e.g. 958,227,522 =
+957,000,550 + 2 x 613,486). Same-evening tip baseline first: 3,551 / 4,059 stalls at delay 112 (the box
+ran slower than the morning that measured the commit's 39-283).
+
+- PIPELINE KNEE (2 decode threads, 64 MiB FIFO -- the mainline's exact score context): **106**, 7/7
+  clean reps (0 stalls each); delay 112 clean 5/5. Delay 100 is bimodal (613k, then 0) exactly like the
+  mainline's 106 (two clean, then 345k). The mainline's knee is 112, so direct push now leads by one
+  step, and the margin behavior says both designs sit on the SAME wall there: per-thread decode busy
+  1,184-1,196 ms against a 1,320 ms wall (~90% duty) -- identical to the mainline's ~1,185 ms. At 2
+  threads the pipeline is host-decode-bound; the wire being ~3% smaller is the whole lead.
+- FILLER KNEE (TT_METAL_PERF_DEBUG_FIFO_MB=3072: 3 GiB FIFO per socket holds the whole capture -- the
+  largest socket carries 2,087 MB -- so credit structurally never binds; worst credit-wait read 0.1 us
+  on every filler of every run): **75**, 5/5 clean; 70 = 0 / 3; 65 = 28 / 23. The gap 75 -> 106 is the
+  HOST's contribution to the pipeline knee. The 3.5 GiB knob cap is the 32-bit socket byte size and the
+  device's 32-bit credit arithmetic; nothing needed widening because 3 GiB already exceeds the largest
+  socket's whole-capture load by 47%.
+- The same device-side ladder reproduces with the host wall removed by THREADS instead of FIFO (6
+  decode threads, 64 MiB): 75 = 7/7 clean; 70 bimodal (5/7 clean; 11 / 33); 65 = 23-61; 60 = 2.2-2.7k;
+  50 = 256k; 40 = 1.5M -- the sub-75 residue is the filler's own sweep, not host drain.
+
+**Mechanism, from the drainer's own counters at 112:** write phase 1.72-2.98 -> 0.19 us/push; busy sweep
+9.4-14.2 -> 6.5-6.7 us; worst sweep 30-52 -> 13-14 us and now symmetric across all six fillers; the
+drainer's write share 34% -> 1-5% of busy time; credit-wait ~0 throughout.
+
+**What did NOT work.** (a) A per-core trigger dither over [1/4, 1/2) keyed on core identity: it removed
+the six fillers' synchronized ship bursts as designed (worst-sweep write 9.7-11.4 -> ~2 us) yet
+regressed every point (delay 50: 256k -> 900k stalls; delay 40 grew 305-456 us credit waits) -- the
+extra frames' gather reads cost the sweep more than the bursts did, because the saturated sweep is
+READ-side bound, and past ~50 the extra frames also pushed host decode over. Reverted; trigger stays
+1/2. (b) Growing the idle pace gap only on zero LIVE words instead of zero frames: null result -- under
+load some core ships nearly every sweep, so the ramp this guards against never fires.
+
+**A trap for the record:** SPSC_RING_TAIL_0 is 24 (PROFILER_SPSC_MAX_RISC), not kNumRisc -- a "64 B
+covers heads+tails" CV read covers neither, every lane reads live=0 forever, no filler ever ships, and
+the lossless producers wedge the workload. The symptom (all six drainers POLL-phase with heartbeats
+advancing and "no data for 120 s") now has a known cause.
+
+**Host fix while validating: BroadcastRing's heap fallback vs 64 B NT stores.**
+TT_METAL_PERF_DEBUG_RING_RECS=1048576 segfaulted (SI_KERNEL, "address (nil)"): 24 MiB of slots took
+allocate_slots' new[] fallback (16 B alignment), and the receiver's SpscNtCarry streams 64 B vmovntdq
+lines through emit_slot_ptr -- a misaligned NT store #GPs, which Linux reports as SEGV at nil. Rings
+>= 64 MiB never hit it (mmap path, 2 MiB-aligned). allocate_slots now mmaps at EVERY size (page
+alignment >= 64 B); new[] remains only as the mmap-failure fallback. Verified post-fix: 1048576 runs
+clean (its drops now mean "ring smaller than the backlog", which is that size working as designed).
+
+**Consumer-facing validation -- two separate claims.** The DEVICE+DECODE pipeline's losslessness is the
+record-count gate (exact on every run above). The CONSUMER keeping up is the BroadcastRing's size: at
+the default 32 Mi records/stream a full-rate consumer drops (431M on ops-csv at 150k), so the ring was
+raised to 2^28 records/stream (6.4 GB x 6, mmap'd) and the ops-csv consumer then saw THE WHOLE CAPTURE:
+957,000,550 delivered, 0 dropped, 0 consumer-ring drops, and zero pairing violations (no zones left
+open, no unmatched ends, no start/end id mismatches) across all 957M records. Self frames validate
+through TT_METAL_PERF_DEBUG_STALL_CSV: 17,930 DRISC-SWEEP zones decoded from RAW frames, mean 6.2 us /
+max 13.9 us -- matching the drainer's own out[] busy-sweep counters independently.
+
+**Hangs:** 0 in ~65 measured 150k/2k captures on the gather-read kernel and its two reverted variants. (Two device wedges during development were a
+run killed mid-flight from outside, and the CV-offset bug above -- both understood, neither a drain-path
+hang.)
+
+## §N+72 — Adaptive raw sweeps, the scan unroll, and what Mo's sub-10 filler knee actually is (bh-lb-120, 2026-08-25/26)
+
+Four device-side changes landed here, then the claimed target was measured instead of chased.
+
+**1. HIGH-PRODUCTION MODE: raw span sweeps under peak-lane hysteresis.** When the slice runs hot the CV
+pass is a wasted serialized round-trip -- the tails it fetches sit inside the spans about to be read.
+HIGH mode reads each core's whole span in ONE round-trip, ships it as a RAW frame (the format the
+decoder already walks circularly and the self frames already use), advances the mirror from the
+control vector that arrives INSIDE the span, and drops the trigger deferral: every core is consumed
+every sweep. Two details make raw frames exact: the staged CV's HEADS are patched to the mirror before
+the ship (the worker's own head words can lag a write-back in flight on the other NoC, and a stale head
+reads as tail - head > ring = a decoder anomaly), and the raw scan order is FIXED -- applying the packed
+scan's per-sweep rotation gave every core a near-double service interval once per rotation period
+(delay 65: 13/6 stalls -> 12.9k/9.1k) because under full service, scan order IS service order.
+
+The signal had to be the PEAK lane, not mean fill: a serviced slice self-regulates its mean
+(consumption pins it near rate x sweep / capacity; it read 50-60% at delay 20 with 199,772 stalls on
+the books, overlapping the healthy range). The per-sweep peak unconsumed lane is the distance to the
+actual failure. Enter at 3/4 ring; exit below 1/8; 512-sweep dwell. The exit was measured DOWN from the
+derivable 1/4: packed's TAIL, not its typical peak, still stalled producers at delays 70-75, so raw
+letting go there cycled the mode through the regime it exists to remove (248/174-203 stalls with exit
+at 1/4 against 0/0 for raw held on).
+
+The credit veto must gate ENTRY only. Raw wire is capacity-proportional, and unconditional raw once
+measured 1.6M stalls with 2x wire drowning the decode-paced ack -- so no entry while the FIFO backlog
+exceeds 1/4. But the first cut ALSO exited on backlog, and that inverted the win: three fillers cycled
+enter->veto-exit 14-25 times per run and every exit handed a slice packed could not carry back to
+packed -- 41,867 stalls at delay 60 against packed's own 2.2k, all in the oscillating fillers' slices
+while the fillers that stayed in raw ran clean. The FIFO's own credit wait throttles raw gracefully
+(worst credit-wait 0.1 -> 23-33 us, the throttle visible); the only forced exit left is the WEDGE
+escape (peak pinned at capacity + FIFO backlogged), for the host-bound corner where pacing holds the
+peak at the clamp and the low-fill exit can never fire.
+
+**2. SCAN UNROLL (the mainline of Mo's own comment).** The gather rewrite of §N+71 had regressed the
+per-core scan to a loop over indexed arrays -- exactly what the deleted process_batch's comment warned
+spills on this core. Unrolled into scalars with no runs[] array at all three scan sites, and the
+decide loop now times itself: **58 ns/core** at 2k iters, 67 ns/core at the 150k pipeline knee
+(out[61..63], host-reported), against the ~356 ns/core Mo measured for the spilling form. Busy sweep at
+the pipeline knee 6.6 -> 6.0 us, worst 13.5 -> 12.5 us, read share 34 -> 28%.
+
+**3. POSTED head write-backs** (Mo's 48c60923371 applied): the worker-ACK round trips left the barrier
+predicates and the congested worker route; a bounded posted-SENT drain covers the exit tail.
+
+**4. The drain kernel opted OUT of its own producer instrumentation** (PERF_DEBUG_DRAIN_KERNEL in
+kernel_profiler.hpp's gate): no drainer serves a DRAM core, so the producer ring was write-only dead
+weight -- and at ~1.2 KB it had twice pushed the kernel past the 11,264 B DRISC code region during this
+work (the region gate is why issue_core's lane walk stays a loop: unrolled, its 5x-inlined NoC-issue
+body alone overflowed the region by 324 B). .text now 10,104 B with all features on.
+
+**MEASURED KNEES (150k iters, 11x10, single device; all quoted runs count-exact at 957,000,550 records
+(+2/stall), anomalies/bad frames/resyncs/unknown-core 0).**
+
+- PIPELINE (2 decode threads, 64 MiB FIFO): **106**, 5/5 clean reps on the final kernel (plus 112
+  clean 2/2) -- unchanged from §N+71: the entry gate keeps raw frames off a host-bound pipeline, so
+  the adaptive mode costs the pipeline nothing.
+- FILLER (3 GiB FIFO/socket via TT_METAL_PERF_DEBUG_FIFO_MB, 6 decode threads so the host drain never
+  gates raw wire; credit-wait is then pacing, not starvation): the STRICT-zero knee stays at §N+71's
+  **75** (7 reps: 0/61/0/0/0 and 0/12 -- five zeros, tens in the other two; 70 = 1/0; 65 = 40/29;
+  60 = 160/18). What the adaptive mode buys is the shape UNDER the knee: against packed-only's cliff
+  (65 = 23-61, 60 = 2.2-2.7k, 50 = 256k, 40 = 1.5M) it holds tens-to-thousands deep into overload --
+  60 = 0-160, 50 = ~5k (RAW_ONLY 4.9k/6.0k), 40 = 278k -- an 8-100x flattening of the overload band,
+  i.e. the capture degrades instead of collapsing. The exit-at-1/4 first cut also produced a WORSE
+  band AT 70-75 than packed alone (203/174 and 248/13: the mode kept handing a hot slice back to
+  packed); the 1/8 exit is what removed it (0/12 and 1/0).
+- BURST (10k iters -- the runway protocol; the 3 GiB FIFOs hold the whole capture, so this is pure
+  device capability + PCIe): hysteretic and RAW_ONLY within noise of each other; delay 30 = 69-84k,
+  20 = ~160k, 15 = ~210-218k, 10 = ~316-329k. The floor is the WIRE: offered = 8800/zone_ns GB/s =
+  28.5 GB/s at delay 30 and 37.4 at delay 20, against the ~37 GB/s measured PCIe write ceiling (§N+53)
+  -- and unlike a DMA-to-DRAM filler, a direct-push filler carries that write inside its sweep.
+
+**TT_METAL_PERF_DEBUG_RAW_ONLY=1** (diagnostic, in-tree): locks HIGH mode on -- no CV pass ever, no
+hysteresis. It answered the "is the hysteresis just too slow?" question: no. RAW_ONLY equals the
+hysteretic mode at every delay that matters (and both hit the same wire floor), so the CV round-trip
+was not the filler-knee wall and the reaction time was not either. One structural note: HIGH mode and
+DRISC self-zones together exceed the code region by ~1.1 KB even after the producer-gate reclaim, so a
+zones build compiles the raw machinery out (kRawCapable) and behaves as §N+71 -- which is also the
+configuration its zone shapes were validated against (20,968 DRISC-SWEEP zones decoded through
+STALL_CSV on the final kernel, gates clean).
+
+**MO'S SUB-10, MEASURED INSTEAD OF QUOTED (origin/mo/drisc_drain_v6 built and run on THIS box, same
+harness, same grid, TT_METAL_PERF_DEBUG_FILLERS=6 -- his 6-filler + 1-mover shape):**
+
+| config | 75 | 50 | 30 | 22 | 20 | 15 | 10 |
+|---|---|---|---|---|---|---|---|
+| (a) his default, 150k | 4.83M/4.83M | 4.83M/4.82M | 4.82M/4.82M | - | 4.82M/4.81M | - | 4.87M/4.87M |
+| (b) RING=448+NO_DECODE, 150k | 2.63M/2.64M | 3.96M/3.96M | 4.08M/4.08M | - | 4.06M/4.06M | - | 4.45M/4.45M |
+| (c) RING=448+NO_DECODE, 10k | - | - | 3/2 | 335/281 | - | 1079/1161 | 187.7k/189.6k |
+
+Sub-10 does NOT reproduce in any configuration. His burst onset on our box is ~delay 22-30 -- matching
+his own commit log ("d22: 154 -> 2, d20: 22.5k -> 4.0k", 48c60923371) -- and it is a RUNWAY number: at
+(c)'s clean point his rings sit at 39-44% high-water with the mover's tail thousands of frames behind.
+Sustained, the runway exhausts: at (b) 150k his rings run 100% full with ~25k ring-room waits per
+filler and the filler's worst sweep is 155-157 us of which 145-147 us is RING-ROOM credit-wait. His own
+§N+65 audit says it plainly: "every era knee was a BURST number" and "the sustained wall is the MOVER's
+per-frame rate".
+
+**The profile side-by-side (same box, same night)** -- his clean burst point (c, delay 30) against our
+pipeline knee: worst sweep 10.9-11.5 us (read 1.5-1.8, proc 4.8-4.9 = ~170 ns/core scan, write 0.8-0.9
+-- a local-bank GDDR-DMA enqueue) vs ours 12.5-12.6 us (read 6.9-7.0, proc 3.5 at 58-67 ns/core scan,
+write 1.1 -- a PCIe write). The sweep machineries are the same class and our per-core scan is now the
+faster one; the structural difference is WHERE egress sits. His filler hands frames to the DRAM tile's
+own DMA engine and a separate mover pays the host cost later (which is why his sustained numbers
+collapse); ours carries PCIe write issue + credit pacing inside the sweep (which is why our burst floor
+is the PCIe ceiling, ~delay 25-30, and our sustained numbers are the ones that win). Direct push at
+sub-30 delays would need the egress out of the sweep again -- which is the DRAM-ring design this branch
+deleted, with §N+71's measured sustained cost.
+
+**What did NOT move the filler knee:** 7 fillers at the old per-core cost (owner-measured: 75 at both 6
+and 7); the CV-pass removal alone (RAW_ONLY == hysteretic); entry aimed at the peak core (the peak is
+measured before that sweep's own ship, so the tripping lane is already serviced at entry); the pace-gap
+suspicion (its share is lifetime-dominated; under load a shipping sweep zeroes the gap every time).

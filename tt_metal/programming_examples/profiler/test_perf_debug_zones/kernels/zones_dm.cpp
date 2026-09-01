@@ -72,23 +72,22 @@ static constexpr int kWallClockLowIdx = 0;
         }                                                                 \
     }
 
-// EMPTY body (ZONE_MODE == 2): the pure-overhead microbenchmark. Ten fully unrolled back-to-back empty
+// EMPTY body (ZONE_MODE == 3): the pure-overhead microbenchmark. Ten fully unrolled back-to-back empty
 // zones per iteration, nothing between them, so the profiler measures ITSELF: each zone's recorded
 // DURATION = open's clock read -> close's clock read with an empty body (the in-zone overhead: the
 // close's ring room check + the wall-clock read), and the GAP between one zone's end and the next
 // zone's start = the close's post-clock work (sticky check + 3 ring stores + publish) plus the next
 // open's clock read. duration + gap = the full cost one zone adds at max rate. The host workload
-// (--empty 1) registers a consumer that computes exactly those two numbers per RISC.
+// (--empty 1) registers a consumer that computes exactly those two numbers per RISC. (--bench, mode 2,
+// is the DEVICE-side twin: same empty scopes, but timed by the kernel itself against the wall clock --
+// mode 3 prices what the CAPTURE observes, mode 2 what the PRODUCER pays.)
 #define ZONE_EMPTY(NAME)         \
     {                            \
         DeviceZoneScopedN(NAME); \
     }
 
-// GRADUATED (ZONE_MODE == 0) keeps the wall-clock spin (ZONE_WALL above): its point is durations calibrated in
-// microseconds for a representative capture, which a nop-iteration count cannot express.
-
-// PRICE-CLOCK body (ZONE_MODE == 3): the EMPTY zone plus ONE extra latched wall-clock read pair in
-// the body. duration(mode 3) - duration(mode 2) = the cost of one read_wall_clock on this RISC.
+// PRICE-CLOCK body (ZONE_MODE == 4): the EMPTY zone plus ONE extra latched wall-clock read pair in
+// the body. duration(mode 4) - duration(mode 3) = the cost of one read_wall_clock on this RISC.
 #define ZONE_PRICE_CLOCK(NAME)                                                             \
     {                                                                                      \
         DeviceZoneScopedN(NAME);                                                           \
@@ -99,9 +98,11 @@ static constexpr int kWallClockLowIdx = 0;
         asm volatile("" ::"r"(_plo), "r"(_phi));                                           \
     }
 
-#if ZONE_MODE == 3
+// GRADUATED (ZONE_MODE == 0) keeps the wall-clock spin (ZONE_WALL above): its point is durations calibrated in
+// microseconds for a representative capture, which a nop-iteration count cannot express.
+#if ZONE_MODE == 4
 #define ZONE(NAME, GRADUATED) ZONE_PRICE_CLOCK(NAME)
-#elif ZONE_MODE == 2
+#elif ZONE_MODE == 3
 #define ZONE(NAME, GRADUATED) ZONE_EMPTY(NAME)
 #elif ZONE_MODE
 #define ZONE(NAME, GRADUATED) ZONE_NOPS(NAME, ZONE_CYC)
@@ -109,20 +110,50 @@ static constexpr int kWallClockLowIdx = 0;
 #define ZONE(NAME, GRADUATED) ZONE_WALL(NAME, GRADUATED)
 #endif
 
+// ZONE_MODE == 2: DEDICATED MICROBENCH of DeviceZoneScopedN itself. Times bursts of empty scopes with
+// the wall clock on-device, so nothing host-side, no nop padding and no drain wall is in the number.
+// kBurst * 3 words stays under the 512-word ring so a burst never blocks on ring room; the drainer
+// empties it between bursts, which is also why the burst is timed rather than the whole loop.
+// ZONE_MODE == 2: DEDICATED MICROBENCH of DeviceZoneScopedN. The kernel does NOTHING but enter and
+// leave empty scopes, so the host's launch->done wall divided by the zone count IS the per-zone cost:
+// no nop padding, no point markers, no other work. Reported by the host (DPRINT cannot be used -- it and
+// the profiler are mutually exclusive). Bursts of kBurst keep 3*kBurst words under the 512-word ring so
+// the producer never blocks on ring room; the drainer empties it between bursts.
+// ZONE_MODE == 2: DEDICATED MICROBENCH of DeviceZoneScopedN. The kernel does nothing but enter and leave
+// empty scopes; it times every burst with the wall clock and leaves the totals in L1 for the host to read
+// (DPRINT cannot be used -- it and the profiler are mutually exclusive). kBurst*3 words stays under the
+// 512-word ring so a burst never blocks on ring room, and the drainer empties it between bursts.
+#if ZONE_MODE == 2
+void kernel_main() {
+    volatile tt_reg_ptr uint32_t* wc = reinterpret_cast<volatile tt_reg_ptr uint32_t*>(RISCV_DEBUG_REG_WALL_CLOCK_L);
+#if defined(COMPILE_FOR_BRISC)
+    constexpr uint32_t kSlot = 0;
+#else
+    constexpr uint32_t kSlot = 1;
+#endif
+    volatile tt_l1_ptr uint32_t* out = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(BENCH_ADDR) + kSlot * 2u;
+    constexpr uint32_t kBurst = 100;
+    uint32_t cycles = 0, zones = 0;
+    for (uint32_t it = 0; it < (uint32_t)N_ITERS; it++) {
+        const uint32_t t0 = wc[kWallClockLowIdx];
+        for (uint32_t i = 0; i < kBurst; i++) {
+            DeviceZoneScopedN(ZTAG "_BENCH");
+        }
+        cycles += (uint32_t)(wc[kWallClockLowIdx] - t0);
+        zones += kBurst;
+    }
+    out[0] = cycles;
+    out[1] = zones;
+}
+#else
 void kernel_main() {
     // Durations span ~1..100 us (typical ~10 us). CYC = us * 2500 (see ZONE calibration note above).
     for (uint32_t it = 0; it < (uint32_t)N_ITERS; it++) {
-        // Three POINT markers per iteration, so a capture of this workload exercises every point-marker
-        // shape on the streaming wire, not just zones: PP_EVENT (a bare 2-word flag -- nothing else in
-        // the tree emits one) and PP_DATA with a compile-time tag + payload. The third marker carries the
-        // iteration index as PAYLOAD -- a runtime value on this wire is ordinary DeviceData payload (the
-        // separate runtime-id event type is gone). Kept at three so the offered marker load stays
-        // comparable with older knee/decode benchmarks of this workload.
 // The marker trio is OPT-IN (--markers 1 -> EMIT_MARKERS=1): it exists to exercise every point-marker
 // shape on the wire (PP_EVENT has no other emitter in the tree), but it costs ~21% of wire volume /
 // ~45% of onset delay, so knee sweeps and onset captures want a pure zone stream. EMPTY overhead mode
-// (ZONE_MODE == 2) never emits it regardless.
-#if defined(EMIT_MARKERS) && EMIT_MARKERS && ZONE_MODE != 2
+// (ZONE_MODE >= 3) never emits it regardless.
+#if defined(EMIT_MARKERS) && EMIT_MARKERS && ZONE_MODE < 3
         DeviceFlag(ZTAG "_Flag");
         DeviceTimestampedData(ZTAG "_Data", ((uint64_t)0xF00D << 32) | it);
         DeviceTimestampedData(ZTAG "_Iter", it);
@@ -139,3 +170,4 @@ void kernel_main() {
         ZONE(ZTAG "_Zone9", 250000u);  // ~100 us
     }
 }
+#endif  // ZONE_MODE == 2

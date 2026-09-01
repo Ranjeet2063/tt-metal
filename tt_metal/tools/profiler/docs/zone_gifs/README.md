@@ -57,8 +57,10 @@ for (uint32_t it = 0; it < N_ITERS; it++) {
 }
 ```
 
-Host callback — a `Data` record carries the timestamp; its payload follows as
-`Ext` (word count) + `Cont` (one uint64 each) records on the same lane:
+Host callback — a `Data` record carries the timestamp; one `Ext` record follows on the same lane
+with the payload word count in `id` and payload words 1–2 packed into `data.ext` (`(hi << 32) | lo`).
+A 64-bit value like this one fits entirely in the `Ext`; `Cont` records appear only for payloads
+past two words (one uint64 each, words 3 and up):
 
 ```cpp
 auto h = perf_debug::register_consumer("data-sink", [&](const perf_debug::PerfDebugRecordBatch& b) {
@@ -68,10 +70,10 @@ auto h = perf_debug::register_consumer("data-sink", [&](const perf_debug::PerfDe
             case perf_debug::PerfDebugRecType::Data:  // marker: name id + device timestamp
                 pending = {names.lookup(r.id), r.data.ts};   // "BYTES-MOVED"
                 break;
-            case perf_debug::PerfDebugRecType::Cont:  // one uint64 of its payload
-                fmt::print("{} @ {}: value={}\n", pending.name, pending.ts, r.data.payload);
+            case perf_debug::PerfDebugRecType::Ext:  // payload words 1-2: the whole uint64 here
+                fmt::print("{} @ {}: value={}\n", pending.name, pending.ts, r.data.ext);
                 break;
-            default: break;
+            default: break;  // Cont (words 3+) unused for a single-uint64 payload
         }
     }
 });

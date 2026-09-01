@@ -88,8 +88,8 @@ def test_perf_debug_zones_capture(gx, gy, iters):
     try:
         proc = subprocess.run(
             # --markers 1: the point-marker trio is opt-in (off by default so knee sweeps run a pure
-            # zone stream), but THIS test is the wire-shape coverage vehicle -- PP_EVENT has no other
-            # emitter in the tree, so the markers must be on here or that layout goes untested.
+            # zone stream), and PP_EVENT / Data payload records have no other emitter in the tree, so
+            # the markers must be on here or that layout goes untested.
             [str(WORKLOAD_BIN), "--gx", str(gx), "--gy", str(gy), "--iters", str(iters), "--markers", "1"],
             env=env,
             cwd=str(TT_METAL_HOME),
