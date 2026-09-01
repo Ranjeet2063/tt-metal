@@ -162,7 +162,6 @@ void kernel_main() {
     // Sum of a core's five tails at its last scan. Tails are monotonic, so the delta is exactly the
     // words produced in one service interval -- the growth term the ship deferral needs.
     static uint32_t tails_seen[kMaxCores];
-    static uint8_t seeded[kMaxCores];
     static uint8_t hot[kMaxCores];        // shipped real words last scan; hot + empty scan = publish lag
     static uint8_t ship_list[kMaxCores];  // this sweep's ship set, dense core indices
     // Per-slot frame geometry, written at gather issue and consumed a whole batch later by the
@@ -170,8 +169,23 @@ void kernel_main() {
     static uint8_t slot_core[kNStage];
     static uint32_t slot_payload[kNStage];
     for (uint32_t i = 0; i < kMaxCores; i++) {
-        seeded[i] = 0;
         hot[i] = 0;
+    }
+    // Seed the head mirrors from the tails as they stand now: everything published before this
+    // launch predates the capture.
+    for (uint32_t c = 0; c < num_cores; c++) {
+        noc_async_read<kCvReadBytes>(core_noc[c] + kCvReadSrcOff, kCvBase + c * kCvReadBytes, kCvReadBytes, kReadNoc);
+    }
+    noc_async_read_barrier(kReadNoc);
+    invalidate_l1_cache();
+    for (uint32_t c = 0; c < num_cores; c++) {
+        const tt_l1_ptr uint32_t* tails = reinterpret_cast<const tt_l1_ptr uint32_t*>(kCvBase + c * kCvReadBytes);
+        uint32_t tsum = 0;
+        for (uint32_t r = 0; r < kNumRisc; r++) {
+            head_mirror[c * kNumRisc + r] = tails[r];
+            tsum += tails[r];
+        }
+        tails_seen[c] = tsum;
     }
 
     uint32_t frames = 0;
@@ -551,14 +565,6 @@ void kernel_main() {
                 const tt_l1_ptr uint32_t* __restrict tails =
                     reinterpret_cast<const tt_l1_ptr uint32_t*>(kCvBase + c * kCvReadBytes);
                 uint32_t* __restrict mine = &head_mirror[c * kNumRisc];
-                if (!seeded[c]) {
-                    // Seed the mirrors from the tails: everything written before this filler
-                    // first saw the core predates the workload.
-                    for (uint32_t r = 0; r < kNumRisc; r++) {
-                        mine[r] = tails[r];
-                    }
-                    seeded[c] = 1;
-                }
                 // The scan is unrolled into registers on purpose: a loop over indexed arrays
                 // spills on this core, and each spilled word is an L1 round trip per core per
                 // sweep.
