@@ -63,23 +63,16 @@ inline void write_to_host_chunked(uint32_t pcie_xy_enc, uint32_t src_l1, uint64_
     }
 }
 
-// Bounded replacement for socket_reserve_pages (socket_api.h), which spins on `bytes_free < num_bytes`
-// with NO escape. That spin is a deadlock trap: the host writer gives up acking after its no-progress
-// watchdog, and `*stop` is only re-read at the top of the sweep loop, so a drainer parked here is both
-// unkillable and unfeedable -- and because the producers are lossless, the WORKLOAD hangs with it.
-//
-// Same credit test, three ways out: credit granted (true), host asked us to stop, or the deadline passed.
-// Returning false means "ship nothing this time"; the caller drops the frame. That is the right trade --
-// the heads have already been written back, so the producers keep running and only capture is lost.
-inline bool reserve_pages_bounded(
-    const SocketSenderInterface& socket, uint32_t num_pages, uint64_t wait_cycles, volatile tt_l1_ptr uint32_t* stop) {
+// Stop-interruptible replacement for socket_reserve_pages (socket_api.h), which spins on
+// `bytes_free < num_bytes` with no escape. Waits on host credit, so it answers the host's stop word:
+// lifecycle is the close path's job, not a deadline's. Returning false means "ship nothing"; the caller
+// drops the frame -- the heads were already written back, so producers keep running and only capture is
+// lost.
+inline bool reserve_pages(
+    const SocketSenderInterface& socket, uint32_t num_pages, volatile tt_l1_ptr uint32_t* stop) {
     const uint32_t num_bytes = num_pages * socket.page_size;
     volatile tt_l1_ptr uint32_t* acked = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(socket.bytes_acked_base_addr);
     const uint32_t acked_end = socket.bytes_acked_base_addr + socket.num_downstreams * bytes_acked_size_bytes;
-    // The deadline arms only on a failed poll (here and in the two barriers below): a no-wait pass must
-    // never read the wall clock -- these run per batch, and clock reads on the service path measurably
-    // stall producers at the saturation boundary.
-    uint64_t deadline = 0;
     while (reinterpret_cast<uint32_t>(acked) < acked_end) {
         for (;;) {
             invalidate_l1_cache();
@@ -88,59 +81,12 @@ inline bool reserve_pages_bounded(
             if (bytes_free >= num_bytes) {
                 break;
             }
-            if (deadline == 0) {
-                deadline = get_timestamp() + wait_cycles;
-            }
-            if (*stop != 0 || get_timestamp() >= deadline) {
+            if (*stop != 0) {
                 return false;
             }
         }
         acked =
             reinterpret_cast<volatile tt_l1_ptr uint32_t*>(reinterpret_cast<uint32_t>(acked) + bytes_acked_size_bytes);
-    }
-    return true;
-}
-
-// Bounded noc_async_write_barrier(). Same predicate the real barrier spins on
-// (ncrisc_noc_nonposted_writes_flushed: hardware NIU_MST_WR_ACK_RECEIVED == software
-// noc_nonposted_writes_acked), but it gives up instead of hanging.
-//
-// This barrier is NOT optional bookkeeping -- it is what makes staging reuse safe. The staged span is
-// overwritten by the next batch's reads, so continuing past an unflushed barrier would let staging be
-// rewritten while writes are still in flight, i.e. trade a hung drainer for silently corrupt capture. So
-// the caller must treat `false` as "egress is dead": stop shipping entirely and leave the loop, never as
-// "carry on". That is safe precisely because it only ever fires when the consumer has already gone away.
-// `sent_only` (NONPOSTED_WR_REQ_SENT, the usual source-reuse gate) is legal ONLY when the buffer's next
-// writer is this core's own NIU (staging, refilled by its own read responses). It is NOT a fence against
-// another L1 master -- a sent-based wait against a DMA-engine refill produced 77k/42k decode order
-// regressions in one run.
-// dbg_addr != 0 (instrumented builds only): publish both sides of the flush predicate to L1 while
-// spinning -- a hardware ack counter frozen against its software mirror is indistinguishable from a
-// stalled NoC in every other readout, and they are different bugs.
-template <bool sent_only = false, uint32_t dbg_addr = 0>
-inline bool write_barrier_bounded(uint64_t wait_cycles) {
-    // Bounded on ITERATIONS as well as cycles: the cycle deadline assumes get_timestamp() advances AND
-    // that the loop gets to evaluate it, and a wedged NIU breaks both. The cap does not actually free a
-    // wedged core -- measured; control never returns from the flush check -- but a barrier bounded two
-    // ways beats one bounded by a clock it must be running to read.
-    // 4M iterations is far beyond any healthy flush (worst observed is a handful).
-    constexpr uint32_t kMaxSpins = 4u << 20;
-    uint32_t spins = 0;
-    uint64_t deadline = 0;
-    while (sent_only ? !ncrisc_noc_nonposted_writes_sent(NOC_INDEX)
-                     : !ncrisc_noc_nonposted_writes_flushed(NOC_INDEX)) {
-        if constexpr (dbg_addr != 0) {
-            volatile tt_l1_ptr uint32_t* dbg = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(dbg_addr);
-            dbg[0] = NOC_STATUS_READ_REG(NOC_INDEX, sent_only ? NIU_MST_NONPOSTED_WR_REQ_SENT : NIU_MST_WR_ACK_RECEIVED);
-            dbg[1] = sent_only ? noc_nonposted_writes_num_issued[NOC_INDEX] : noc_nonposted_writes_acked[NOC_INDEX];
-        }
-        invalidate_l1_cache();
-        if (deadline == 0) {
-            deadline = get_timestamp() + wait_cycles;
-        }
-        if (++spins >= kMaxSpins || get_timestamp() >= deadline) {
-            return false;
-        }
     }
     return true;
 }
@@ -166,21 +112,6 @@ inline void dma_read_unchecked(uint8_t stream, uint64_t src_gddr, uint32_t dst_l
     attrs.f.transfer_start_read = 1;
     experimental::program_dma_read_addresses_(stream, src_gddr, dst_l1);
     WRITE_TX_STREAM_REG(stream, TX_REG_STREAM_TRANSFER_ATTRIBUTES_REG_OFFSET, attrs.val);
-}
-
-// Bounded dma_async_write_wait_n (gddr_dma.h): the spool-mode staging-reuse gate. Completion, not "sent" --
-// the DMA engine has no sent analog, and completion (AXI write response received) is also what makes the
-// spool bytes observable to the stream-1 reads that consume them.
-inline bool dma_wait_writes_bounded(uint8_t stream, uint8_t n, uint64_t wait_cycles) {
-    uint64_t deadline = 0;
-    while (experimental::dma_get_writes_outstanding(stream) > n) {
-        if (deadline == 0) {
-            deadline = get_timestamp() + wait_cycles;
-        } else if (get_timestamp() >= deadline) {
-            return false;
-        }
-    }
-    return true;
 }
 
 // ---- NoC FOOTPRINT: per-sweep NIU-counter deltas into 64-bit accumulators ------------------------------

@@ -120,10 +120,6 @@ constexpr uint32_t kLaneTrigger = kRingWords / 2u;
 constexpr uint32_t kCvBusyPeak = kLaneTrigger / 2u;
 // Idle backoff ceiling, ~5 us. 20 us exceeded a lane's fill time at high rates.
 constexpr uint32_t kCvIdleGapMax = 6750;
-// ~50 ms. Far above any healthy wait (worst observed is ~0.1 us); exists purely to convert "wait
-// forever on a dead consumer" into "lose a frame". Deadlines arm lazily inside the bounded waits,
-// so the no-wait path never reads the wall clock.
-constexpr uint64_t kCreditWaitCycles = 67500000ull;
 // ~50 ms: the worst-case host staleness for a workload too light to reach the occupancy bands.
 constexpr uint64_t kSpoolFreshCycles = 67500000ull;
 constexpr uint64_t kStopDrainCycles = 1350000000;
@@ -324,9 +320,6 @@ void kernel_main() {
     uint32_t quiet_streak = 0;
     constexpr uint32_t kBatchArmSweeps = 3;
     constexpr uint32_t kFlushQuietSweeps = 8;
-    // Set when a bounded egress wait expires. Means "the consumer is gone, stop shipping for good";
-    // never "continue anyway" -- staging reuse depends on the expired barrier having flushed.
-    bool egress_dead = false;
     // Which staging generations may still have a ship in flight. Persists across sweeps so a
     // sweep's final ship drains under the pace gap or the next CV pass, not on its own critical
     // path.
@@ -368,8 +361,7 @@ void kernel_main() {
     bool fresh_boost = false;
     uint64_t spool_oldest = 0;  // when the spool last went non-empty; 0 = empty
     uint32_t fresh_tick = 0;
-    bool spool_lossy = false;  // a full-spool wait expired: consumer gone, stop waiting on it
-    bool drain_dead = false;   // exit drain deadline expired: bytes stranded in the spool
+    bool drain_dead = false;  // teardown escalated (stop=2) with bytes stranded in the spool
     uint32_t spool_drops = 0;
     uint32_t credit_timeouts = 0;
     uint32_t dropped_frames = 0;
@@ -824,7 +816,6 @@ void kernel_main() {
         }  // kInstr != 0 //
         out[33] = credit_timeouts;                                                                        //
         out[34] = dropped_frames;                                                                         //
-        out[35] = egress_dead ? 1u : 0u;                                                                  //
         out[36] = noc_index_before;                                                                       //
         out[37] = noc_index_after;                                                                        //
         out[38] = NOC_INDEX;                                                                              //
@@ -911,7 +902,6 @@ void kernel_main() {
         }  // kInstr != 0 //
         out64(140, spool_wr);  //
         out[142] = static_cast<uint32_t>(spool_wr - spool_rd);  // stranded; nonzero only with drain_dead //
-        out[144] = spool_lossy ? 1u : 0u;                                                                 //
         if constexpr (kInstr != 0) {  //
         out[170] = ship_deferred;                                                                         //
         out[171] = 0;                                                                                     //
@@ -994,17 +984,16 @@ void kernel_main() {
             pages = s_pages;                                                                        //
             pushes = s_pushes;                                                                      //
             max_reserve = s_maxr;                                                                   //
-            const bool self_out = kSpool ? dma_wait_writes_bounded(kDmaShip, 0, kCreditWaitCycles)  //
-                                         : write_barrier_bounded(kCreditWaitCycles);                //
-            if (self_out) {                                                                         //
-                self_words_shipped += self_tail - self_head;                                        //
-                self_head = self_tail;                                                              //
-                self_frames++;                                                                      //
+            if constexpr (kSpool) {                                                                 //
+                while (experimental::dma_get_writes_outstanding(kDmaShip) != 0) {                   //
+                }                                                                                   //
             } else {                                                                                //
-                // Egress is dead; emit_slots already counted the drop. Stop instrumenting rather
-                // than keep writing into a ring nothing will read.
-                egress_dead = true;                                                                 //
+                while (!ncrisc_noc_nonposted_writes_flushed(NOC_INDEX)) {                           //
+                }                                                                                   //
             }                                                                                       //
+            self_words_shipped += self_tail - self_head;                                            //
+            self_head = self_tail;                                                                  //
+            self_frames++;                                                                          //
             self_busy = false;                                                                      //
             c_self += instr_now() - t_s0;                                                       //
         }                                                                                           //
@@ -1110,9 +1099,7 @@ void kernel_main() {
         // Gated on tail != head, not on self_on -- self_on is cleared at the end of every sweep.
         if constexpr (kSelfZones != 0) {  //
             self_on = false;              //
-            if (!egress_dead) {           //
-                self_publish();           //
-            }                             //
+            self_publish();               //
         }                                 //
     };  //
     // ==== end instrumentation =======================================================================
@@ -1243,7 +1230,7 @@ void kernel_main() {
             } else if (b_state[1] == kBounceReady) {
                 rdy = 1u;
             }
-            if (rdy != 2u && !egress_dead) {
+            if (rdy != 2u) {
                 invalidate_l1_cache();
                 const uint32_t bytes_free = sender.downstream_fifo_total_size - (sender.bytes_sent - *acked0);
                 uint32_t nb = b_bytes[rdy] - b_off[rdy];
@@ -1284,11 +1271,6 @@ void kernel_main() {
         if (count == 0) {
             return;
         }
-        if (egress_dead) {
-            *phase = kPhDropped;
-            dropped_frames += count;
-            return;
-        }
         if constexpr (kSpool) {
             uint32_t bytes = 0;
             for (uint32_t f = 0; f < count; f++) {
@@ -1296,16 +1278,12 @@ void kernel_main() {
             }
             // Full spool: pump until there is room. This wait, not a drop, is the spool's
             // back-pressure -- frames stay safe in staging, the sweep slows, producers stall.
-            // Frames drop only for a consumer that is actually gone (stop, or the deadline).
-            if (kSpoolBytes - static_cast<uint32_t>(spool_wr - spool_rd) < bytes && !egress_dead && !spool_lossy) {
+            // Interruptible only by the host's stop: lifecycle lives in the close path.
+            if (kSpoolBytes - static_cast<uint32_t>(spool_wr - spool_rd) < bytes) {
                 *phase = kPhaseReserve;
-                const uint64_t t_a = get_timestamp() + kCreditWaitCycles;
                 while (kSpoolBytes - static_cast<uint32_t>(spool_wr - spool_rd) < bytes && *stop == 0) {
+                    invalidate_l1_cache();
                     drain_pump();
-                    if (get_timestamp() >= t_a) {
-                        spool_lossy = true;
-                        break;
-                    }
                 }
             }
             if (kSpoolBytes - static_cast<uint32_t>(spool_wr - spool_rd) < bytes) {
@@ -1368,7 +1346,7 @@ void kernel_main() {
             // Suppressed while self_publish ships the self frame through this same path, so the
             // self frame's own egress is never a zone.
             I_ZONE_CREDIT();
-            credited = reserve_pages_bounded(sender, npages, kCreditWaitCycles, stop);
+            credited = reserve_pages(sender, npages, stop);
         }
         *phase = kPhaseWrite;
         if (!credited) {
@@ -1408,7 +1386,7 @@ void kernel_main() {
     // The batched bytes_sent notify for pump ships: once per sweep instead of once per chunk.
     auto drain_notify = [&]() {
         if constexpr (kSpool) {
-            if (notify_pending && !egress_dead) {
+            if (notify_pending) {
                 notify_host();
                 notify_pending = false;
             }
@@ -1423,7 +1401,7 @@ void kernel_main() {
     uint64_t stop_seen_at = 0;
     uint32_t frames_at_stop_check = 0;
     const uint64_t t_start = get_timestamp();
-    while (sweeps < kMaxSweeps && !egress_dead) {
+    while (sweeps < kMaxSweeps) {
         invalidate_l1_cache();
         if (*stop != 0) {
             if (stop_seen_at == 0) {
@@ -1702,9 +1680,7 @@ void kernel_main() {
                     if constexpr (kSpool) {
                         gen_dma_mark[g] = dma_issued;
                     }
-                    if (!egress_dead) {
-                        gen_shipped[g] = true;
-                    }
+                    gen_shipped[g] = true;
                 };
 
                 while (cur < n_ship) {
@@ -1809,7 +1785,7 @@ void kernel_main() {
                     have_pend = true;
                     gen = gen + 1u == kNGens ? 0u : gen + 1u;
                 }
-                if (egress_dead || (cur >= n_ship && scan_hi >= num_cores)) {
+                if (cur >= n_ship && scan_hi >= num_cores) {
                     if (have_pend) {
                         ship_frames(pend_n, gen == 0u ? kNGens - 1u : gen - 1u);
                         have_pend = false;
@@ -1910,31 +1886,33 @@ void kernel_main() {
     // pass; bounded, so a consumer that stopped acking strands bytes (counted) instead of wedging
     // teardown.
     if constexpr (kSpool) {
-        if (!egress_dead) {
-            (void)dma_wait_writes_bounded(kDmaShip, 0, kCreditWaitCycles);
-            const uint64_t t_dl = get_timestamp() + kStopDrainCycles;
-            while (spool_rd_iss != spool_wr || b_state[0] != kBounceEmpty || b_state[1] != kBounceEmpty) {
-                drain_pump();
-                // Notify per pass, not per sweep: with a host FIFO smaller than the backlog, the
-                // acks that free credit only come after the host has seen the bytes.
-                drain_notify();
-                if (get_timestamp() >= t_dl) {
-                    drain_dead = true;
-                    break;
-                }
-            }
-            drain_notify();
+        while (experimental::dma_get_writes_outstanding(kDmaShip) != 0) {
         }
+        while (spool_rd_iss != spool_wr || b_state[0] != kBounceEmpty || b_state[1] != kBounceEmpty) {
+            drain_pump();
+            // Notify per pass, not per sweep: with a host FIFO smaller than the backlog, the
+            // acks that free credit only come after the host has seen the bytes.
+            drain_notify();
+            // The host's teardown escalates stop to 2 after its own timeout -- the close path's
+            // kill switch for a drain whose consumer will never finish it.
+            invalidate_l1_cache();
+            if (*stop == 2u) {
+                drain_dead = true;
+                break;
+            }
+        }
+        drain_notify();
     }
 
     // socket_barrier waits for the host to ack everything, so it would hang on a dead consumer.
-    const bool consumer_gone = egress_dead || credit_timeouts != 0 || drain_dead || spool_lossy;
+    const bool consumer_gone = credit_timeouts != 0 || drain_dead;
     *phase = kPhSockBar;
     if (!consumer_gone) {
         socket_barrier(sender);
     }
     *phase = kPhTailBar;
-    (void)write_barrier_bounded<false, kInstr != 0 ? kDoneAddr + 12u : 0u>(kCreditWaitCycles);
+    while (!ncrisc_noc_nonposted_writes_flushed(NOC_INDEX)) {
+    }
     // The posted head write-backs are outside that barrier's predicate; drain their sent counter
     // (small packets stream out in nanoseconds) so no unstreamed head is left behind.
     {
