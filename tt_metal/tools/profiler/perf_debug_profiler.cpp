@@ -1948,7 +1948,9 @@ bool PerfDebugProfiler::boot_device(
                     .compile_args = cargs,
                     .defines = {{"PERF_DEBUG_DRAIN_KERNEL", "1"}}});
             std::vector<uint32_t> rt = {my_cores, static_cast<uint32_t>(prof_l1)};
-            rt.insert(rt.end(), coords.begin() + lo, coords.begin() + hi);
+            // Reversed: launch order follows global index, so the slice's last-launched cores (the
+            // join-blind victims) land in the first-chunk slots, which are read and serviced first.
+            rt.insert(rt.end(), coords.rbegin() + (coords.size() - hi), coords.rbegin() + (coords.size() - lo));
             SetRuntimeArgs(*ctx.drain_program[d], drain_id, ctx.drisc_logical[d], rt);
 
             detail::CompileProgram(ctx.device, *ctx.drain_program[d], /*force_slow_dispatch=*/true);
