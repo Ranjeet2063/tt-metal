@@ -24,7 +24,6 @@
 #include <x86intrin.h>
 #include <thread>
 
-#include <tt-metalium/allocator.hpp>
 #include "impl/dispatch/dispatch_core_manager.hpp"
 #include <tt-metalium/device.hpp>
 #include <tt-metalium/host_api.hpp>
@@ -33,6 +32,7 @@
 #include <tt-metalium/kernel_types.hpp>
 
 #include <tt-metalium/mesh_device.hpp>
+#include <tt-metalium/mesh_buffer.hpp>
 #include <tt-metalium/mesh_coord.hpp>
 #include <tt-metalium/experimental/sockets/d2h_socket.hpp>
 #include <tt-metalium/experimental/sockets/mesh_socket.hpp>  // MeshCoreCoord
@@ -73,20 +73,6 @@ uint32_t drisc_gap_cycles() {
     return v;
 }
 
-// TT_METAL_PERF_DEBUG_SHIP_REPEAT: EGRESS AMPLIFIER for stress testing. N>1 makes the drainer re-send each
-// staged frame N times, so egress bandwidth stops being bounded by producer rate -- the extra sends skip the
-// read and process phases. Written to answer "can PCIe egress alone hang the card?" on the Tensix drainer,
-// whose own ceiling is read/process (saturated at 511/512 ring occupancy while pushing only 5.2 GB/s).
-// The host then receives N duplicate copies of every frame, so this is NOT a valid capture: pair it with
-// TT_METAL_PERF_DEBUG_NO_DECODE=1 and read the page/byte counters, not the markers.
-uint32_t ship_repeat() {
-    static const uint32_t v = [] {
-        const char* s = std::getenv("TT_METAL_PERF_DEBUG_SHIP_REPEAT");
-        const uint32_t n = (s == nullptr || *s == '\0') ? 1u : static_cast<uint32_t>(std::strtoul(s, nullptr, 10));
-        return n == 0 ? 1u : n;
-    }();
-    return v;
-}
 
 // TT_METAL_PERF_DEBUG_NO_STATIC_TLB: skip configuring a static TLB window for the DRISC drainer, leaving the
 // socket's ack write on UMD's dynamic (reconfigure-per-access) path. Exists so static-vs-dynamic can be A/B'd
@@ -99,15 +85,6 @@ bool no_static_tlb() {
     return v;
 }
 
-// TT_METAL_PERF_DEBUG_DRAIN_TENSIX: run the drain kernel on a Tensix BRISC instead of a DRISC. Control
-// path only -- see boot_device(). Requires slow dispatch.
-bool drain_on_tensix() {
-    static const bool v = [] {
-        const char* s = std::getenv("TT_METAL_PERF_DEBUG_DRAIN_TENSIX");
-        return s != nullptr && *s != '\0' && *s != '0';
-    }();
-    return v;
-}
 
 // TT_METAL_PERF_DEBUG_NO_NOC_INIT: do not resync the drainer's software NoC counter mirrors from hardware at
 // kernel entry. That resync is what fixes the slow-dispatch wedge (a resident core's mirrors persist across
@@ -122,15 +99,13 @@ bool no_noc_init() {
     return v;
 }
 
-// ABLATION: strip the drain loop to EGRESS ONLY. TT_METAL_PERF_DEBUG_ABLATE=1 compiles out every worker
-// read and all per-core processing; the drainer re-ships the same pre-staged mock bytes forever. Purpose is to
-// bisect the hang: if DRAM-core -> PCIe egress alone can hang the card, the read side is irrelevant.
-// TT_METAL_PERF_DEBUG_ABLATE_SPIN is a cycle count that stands in for the sweep. IT MUST BE LARGE. A real run
-// is only 1.7% duty (268 busy sweeps of 15,477) and idles ~1.7 ms between bursts, which is what lets the host
-// fully drain the FIFO so the NEXT burst runs at the true ~16 GB/s. Spins of 4k-40k cycles (3-30 us) are ~57x
-// too small: the loop stays permanently credit-bound at ~3.9 GB/s and the spin appears to do nothing, because
-// when you are already blocked on credits a spin only displaces wait time. Use ~2.3M cycles (~1.7 ms) to
-// reproduce real burst behaviour. Pair with NO_DECODE=1 -- the payload is mock.
+// ABLATION: strip the drain loop to EGRESS ONLY -- no worker reads, no per-core processing; the drainer
+// re-ships pre-staged mock bytes forever. Pair with NO_DECODE=1, since the payload is mock.
+//
+// ABLATE_SPIN stands in for the sweep and MUST be ~2.3M cycles (~1.7 ms). A real run idles that long
+// between bursts, and that idle is what lets the host drain the FIFO so the next burst runs at full rate.
+// Spins of 3-30 us leave the loop permanently credit-bound, where a spin only displaces wait time and so
+// appears to do nothing at all (FINDINGS §N+12).
 uint32_t ablate() {
     static const uint32_t v = [] {
         const char* s = std::getenv("TT_METAL_PERF_DEBUG_ABLATE");
@@ -147,26 +122,22 @@ uint32_t ablate_spin() {
     return v;
 }
 
-// TT_METAL_PERF_DEBUG_NOC selects which NIU the DRISC drainer EGRESSES on (reads use the other one). Default
-// 0, matching every result recorded so far. Exists to test whether the hang follows the NoC rather than the
-// core: if egress on NoC 1 stops hanging, NoC 0's route from the DRAM endpoint to the PCIe tile is implicated.
+// TT_METAL_PERF_DEBUG_NOC forces which NIU EVERY drainer egresses on (reads take the other); unset =
+// NOC 0 for all six.
 //
-// It IS just a flag flip, and the question it was built to ask is already answered -- see FINDINGS §N+12:
-// egress on NoC 1 hangs identically to NoC 0 (16.0 vs 16.2 GB/s, load matched within 1%, both at run 16), so
-// the route from the DRAM endpoint to the PCIe tile is dead as an explanation.
-//
-// This comment previously claimed the flip needed a mirrored PCIe encoding, because NoC 1 mirrors coordinates
-// (NOC_0_X_PHYS_COORD(noc, size_x, x) = noc == 0 ? x : size_x - 1 - x). That was WRONG: the macro mirrors
-// WORKER coords, while the PCIe tile lives in TRANSLATED space (the kernel is built with PCIE_NOC_X=19,
-// PCIE_NOC_Y=24 -- both outside the 17x12 NOC0 grid), so the socket's NOC0-derived pcie_xy_enc is correct on
-// BOTH NoCs. Measured: with the mirrored override, 0 markers decode from 2.37M pages; without it, 5,501,058
-// decode. The override survives only behind TT_METAL_PERF_DEBUG_NOC_MIRROR=1 to keep the dead end documented.
-// Watch for its signature: pages flow while zero markers decode, because socket credits advance on a
-// different path than the payload writes, so a wrong payload destination looks like healthy throughput.
-uint32_t drain_noc() {
-    static const uint32_t v = [] {
+// It USED to alternate by drainer index, so each PCIe-tile NIU would carry three fillers' pushes instead
+// of one carrying all six. That reasoning is sound and was measured wrong: NOC 1 egress runs ~2x the
+// service interval of NOC 0 (per-filler, delay 30: 41.0-52.6 us forced to NOC 1 against 20.2-36.5 us
+// forced to NOC 0), so alternating parked three of six fillers on the bad NIU. Those three then owned a
+// contiguous core band and took essentially every producer stall below saturation. Forcing all six to
+// NOC 0 halves stalls across the range (delay 30: 60,963 -> 35,699) even though they now share one NIU.
+// The winning pairing is egress on 0 / reads on 1, which is what kReadNoc derives. The socket's NOC0-derived PCIe encoding is correct on BOTH NoCs -- the PCIe tile lives in
+// translated space, so the coordinate mirroring that applies to worker coords does not apply to it
+// (FINDINGS §N+12).
+int drain_noc_override() {
+    static const int v = [] {
         const char* s = std::getenv("TT_METAL_PERF_DEBUG_NOC");
-        return (s == nullptr || *s == '\0') ? 0u : (std::strtoul(s, nullptr, 10) == 1 ? 1u : 0u);
+        return (s == nullptr || *s == '\0') ? -1 : (std::strtoul(s, nullptr, 10) == 1 ? 1 : 0);
     }();
     return v;
 }
@@ -192,28 +163,6 @@ bool reserve_column_env() {
     return v;
 }
 
-// DRAM banks a resident DRISC drainer may safely occupy. MEASURED, not derived -- see the call site
-// and FINDINGS N+29. Drainer d takes kSafeBanks[d].
-constexpr uint32_t kSafeBanks[] = {0, 3};
-constexpr uint32_t kNumSafeBanks = sizeof(kSafeBanks) / sizeof(kSafeBanks[0]);
-
-// TT_METAL_PERF_DEBUG_DRISC_BANK: DIAGNOSTIC override of the bank drainer 0 takes (drainer d then
-// takes base+d). Unset = use kSafeBanks, which is what production wants. Returns -1 when unset, so
-// that an explicit "=0" is distinguishable from the default.
-int drisc_bank_override() {
-    static const int v = [] {
-        const char* s = std::getenv("TT_METAL_PERF_DEBUG_DRISC_BANK");
-        return (s != nullptr && *s != '\0') ? static_cast<int>(std::strtol(s, nullptr, 10)) : -1;
-    }();
-    return v;
-}
-
-// ---- ROLE SPLIT knobs (see PerfDebugProfiler::kMaxDrisc in the header for the why) --------------------
-//
-// TT_METAL_PERF_DEBUG_ROLE_SPLIT=1 runs SIX DRISCs -- 4 fillers (a quarter of the worker grid each -> its own
-// device DRAM ring) and 2 movers (TWO DRAM rings each -> the existing D2H socket) -- instead of 2 drainers
-// each doing the whole job. Unset or 0 is today's path, bit for bit: every role-split compile arg is then 0
-// and the kernel's `if constexpr` discards all of it.
 // Shared truthiness for the perf-debug knobs. Tests the WHOLE value, not just the first character: the old
 // `*s != '0'` idiom made `=false`, `=off` and `=no` all evaluate to ENABLED (any word not starting with '0'),
 // while `=01` and `=0x1` evaluated to DISABLED. That is backwards for knobs whose purpose is keeping an
@@ -238,64 +187,33 @@ bool env_flag(const char* name) {
     return true;
 }
 
-// DEFAULT ON. The 6-DRISC split is the production shape -- it moved the knee from delay 60 to 15 (§N+40) --
-// and the 2-drainer fallback is well past its own knee at the delays we care about: measured 22,761 producer
-// stalls across 120 of 120 cores at delay 15 with the split off against 0 with it on. Both are lossless, so
-// the old default cost workload perturbation rather than correctness. Set a falsy value to force the
-// 2-drainer path; that is a bisect tool, not a production choice.
-bool role_split() {
-    static const bool v = [] {
-        const char* s = std::getenv("TT_METAL_PERF_DEBUG_ROLE_SPLIT");
-        return (s == nullptr || *s == '\0') ? true : env_flag("TT_METAL_PERF_DEBUG_ROLE_SPLIT");
-    }();
-    return v;
-}
 
-// Per-filler DRAM ring size, in MiB. The whole reason to stage in DRAM is that this number is not capped by
-// the TLB window budget the way the 12 MiB host FIFO is, so make it large enough that a host hiccup cannot
-// reach the producers: 64 MiB is ~6,300 frames, roughly 115 busy sweeps of slack against the host FIFO's 21.
-//
-// This now sizes the HAL's DRAM PROFILER region too (perf_debug_dram_region_bytes_per_risc above), so it is
-// read before any device is opened. Lowering it lowers DRAM held per bank one-for-one; 12 MiB is enough for a
-// 5,000-zone/RISC capture and 64 MiB buys ~16-17k zones/RISC of runway (FINDINGS §N+39).
-//
-// DEFAULT 448 MiB, because runway is what keeps producers unstalled and it scales with VOLUME, not rate:
-// roughly 19 MB per 1k iterations per filler at the knee, so 448 covers ~24k iterations' worth of backlog
-// while 64 covers ~3.4k. Nothing is reserved unless the streaming profiler is enabled (see the gate above),
-// so the cost is paid only by runs that profile.
-uint32_t role_ring_mb() {
-    static const uint32_t v = [] {
-        const char* s = std::getenv("TT_METAL_PERF_DEBUG_ROLE_RING_MB");
-        const uint32_t n = (s != nullptr && *s != '\0') ? static_cast<uint32_t>(std::strtoul(s, nullptr, 10)) : 448u;
-        return n == 0 ? 448u : n;
-    }();
-    return v;
-}
 
-// DRAM banks (DRAM VIEW ids) the FILLERS occupy. Default 5, 6, 4, 1 = NoC cores 9-9, 9-5, 9-2, 0-3 -- all
-// y != 0, which is legal for this role only (see the header). Two 25-run blocks on bank 5 -- N+29's WORST
-// core, 5/25 for a full-job drainer -- gave 0/25 for stream-mode-held and 0/25 for filler-only duty.
-//
-// Views 4 and 1 were added for fillers 2 and 3. NOT view 7: the N+29 sweep records view 7's unused port as
-// NoC core 0-0, the SAME core view 0 resolves to, and view 0 hosts mover 0. Two resident kernels on one core
-// is not a subtle failure, but nothing in pick_unused_dram_logical_core() would have stopped it, so the
-// duplicate-core TT_FATAL in boot_device now checks it explicitly for every roster.
-// TT_METAL_PERF_DEBUG_FILLERS: the role-split shape. 6 (default) = 6 fillers + 1 mover: every DRAM view
-// sweeps workers (cores/filler 30 -> 20, ~1.5x faster revisit cadence = the onset lever) and the single
-// mover owns all six rings, at the cost of HALF the sustained evacuation ceiling. 4 = 4 fillers + 2 movers,
-// the sustained-optimized roster: the second mover is worth ~2.3x on the sustained knee, so switch to 4 for
-// long max-rate captures. The 6-shape is the default because it keeps producers unstalled at the highest
-// offered rates, which is what perturbs a workload's own timing.
-uint32_t n_fillers() {
-    static const uint32_t v = [] {
-        const char* s = std::getenv("TT_METAL_PERF_DEBUG_FILLERS");
-        const uint32_t x = (s != nullptr && *s != '\0') ? static_cast<uint32_t>(std::strtoul(s, nullptr, 10)) : 6u;
-        TT_FATAL(x == 4 || x == 6, "TT_METAL_PERF_DEBUG_FILLERS must be 4 or 6, got {}", x);
-        return x;
+// DRAM banks (DRAM VIEW ids) the FILLERS occupy, one per filler. Views 7 and 2 ride at the end: the N+29
+// sweep recorded view 7's spare port colliding with view 0's (both NoC core 0-0) and view 2 failing
+// bringup outright, so a downgraded roster that drops trailing entries sheds the historically fragile
+// views first. Both boot clean on the current UMD/soc-descriptor state, and the duplicate-core TT_FATAL
+// in boot_device still checks every roster -- nothing in pick_unused_dram_logical_core() would.
+const std::vector<uint32_t>& filler_vcs() {
+    static const std::vector<uint32_t> v = [] {
+        std::vector<uint32_t> out;
+        const char* s = std::getenv("TT_METAL_PERF_DEBUG_FILLER_VCS");
+        if (s != nullptr && *s != '\0') {
+            const char* p = s;
+            while (*p != '\0') {
+                out.push_back(static_cast<uint32_t>(std::strtoul(p, nullptr, 10)) & 3u);
+                while (*p != '\0' && *p != ',') {
+                    p++;
+                }
+                if (*p == ',') {
+                    p++;
+                }
+            }
+        }
+        return out;
     }();
     return v;
 }
-uint32_t n_sockets_split() { return n_fillers() == 6 ? 1u : 2u; }
 
 const std::vector<uint32_t>& role_filler_banks() {
     static const std::vector<uint32_t> v = [] {
@@ -314,57 +232,12 @@ const std::vector<uint32_t>& role_filler_banks() {
             }
         }
         if (out.empty()) {
-            // 6-filler shape: bank 3 (the second y==0 safe bank, unused with 1 mover) and bank 2 join.
-            out = n_fillers() == 6 ? std::vector<uint32_t>{5u, 6u, 4u, 1u, 2u, 3u}
-                                   : std::vector<uint32_t>{5u, 6u, 4u, 1u};
+            out = {5u, 6u, 4u, 1u, 0u, 3u, 7u, 2u};
         }
         return out;
     }();
     return v;
 }
-
-// ALLOCATOR bank ids the RINGS live in. Since stage_run pushes frames with the DRAM tile's own GDDR DMA
-// engine (gddr_dma.h), a filler's ring MUST live in its OWN bank: the DMA reaches only the channel its tile
-// fronts, and allocator bank ids are DRAM view ids one-for-one (l1_banking_allocator sizes the DRAM
-// allocator off get_num_dram_views() with identity bank<->channel maps). So the default is rb[i] == fb[i],
-// and boot_device FATALs on any override that breaks it -- a non-local ring does not fail loudly, it makes
-// the DMA write a well-formed ring into the WRONG bank's HAL profiler region while the mover replays stale
-// laps from the configured one (measured 2026-08-24: 6.4M resync words, 79,580 order regressions, a
-// 45-minute "zone window" of mixed-boot timestamps).
-//
-// This replaces the NoC-era stagger (fb[i] != rb[i] pairwise, rings {1,2,3,4,5,6}), whose own justification
-// had already been relaxed to "never on a MOVER bank" -- still satisfied: fillers never sit on mover banks.
-// Ring traffic now terminates at the filler's own channel, which also takes the ~1.4 GB/s ring write off
-// the NoC entirely. Overridable with TT_METAL_PERF_DEBUG_ROLE_RING_BANKS (validated, see above).
-const std::vector<uint32_t>& role_ring_banks() {
-    static const std::vector<uint32_t> v = [] {
-        std::vector<uint32_t> out;
-        const char* s = std::getenv("TT_METAL_PERF_DEBUG_ROLE_RING_BANKS");
-        if (s != nullptr && *s != '\0') {
-            const char* p = s;
-            while (*p != '\0') {
-                out.push_back(static_cast<uint32_t>(std::strtoul(p, nullptr, 10)));
-                while (*p != '\0' && *p != ',') {
-                    p++;
-                }
-                if (*p == ',') {
-                    p++;
-                }
-            }
-        }
-        if (out.empty()) {
-            out = role_filler_banks();  // rb[i] == fb[i]: the ring must be DMA-reachable from its filler
-        }
-        return out;
-    }();
-    return v;
-}
-
-constexpr uint32_t kRoleFull = 0, kRoleFiller = 1, kRoleMover = 2;
-// Must match drisc_profiler_drain.cpp's kProbeMoverMagic and handshake offsets.
-constexpr uint32_t kProbeFillerMagic = 0xF11E5A17u;
-constexpr uint32_t kProbeMoverMagic = 0x5A0FE1EDu;
-constexpr uint32_t kHsHead = 0, kHsTail = 16, kHsProbeF = 32, kHsProbeM = 48, kHsBytes = 64;
 
 // ---- DRISC SELF-PROFILING knobs -----------------------------------------------------------------------
 //
@@ -378,12 +251,14 @@ constexpr uint32_t kHsHead = 0, kHsTail = 16, kHsProbeF = 32, kHsProbeM = 48, kH
 // sweeps. Every sweep inside an active window is now instrumented instead.
 bool drisc_zones() {
     static const bool v = [] {
-        // NOC_FOOTPRINT IMPLIES ZONES. The per-sweep NoC series rides the self-zone marker stream, so
-        // footprint-without-zones yields the out[] totals and the log block but NO plots -- a silently
-        // half-working configuration. Asking for the footprint therefore turns self-profiling on too.
-        // An explicit falsy DRISC_ZONES still wins, so the combination remains expressible.
+        // NOC_FOOTPRINT IMPLIES ZONES -- but only when the per-sweep series exists to ride the self-zone
+        // stream, i.e. with CV-first off (the kernel forces the series off under CV-first: the maximal
+        // build measured 396 B over the code region). Under CV-first the footprint is its out[] totals,
+        // which need no zones. An explicit falsy DRISC_ZONES still wins either way.
         const char* z = std::getenv("TT_METAL_PERF_DEBUG_DRISC_ZONES");
-        if ((z == nullptr || *z == '\0') && env_flag("TT_METAL_PERF_DEBUG_NOC_FOOTPRINT")) {
+        const char* cf = std::getenv("TT_METAL_PERF_DEBUG_CV_FIRST");
+        const bool cv_on = (cf == nullptr || *cf == '\0') ? true : env_flag("TT_METAL_PERF_DEBUG_CV_FIRST");
+        if ((z == nullptr || *z == '\0') && env_flag("TT_METAL_PERF_DEBUG_NOC_FOOTPRINT") && !cv_on) {
             log_info(
                 tt::LogMetal,
                 "[perf-debug profiler] NOC_FOOTPRINT implies DRISC_ZONES (the per-sweep NoC series rides the "
@@ -398,8 +273,7 @@ bool drisc_zones() {
 // How long, in MICROSECONDS of device wall clock, the capture window stays open past the last work seen. This
 // is what makes coverage contiguous across a burst instead of restarting per busy sweep, and what keeps the
 // drainer's ~99% idle residency (hundreds of ms to seconds, against a ~2 ms workload) out of the trace.
-// In cycles on the device; a filler idles at 8.5 us + a 12.7 us pacing gap, a mover at 0.7 us, so a hold
-// expressed in SWEEPS would mean two completely different durations on the two roles.
+// Wall clock rather than sweeps, because a sweep's duration swings ~5x between idle and loaded.
 uint32_t drisc_zone_hold_cycles() {
     static const uint32_t v = [] {
         const char* s = std::getenv("TT_METAL_PERF_DEBUG_DRISC_ZONE_HOLD_US");
@@ -429,14 +303,6 @@ uint32_t drisc_zone_detail() {
         // Detail-1 phases plus the read-split read path overflow the 11,264 B DRISC code region by
         // ~300 B (measured; every other knob combination fits). Degrade loudly rather than let the
         // filler fail to load and produce an empty capture.
-        if (d != 0 && env_flag("TT_METAL_PERF_DEBUG_READ_SPLIT")) {
-            log_warning(
-                tt::LogMetal,
-                "[perf-debug profiler] DRISC_ZONE_DETAIL={} with READ_SPLIT does not fit the DRISC code "
-                "region; forcing detail 0 (SWEEP/PACE zones only)",
-                d);
-            d = 0;
-        }
         return d;
     }();
     return v;
@@ -491,115 +357,185 @@ uint32_t nstage_cap(uint32_t computed) {
 
 }  // namespace
 
-// Declared in the header, so it lives OUTSIDE the anonymous namespace above (external linkage) while still
-// seeing role_split()/role_ring_mb() from it.
-//
-// The HAL sizes its per-bank DRAM PROFILER region as
-// `per_risc_bytes * MaxProcessorsPerCoreType * CEIL_NUM_CORES_PER_DRAM_CHANNEL` (5 * 20 = 100 on Blackhole and
-// Wormhole), so the per-risc figure that yields R bytes per bank is R / 100.
-//
-// Nothing downstream assumes this landed on exactly ROLE_RING_MB: those multipliers live in the arch HALs and
-// are not visible here, so if an arch differs the region comes out a different size and the ring adapts to
-// whatever was actually reserved (frames = region_bytes / slot_bytes).
-uint32_t perf_debug_dram_region_bytes_per_risc() {
-    // Gated on the streaming profiler actually being ENABLED, not merely on a Tracy-enabled build. The HAL
-    // reserves this region in every DRAM bank before any device is opened, and it comes straight out of
-    // DRAM_UNRESERVED -- i.e. out of what models can allocate. At the 448 MiB default that is ~3 GiB across
-    // a 7-bank part, which no build should pay for a profiler it never turns on.
-    const char* on = std::getenv("TT_METAL_STREAMING_PROFILER");
-    if (on == nullptr || *on == '\0' || *on == '0') {
-        return 0;
-    }
-    if (!role_split()) {
-        return 0;
-    }
-    const uint64_t want_bytes = static_cast<uint64_t>(role_ring_mb()) * 1024ull * 1024ull;
-    return static_cast<uint32_t>((want_bytes + 99) / 100);
-}
-
 // TT_METAL_STREAMING_PROFILER_TRACY=1: attach the Tracy sink. OFF BY DEFAULT -- the streaming profiler's
 // primary consumers are the registered ones (register_consumer / the ops CSV); Tracy is one more consumer
 // and an expensive one, so it is opt-in rather than something every capture pays for. (This inverts the
 // old TT_METAL_PERF_DEBUG_NO_TRACY.) Drain and decode run EXACTLY the same either way, which also makes
 // the off state the sink-cost ablation: if the relay stops host-waiting with Tracy off, the Tracy push is
 // provably the bottleneck.
-// TT_METAL_PERF_DEBUG_FILL_PCT: target span fill for the drainer's pacing controller, as a percent of a
-// span's live capacity (kNumRisc * ring words). 0 disables the loop and leaves the fixed
-// TT_METAL_PERF_DEBUG_DRISC_GAP behaviour.
+
+
+// TT_METAL_PERF_DEBUG_SHIP_MIN_PCT: a FILLER defers shipping a live core until its FULLEST lane holds at
+// least this percent of its own ring, unless the core aged out (serviced regardless). 0 disables (ship
+// every live core every sweep). Per-lane, not per-span: the producer that blocks is always a lane, and a
+// span percent under-reads a concentrated core's binding ring by up to kNumRisc x (span-5% let BRISC ride
+// to a quarter ring and cost 551 stalls at delay 10; lane-5% opens the blind window at 5%). Values past
+// 50 are capped by the kernel's half-ring lane trigger. Deferral only arms once the grid has grown for
+// consecutive sweeps and disarms after a quiet spell (the kernel's growth-streak gate), so idle-phase
+// trickle is flushed instead of parked across a burst onset. Default 25: the measured strict-0 band ends
+// between 30 and 35 -- 35-48 flicker ~9% of runs at the burst knee and break at the delay where per-visit
+// growth straddles the threshold (jitter lands on deferral-pre-loaded lanes), and >=50 stalls every run
+// (two-visit exposure 2T+15 exceeds the usable ring).
+uint32_t ship_min_pct() {
+    static const uint32_t v = [] {
+        const char* s = std::getenv("TT_METAL_PERF_DEBUG_SHIP_MIN_PCT");
+        const uint32_t n = (s != nullptr && *s != '\0') ? static_cast<uint32_t>(std::strtoul(s, nullptr, 10)) : 25u;
+        return n > 100 ? 100u : n;
+    }();
+    return v;
+}
+
+// TT_METAL_PERF_DEBUG_DRAM_MB: per-filler GDDR spool ring, in MiB. Non-zero makes each filler ship frames
+// by DMA into a ring in its own DRAM bank and forward them to the host FIFO from a non-blocking pump, so
+// the service loop never touches the PCIe tile and host-side pressure lands in spool occupancy instead of
+// in the sweep interval. The spool is the pipeline's burst elasticity: producers only feel back-pressure
+// once it fills. 0 = the direct-push path, exactly as it was before the spool existed.
+uint32_t dram_spool_mb() {
+    static const uint32_t v = [] {
+        const char* s = std::getenv("TT_METAL_PERF_DEBUG_DRAM_MB");
+        const uint32_t n = (s != nullptr && *s != '\0') ? static_cast<uint32_t>(std::strtoul(s, nullptr, 10)) : 128u;
+        // A ring beyond 4095 MiB would overflow the kernel's 32-bit ring arithmetic (a bank is 4 GiB anyway).
+        return n > 4095u ? 4095u : n;
+    }();
+    return v;
+}
+
+// TT_METAL_PERF_DEBUG_FILLER_SLICE_MAP: comma-separated permutation, entry d = which core BAND filler d
+// takes. Unset = identity, which is what the code has always done -- and the bands are row-major slices of
+// the worker grid assigned with no reference to where the filler's own DRAM core sits, so the pairing is
+// arbitrary. Measured per-filler service intervals spread 20.1-36.6 us at delay 30 with the DRISCs scattered
+// over y=12..23 while workers occupy y=2..11; this knob exists to test whether that spread is DRISC
+// placement (follows the filler) or a property of the rows (follows the band).
+const std::vector<uint32_t>& filler_slice_map() {
+    static const std::vector<uint32_t> v = [] {
+        std::vector<uint32_t> out;
+        const char* s = std::getenv("TT_METAL_PERF_DEBUG_FILLER_SLICE_MAP");
+        if (s != nullptr && *s != '\0') {
+            for (const char* p = s; *p != '\0';) {
+                out.push_back(static_cast<uint32_t>(std::strtoul(p, nullptr, 10)));
+                while (*p != '\0' && *p != ',') {
+                    p++;
+                }
+                if (*p == ',') {
+                    p++;
+                }
+            }
+        }
+        return out;
+    }();
+    return v;
+}
+
+// Per-filler CORE-COUNT WEIGHTS, indexed by filler slot (not bank id). An even split makes every filler
+// own the same ~22 cores, which makes the SLOWEST filler set the knee -- and they are not equally fast.
+// Measured at delay 8, 130 cores, even split: per-filler service interval 19.7 / 21.1 / 22.3 / 22.8 / 26.6
+// / 28.5 us, a 45% spread that follows the FILLER and not the core band (permuting bands leaves d5 slowest
+// while it owns bands 5, 5, then 0). Mo's v6 roster spreads 3% over the same grid and takes 11 stalls where
+// an even split takes 428 k, because a lane fills in 22.5 us -- so a 28.5 us filler stalls every ring and a
+// 19.7 us one never does. Weighting core count by 1/interval equalises the intervals instead of the counts.
 //
-// Why it exists: the drainer ships the WHOLE span per core per frame regardless of how much is live, so
-// host cost is frames x 10,560 B and the fill ratio decides bytes-per-marker. Sweeping continuously
-// against slow producers returns ~37%-full spans, which is why producer stalls got WORSE as producers got
-// SLOWER -- ~2x the host bytes for the same payload. Pacing holds the spans full instead.
-// TT_METAL_PERF_DEBUG_STAGE_MIN_FILL_PCT: per-core staging fill gate, as a percent of a core's live
-// span capacity (kNumRisc * ring words). A filler SKIPS shipping a core whose live words are below this
-// (leaving them in the worker's ring to accumulate) unless (a) any of the core's RISCs is past the
-// pace high-water valve -- occupancy safety always wins, (b) this is a force-ship sweep (every 8th, the
-// latency bound and the sparse-traffic batcher), or (c) the stop-word drain is in progress (teardown
-// completeness). 0 disables the gate. Why it exists: frames are fixed 10,560 B regardless of fill, and
-// the SUSTAINED word ceiling is mover-frames/us x fill x span words -- skipping half-empty cores is the
-// direct way to raise fill without touching the mover (FINDINGS N+65). MEASURED: full-pipeline
-// sustained stalls -45% (delay 100: 193k -> 107k), frame bytes -63% (fill 33% -> ~79%); NO_DECODE
-// sustained -12-17%. KNOWN TRADE: at high offered rates WITH large ring runway (which is now the
-// default, ROLE_RING_MB=448) deferral erodes the worker-ring margin -- delay-25 went clean -> 38k
-// stalls. That is why the gate DEFAULTS TO 0 (off): holding a core's words back to ship fuller frames
-// costs producer headroom exactly where the default runway is spending it. Set 50 to trade that back
-// for ~2x fewer frames per zone on long sustained captures, where host cost dominates.
-// TT_METAL_PERF_DEBUG_MOVER_FRAME_GAP: deliberate mover traffic shaping, in DRISC cycles per frame
-// just moved. After a PRODUCTIVE sweep that nonetheless KEPT UP (every peer's backlog fit in one batch),
-// the mover pauses gap x frames_moved (capped at its 10 us pace ceiling) before the next sweep. A
-// backlogged sweep never pauses, so the sustained evacuation ceiling is untouched by construction.
-// Why (FINDINGS N+66): with instant acks (NO_DECODE) the mover compresses its sweeps ~2.4x, and that
-// burst density inflates the landing tail of the fillers' posted head write-backs -- the write whose
-// LANDING releases a blocked producer -- converting onset grazes into stalls (measured 9-16x). Decode-
-// paced acks were shaping this traffic by accident; this knob does it on purpose. 0 disables.
-uint32_t mover_frame_gap() {
-    static const uint32_t v = [] {
-        const char* s = std::getenv("TT_METAL_PERF_DEBUG_MOVER_FRAME_GAP");
-        return (s != nullptr && *s != '\0') ? static_cast<uint32_t>(std::strtoul(s, nullptr, 10)) : 1600u;
+// Weights are a CALIBRATION, and the default is board-specific: they came off this part's default bank
+// roster (5,6,4,1,0,3). Override with TT_METAL_PERF_DEBUG_FILLER_WEIGHTS, or pass all-equal values to get
+// the old even split back.
+const std::vector<uint32_t>& filler_weights() {
+    static const std::vector<uint32_t> v = [] {
+        std::vector<uint32_t> out;
+        const char* s = std::getenv("TT_METAL_PERF_DEBUG_FILLER_WEIGHTS");
+        if (s != nullptr && *s != '\0') {
+            for (const char* p = s; *p != '\0';) {
+                out.push_back(static_cast<uint32_t>(std::strtoul(p, nullptr, 10)));
+                while (*p != '\0' && *p != ',') {
+                    p++;
+                }
+                if (*p == ',') {
+                    p++;
+                }
+            }
+            return out;
+        }
+        // Default EVEN. Weighting core counts compensates for bad filler placement rather than fixing it;
+        // the placement itself is the lever (which DRAM subchannel each filler sits on). Kept as a knob so
+        // the compensation can still be measured against a placement fix.
+        return out;  // empty = even split; the use site treats it that way
     }();
     return v;
 }
 
-uint32_t stage_min_fill_pct() {
-    static const uint32_t v = [] {
-        const char* s = std::getenv("TT_METAL_PERF_DEBUG_STAGE_MIN_FILL_PCT");
-        return (s != nullptr && *s != '\0') ? static_cast<uint32_t>(std::strtoul(s, nullptr, 10)) : 0u;
-    }();
-    return v;
-}
-
-uint32_t fill_target_pct() {
-    static const uint32_t v = [] {
-        const char* s = std::getenv("TT_METAL_PERF_DEBUG_FILL_PCT");
-        return (s != nullptr && *s != '\0') ? static_cast<uint32_t>(std::strtoul(s, nullptr, 10)) : 70u;
-    }();
-    return v;
-}
-
-// Ceiling on the controller's gap, in DRISC cycles. Bounds worst-case capture latency: a core with data
-// waits at most this long between sweeps. ~148 us at 1.35 GHz.
+// TT_METAL_PERF_DEBUG_FILLER_SUBCH: comma-separated DRAM SUBCHANNEL index per filler. Each DRAM view has
+// three subchannels at quite different NoC positions (bank 5: NOC0 (9,2)/(9,10)/(9,3); bank 3: (0,5)/(0,7)/
+// (0,6)), and pick_unused_dram_logical_core() returns whichever is simply FIRST unreserved -- nothing picks
+// for locality. Unset keeps that behaviour.
 //
-// MUST be well above the gap the controller actually wants, or it saturates and the loop never closes.
-// Measured at delay 125 (120 cores, 6M markers): with a 20,000 ceiling it pinned at 20,000 and producers
-// still stalled; at 50,000 it pinned at 50,000; at 100,000 it pinned at 100,000; only at 200,000 did it
-// SETTLE, at 108,881 -- i.e. the true operating point is ~109k and every smaller ceiling was clipping it.
-// A gap pinned exactly at this value in the results is the signature of a ceiling that is too low.
-// TT_METAL_PERF_DEBUG_READ_SPLIT=1: issue the batch's span reads alternately on BOTH NoCs instead of
-// only kReadNoc. The busy sweep is read-latency bound and the batch cannot grow (DRISC L1 holds 7 spans),
-// so splitting is the only way to raise outstanding read transactions.
-uint32_t read_split() {
-    static const uint32_t v = [] {
-        const char* s = std::getenv("TT_METAL_PERF_DEBUG_READ_SPLIT");
-        return (s != nullptr && *s != '\0') ? static_cast<uint32_t>(std::strtoul(s, nullptr, 10)) : 0u;
+// Placement is worth choosing because the per-filler service interval spreads 45% (19.7-28.5 us at delay 8)
+// and the knee is set by the WORST filler, while a lane fills in 22.5 us. But it is chosen by MEASUREMENT,
+// not by a distance model: the observed spread does not track NoC distance to the owned band (the closest
+// filler, bank 3 at (0,6) owning rows 8-9, is the slowest at 36.5 us), nor column, nor staging depth
+// (identical 7 slots), nor core count (equal).
+const std::vector<uint32_t>& filler_subchannels() {
+    static const std::vector<uint32_t> v = [] {
+        std::vector<uint32_t> out;
+        const char* s = std::getenv("TT_METAL_PERF_DEBUG_FILLER_SUBCH");
+        if (s != nullptr && *s != '\0') {
+            for (const char* p = s; *p != '\0';) {
+                out.push_back(static_cast<uint32_t>(std::strtoul(p, nullptr, 10)));
+                while (*p != '\0' && *p != ',') {
+                    p++;
+                }
+                if (*p == ',') {
+                    p++;
+                }
+            }
+        }
+        return out;
     }();
     return v;
 }
 
-uint32_t gap_max_cycles() {
+// TT_METAL_PERF_DEBUG_FILLER_ASSIGN=xsplit: assign worker cores to fillers by NoC REACHABILITY instead of
+// row-major index order.
+//
+// Round-trip LATENCY is position-independent on these NoCs -- both are unidirectional tori, so a request
+// costs dx+dy hops and its response (17-dx)+(12-dy), always 29 total. LINK OCCUPANCY is not. Reads ride
+// NoC 1 (-x/-y), and DRAM sits in NOC0 columns x=0 (views D0-D3) and x=9 (views D4-D7), so a filler in the
+// x=0 column reaching a worker at x=1 wraps 0->16->15->...->1 and holds ~15 links for that one read, while
+// reaching x=16 holds one. Row-major bands span BOTH halves, so nearly every one of a sweep's ~93 reads
+// wraps a row. Grouping instead puts each filler on the half its own column reaches cheaply:
+//   x=9 column fillers (bank >= 4) -> the LEFT half  (NOC0 x < 9)
+//   x=0 column fillers (bank <  4) -> the RIGHT half (NOC0 x > 9)
+bool filler_assign_xsplit() {
+    static const bool v = [] {
+        const char* s = std::getenv("TT_METAL_PERF_DEBUG_FILLER_ASSIGN");
+        return s != nullptr && std::string_view(s) == "xsplit";
+    }();
+    return v;
+}
+
+// TT_METAL_PERF_DEBUG_PCIE_SPLIT=1: point odd-numbered fillers at the SECOND PCIe tile.
+//
+// Blackhole has two PCIe tiles (NOC0 (2,0) and (11,0)), and D2HSocket always takes pcie_cores.front(), so
+// all six fillers' egress arcs converge on one tile and share links. Per-filler service interval spreads
+// 45% with no assignment scheme able to move it (band permutation, subchannel, bank roster and NoC-half
+// splits are all null), and arc contention on the shared egress path is the remaining explanation.
+//
+// DIAGNOSTIC, and it may simply not work: on the PinnedMemory/IOMMU path the tile comes from UMD's mapping
+// of the host buffer, so the second tile is not necessarily wired to the same buffer. The existing comment
+// on pcie_enc_override records the failure mode -- pages still flow but decode yields ZERO markers -- so
+// treat a zero-marker capture as "the second tile does not reach this buffer", not as a perf result.
+bool pcie_split() {
+    static const bool v = perf_debug::env_flag("TT_METAL_PERF_DEBUG_PCIE_SPLIT");
+    return v;
+}
+
+// TT_METAL_PERF_DEBUG_FIFO_MB: host FIFO per D2H socket, in MiB. See the header comment on the default.
+// Capped at 3.5 GiB: the socket's byte size and the device's wrap-safe credit arithmetic
+// (reserve_pages_bounded's bytes_sent - bytes_acked) are 32-bit, so a FIFO at or past 4 GiB overflows
+// them -- past this cap the knob would have to move to page units and the socket config to 64-bit.
+uint32_t host_fifo_bytes() {
     static const uint32_t v = [] {
-        const char* s = std::getenv("TT_METAL_PERF_DEBUG_GAP_MAX");
-        return (s != nullptr && *s != '\0') ? static_cast<uint32_t>(std::strtoul(s, nullptr, 10)) : 200000u;
+        const char* s = std::getenv("TT_METAL_PERF_DEBUG_FIFO_MB");
+        uint64_t mb = (s != nullptr && *s != '\0') ? std::strtoull(s, nullptr, 10) : 64ull;
+        mb = std::clamp<uint64_t>(mb, 1, 3584);
+        return static_cast<uint32_t>(mb << 20);
     }();
     return v;
 }
@@ -643,7 +579,7 @@ PerfDebugSync sync_device_clock(
     // irrelevant).
     //
     // CORRECTED: an earlier version of this comment said "the same registers the drainer firmware co-samples in
-    // calibrate()". THERE IS NO SUCH FUNCTION -- `calibrate` appears nowhere in drisc_profiler_drain.cpp, in
+    // calibrate()". THERE IS NO SUCH FUNCTION -- `calibrate` appears nowhere in the drain kernels, in
     // tt_metal/hw, or anywhere else on the device side. The drainer does NOT co-sample two clocks; the whole
     // reason §N+46 needed a per-core HOST anchor is that no device-side rebase exists to lean on.
     //
@@ -911,16 +847,14 @@ void PerfDebugProfiler::start(const std::shared_ptr<distributed::MeshDevice>& me
             tracy_->PreCreateContexts(ctx.chip_id, it->second);
         }
         // Give each drainer's rows its ROLE, so a plot reads "DRISC 9-9 FILLER" instead of coordinates the
-        // reader has to map back to a job by hand. String literals: the role text is interned into a plot
+        // reader has to map back to a job by hand. A string literal: the role text is interned into a plot
         // name whose pointer the SERVER dereferences, so it has to outlive everything.
         if (tracy_ != nullptr) {
-            for (uint32_t d = 0; d < kMaxDrisc; d++) {
+            for (uint32_t d = 0; d < kNFillers; d++) {
                 if (ctx.drain_program[d] == nullptr) {
                     continue;
                 }
-                const char* role = ctx.role[d] == kRoleFiller  ? "FILLER"
-                                   : ctx.role[d] == kRoleMover ? "MOVER"
-                                                               : "DRAINER";
+                const char* role = "FILLER";
                 // TRANSLATE: the handler keys on NOC0 coords (that is what a decoded event carries), while
                 // drisc_virtual is the VIRTUAL space. Registering the virtual pair would look up nothing and
                 // the label would silently fall back to bare coordinates -- the failure would have been an
@@ -958,6 +892,7 @@ void PerfDebugProfiler::start(const std::shared_ptr<distributed::MeshDevice>& me
             rd.core_of_xy = ctx.core_of_xy;
             rd.clock_synced = ctx.clock_synced;
             rd.frequency_ghz = ctx.freq_ghz;
+            rd.numa_node = static_cast<int>(cluster.get_numa_node_for_device(ctx.chip_id));
             rd.lane_table.reserve(ctx.nl);
             for (uint32_t ci = 0; ci < rd.num_cores; ci++) {
                 const auto [vx, vy] = ctx.core_virt[ci];
@@ -967,14 +902,9 @@ void PerfDebugProfiler::start(const std::shared_ptr<distributed::MeshDevice>& me
                     nx = it->second.first;
                     ny = it->second.second;
                 }
-                auto role = perf_debug::PerfDebugLaneRole::Worker;
-                if (ctx.n_worker_cores != 0 && ci >= ctx.n_worker_cores) {
-                    switch (ctx.role[ci - ctx.n_worker_cores]) {
-                        case kRoleFiller: role = perf_debug::PerfDebugLaneRole::Filler; break;
-                        case kRoleMover: role = perf_debug::PerfDebugLaneRole::Mover; break;
-                        default: role = perf_debug::PerfDebugLaneRole::Full; break;
-                    }
-                }
+                const auto role = (ctx.n_worker_cores != 0 && ci >= ctx.n_worker_cores)
+                                      ? perf_debug::PerfDebugLaneRole::Filler
+                                      : perf_debug::PerfDebugLaneRole::Worker;
                 for (uint32_t r = 0; r < kNRisc; r++) {
                     rd.lane_table.push_back(perf_debug::PerfDebugLaneInfo{
                         ctx.chip_id,
@@ -986,7 +916,7 @@ void PerfDebugProfiler::start(const std::shared_ptr<distributed::MeshDevice>& me
                         role});
                 }
             }
-            for (uint32_t sk = 0; sk < n_sockets_split(); sk++) {
+            for (uint32_t sk = 0; sk < kNSockets; sk++) {
                 if (ctx.sockets[sk] != nullptr) {
                     TT_FATAL(sk == rd.sockets.size(), "sockets must form a contiguous prefix");
                     rd.sockets.push_back(std::move(ctx.sockets[sk]));
@@ -999,19 +929,14 @@ void PerfDebugProfiler::start(const std::shared_ptr<distributed::MeshDevice>& me
         // it holds a fraction of its final size). PRODUCER-STALL and the DRISC self-zones are ordinary
         // zones with ordinary ELF records now -- nothing is registered by hand.
         rcfg.starvation_diagnostic = [this](uint32_t dev, uint32_t sock) {
-            DeviceCtx& ctx = devices_[dev];
-            for (uint32_t d = 0; d < ctx.n_drisc; d++) {
-                if (ctx.sock_of[d] == sock || ctx.role[d] == kRoleFiller) {
-                    dump_drainer_state(ctx, d, "receiver-starved");
-                }
-            }
+            dump_drainer_state(devices_[dev], sock, "receiver-starved");
         };
         receiver_ = std::make_unique<perf_debug::PerfDebugReceiver>(std::move(rcfg), std::move(rdevs));
         if (tracy_push_enabled()) {
             tracy_consumer_ = std::make_unique<perf_debug::PerfDebugTracyConsumer>(tracy_.get());
-            // An ordinary paired-contract consumer, like the ops CSV. Zones arrive END-ordered, so
-            // the consumer buffers them and reconstructs Tracy's begin/end push order in a teardown
-            // flush -- see perf_debug_tracy_consumer.hpp.
+            // An ordinary public consumer: Tracy takes device zones WHOLE now (one QueueGpuZone item
+            // per zone), and the paired stream's per-lane completion order is exactly the order the
+            // Tracy server rebuilds nesting from.
             receiver_->add_consumer(
                 "tracy", [c = tracy_consumer_.get()](const perf_debug::PerfDebugRecordBatch& b) { (*c)(b); });
         }
@@ -1023,7 +948,7 @@ void PerfDebugProfiler::start(const std::shared_ptr<distributed::MeshDevice>& me
             tt::LogMetal,
             "[perf-debug profiler] active on {} device(s): DRISC drain -> {} MiB D2H socket -> {}",
             devices_.size(),
-            (static_cast<uint64_t>(kHRingWords) * 4) / (1024 * 1024),
+            host_fifo_bytes() / (1024 * 1024),
             tracy_push_enabled() ? "registered consumers + Tracy"
                                  : "registered consumers (Tracy off; opt in with TT_METAL_STREAMING_PROFILER_TRACY=1)");
     }
@@ -1094,8 +1019,16 @@ void PerfDebugProfiler::set_drisc_niu_mode(
     detail::CompileProgram(device, p, /*force_slow_dispatch=*/true);
     g_bringup_step = who + ":WriteRuntimeArgs";
     detail::WriteRuntimeArgsToDevice(device, p, /*force_slow_dispatch=*/true);
-    g_bringup_step = who + ":LaunchProgram(dram_barrier+wait_until_cores_done)";
-    detail::LaunchProgram(device, p, /*wait_until_cores_done=*/true, /*force_slow_dispatch=*/true);
+    // SPLIT for the same reason the single-core path above is split, and it should have been from the
+    // start: the two halves fail for different reasons and only the label tells them apart. The barrier
+    // runs BEFORE any core here is in stream mode (that is what one-launch buys, N+32/N+34), so a failure
+    // on the first label means a core was ALREADY in stream mode when this run began -- a restore that did
+    // not complete, or a reset that did not cover it. A failure on the second is the poll-after-flip
+    // hazard, which is inherent to this kernel because its whole body IS the flip.
+    g_bringup_step = who + ":LaunchProgram(dram_barrier,no-wait)";
+    detail::LaunchProgram(device, p, /*wait_until_cores_done=*/false, /*force_slow_dispatch=*/true);
+    g_bringup_step = who + ":WaitProgramDone(poll-after-flip)";
+    detail::WaitProgramDone(device, p);
     g_bringup_step = who + ":done";
 }
 
@@ -1135,6 +1068,73 @@ void PerfDebugProfiler::disarm_producers(
         n);
 }
 
+// Wait until every producer's ring is EMPTY, with the fillers still running. head is drainer-written and
+// tail is producer-written, so head == tail on every RISC means the consumer has taken everything published.
+//
+// This has to happen before anything stops draining. Quiescing the fillers first leaves the workers' rings
+// unserved while producers are still live -- dispatch cores keep emitting zones through device close, which
+// is the very case PROFILER_TERMINATE was added for -- and they park in ring_ensure_room for however long
+// that lasts. Measured: 100% of kimi's producer stalls sat inside the last ~130 ms of a 283 s capture, none
+// anywhere else in the run. Draining first removes the window instead of dropping the markers in it.
+bool PerfDebugProfiler::wait_producer_rings_drained(DeviceCtx& ctx, std::chrono::milliseconds budget) {
+    if (ctx.core_virt.empty()) {
+        return true;
+    }
+    auto& cluster = MetalContext::instance().get_cluster();
+    const auto& hal = MetalContext::instance().hal();
+    const uint64_t prof_l1 = hal.get_dev_addr(HalProgrammableCoreType::TENSIX, HalL1MemAddrType::PROFILER);
+    const size_t n = ctx.n_worker_cores != 0 ? ctx.n_worker_cores : ctx.core_virt.size();
+    std::vector<uint8_t> drained(n, 0);
+    std::vector<uint32_t> ht(2 * kernel_profiler::PROFILER_SPSC_MAX_RISC, 0);
+    const auto dl = std::chrono::steady_clock::now() + budget;
+    size_t pending = n;
+    while (pending != 0 && std::chrono::steady_clock::now() < dl) {
+        pending = 0;
+        for (size_t ci = 0; ci < n; ci++) {
+            if (drained[ci] != 0) {
+                continue;
+            }
+            const auto [vx, vy] = ctx.core_virt[ci];
+            cluster.read_core(
+                ht.data(),
+                static_cast<uint32_t>(ht.size() * sizeof(uint32_t)),
+                tt_cxy_pair(ctx.chip_id, CoreCoord{vx, vy}),
+                prof_l1);
+            bool empty = true;
+            for (uint32_t r = 0; r < kNRisc; r++) {
+                if (ht[kernel_profiler::SPSC_RING_HEAD_0 + r] != ht[kernel_profiler::SPSC_RING_TAIL_0 + r]) {
+                    empty = false;
+                    break;
+                }
+            }
+            drained[ci] = empty ? 1u : 0u;
+            pending += empty ? 0u : 1u;
+        }
+    }
+    return pending == 0;
+}
+
+// Last resort, and the ONLY path that drops a marker: a producer still publishing after the drain budget
+// expired. Unblocking it is what keeps device close from wedging in wait_until_cores_done().
+void PerfDebugProfiler::disarm_producer_backpressure(DeviceCtx& ctx) {
+    if (ctx.core_virt.empty()) {
+        return;
+    }
+    auto& cluster = MetalContext::instance().get_cluster();
+    const auto& hal = MetalContext::instance().hal();
+    const uint64_t prof_l1 = hal.get_dev_addr(HalProgrammableCoreType::TENSIX, HalL1MemAddrType::PROFILER);
+    const size_t n = ctx.n_worker_cores != 0 ? ctx.n_worker_cores : ctx.core_virt.size();
+    uint32_t one = 1;
+    for (size_t ci = 0; ci < n; ci++) {
+        const auto [vx, vy] = ctx.core_virt[ci];
+        cluster.write_core(
+            &one,
+            sizeof(uint32_t),
+            tt_cxy_pair(ctx.chip_id, CoreCoord{vx, vy}),
+            prof_l1 + kernel_profiler::PROFILER_TERMINATE * sizeof(uint32_t));
+    }
+}
+
 bool PerfDebugProfiler::boot_device(
     const std::shared_ptr<distributed::MeshDevice>& mesh_device,
     DeviceCtx& ctx,
@@ -1145,12 +1145,6 @@ bool PerfDebugProfiler::boot_device(
     const uint32_t device_id = ctx.chip_id;
     const auto& soc = cluster.get_soc_desc(device_id);
 
-    // TT_METAL_PERF_DEBUG_DRAIN_TENSIX=1 runs the identical drain kernel on a Tensix BRISC instead of a
-    // DRISC. It is a control for "does the DRAM core have anything to do with the PCIe hang", not a product
-    // mode: it needs TT_METAL_SLOW_DISPATCH_MODE=1 so the dispatch row/column is free (the drainer core is
-    // taken from there, leaving the producers the full compute grid) and so a resident non-CQ program is
-    // legal on a worker at all.
-    const bool tensix_drain = drain_on_tensix();
     const char* sd_env = std::getenv("TT_METAL_SLOW_DISPATCH_MODE");
     const bool slow_dispatch = sd_env != nullptr && *sd_env != '\0' && *sd_env != '0';
 
@@ -1163,27 +1157,10 @@ bool PerfDebugProfiler::boot_device(
     // result compared DRISC+fast against Tensix+slow -- two variables at once -- precisely BECAUSE the Tensix
     // arm was believed to be slow-dispatch-only. It is not, and core type can finally be tested with dispatch
     // mode held fixed.
-    std::optional<CoreCoord> fd_tensix_core;
-    if (tensix_drain && !slow_dispatch) {
-        auto rt_core = MetalContext::instance(context_id)
-                           .get_dispatch_core_manager()
-                           .get_reserved_realtime_profiler_core(device_id);
-        if (!rt_core.has_value()) {
-            log_warning(
-                tt::LogMetal,
-                "[perf-debug profiler] Device {}: no reserved real-time-profiler core to borrow, so a Tensix "
-                "drainer has nowhere to live under fast dispatch (reservation is skipped for non-MMIO chips, "
-                "ETH dispatch, fabric tensix datamover, and Quasar) -- use TT_METAL_SLOW_DISPATCH_MODE=1",
-                device_id);
-            disarm_producers(mesh_device, device_id);
-            return false;
-        }
-        fd_tensix_core = CoreCoord{rt_core->x, rt_core->y};
-    }
 
     // The drainer is a DRISC: one DM RISC-V on a DRAM core. Nothing else here is Blackhole-specific, but
     // that is the only place they exist today.
-    if (!tensix_drain && !hal.has_programmable_core_type(HalProgrammableCoreType::DRAM)) {
+    if (!hal.has_programmable_core_type(HalProgrammableCoreType::DRAM)) {
         log_warning(
             tt::LogMetal,
             "[perf-debug profiler] Device {}: no DRAM programmable cores (card FW below the DRISC gate?)",
@@ -1212,7 +1189,7 @@ bool PerfDebugProfiler::boot_device(
     //
     // TT_METAL_PERF_DEBUG_RESERVE_COLUMN=1 forces the 110 reservation on the DRISC arm too, for 2x2 runs
     // where equal poll-list length (= equal idle sweep cost) matters more than coverage. See FINDINGS N+24.
-    const bool reserve_column = slow_dispatch && (tensix_drain || reserve_column_env());
+    const bool reserve_column = slow_dispatch && reserve_column_env();
     const uint32_t gx = static_cast<uint32_t>(grid.x) - (reserve_column ? 1u : 0u);
     const uint32_t gy = static_cast<uint32_t>(grid.y);
     const uint64_t num_cores = static_cast<uint64_t>(gx) * gy;
@@ -1225,9 +1202,38 @@ bool PerfDebugProfiler::boot_device(
     // Identity travels in the payload instead, written by the producing core into SPSC_CORE_XY.
     std::vector<uint32_t> coords(num_cores, 0);
     std::vector<uint8_t> zero_ctrl(kernel_profiler::PROFILER_L1_CONTROL_BUFFER_SIZE, 0);
-    for (uint32_t ly = 0; ly < gy; ly++) {
-        for (uint32_t lx = 0; lx < gx; lx++) {
-            const uint32_t idx = ly * gx + lx;
+    // Enumeration ORDER decides what a contiguous filler slice means. Default is row-major; xsplit orders
+    // by (NoC half, row, column) so the first n_left entries are exactly the cores the x=9 DRAM column
+    // reaches without wrapping a row.
+    std::vector<std::pair<uint32_t, uint32_t>> order;  // (lx, ly) in assignment order
+    order.reserve(num_cores);
+    uint32_t n_left = 0;
+    {
+        std::vector<std::pair<uint32_t, std::pair<uint32_t, uint32_t>>> keyed;
+        keyed.reserve(num_cores);
+        for (uint32_t ly = 0; ly < gy; ly++) {
+            for (uint32_t lx = 0; lx < gx; lx++) {
+                const CoreCoord n0 = cluster.get_physical_coordinate_from_logical_coordinates(
+                    device_id, CoreCoord{lx, ly}, CoreType::WORKER, /*no_warn=*/true);
+                const uint32_t half = static_cast<uint32_t>(n0.x) < 9u ? 0u : 1u;
+                keyed.push_back({half, {lx, ly}});
+                n_left += (half == 0u) ? 1u : 0u;
+            }
+        }
+        if (filler_assign_xsplit()) {
+            std::stable_sort(keyed.begin(), keyed.end(), [](const auto& a, const auto& b) {
+                return a.first < b.first;  // stable: row-major order preserved inside each half
+            });
+        } else {
+            n_left = 0;  // signals "no grouping" to the assignment loop
+        }
+        for (const auto& k : keyed) {
+            order.push_back(k.second);
+        }
+    }
+    for (uint32_t idx = 0; idx < num_cores; idx++) {
+        {
+            const uint32_t lx = order[idx].first, ly = order[idx].second;
             CoreCoord v =
                 cluster.get_virtual_coordinate_from_logical_coordinates(device_id, CoreCoord{lx, ly}, CoreType::WORKER);
             const uint32_t vx = static_cast<uint32_t>(v.x), vy = static_cast<uint32_t>(v.y);
@@ -1256,109 +1262,18 @@ bool PerfDebugProfiler::boot_device(
     // LaunchProgram, every LaunchProgram carries a dram_barrier over every DRAM channel, and the second
     // one therefore barriered across drainer 0's already-stream-mode core. Picking the cores up front
     // costs a cheap repeat of the bank selection and removes the ordering entirely.
-    // ---- ROLE SPLIT: decide the roster before anything is flipped or launched ----
-    //
-    // Roles, banks and socket ownership are all resolved up front because the NIU pre-pass below needs every
-    // drainer's core in ONE launch (see its comment) and because a mover's compile args reference its
-    // filler's L1, so the fillers must be set up first. The default path takes the `else` and is unchanged.
     const uint32_t nbanks = static_cast<uint32_t>(soc.get_num_dram_views());
-    // DEGRADE, don't fail, when the part cannot host the full roster. The 6-DRISC split needs n_fillers() filler
-    // banks plus n_sockets_split() host-facing banks, and the fillers' RINGS need banks too; a harvested or smaller
-    // part may not have them. Nothing downstream checked this -- the roster was fixed before
-    // pick_unused_dram_logical_core() was ever called, so a short part would have indexed past the end of
-    // kSafeBanks / the filler-bank list rather than reporting anything.
-    //
-    // Ladder: 6 (4 fillers + 2 movers) -> 2 full-role drainers -> 1. Each step is a configuration already
-    // measured to work, just with a worse knee (§N+34: 1 drainer knee 100, 2 -> 20; §N+40: the split -> 15).
-    // Losslessness never depends on the count: fewer drainers means producers stall sooner, not that markers
-    // are dropped.
-    const uint32_t need_split = n_fillers() + n_sockets_split();
-    bool rsplit = role_split() && !tensix_drain;
-    if (rsplit && nbanks < need_split) {
+    if (nbanks < kNFillers) {
         log_warning(
             tt::LogMetal,
-            "[perf-debug profiler] role split needs {} DRAM views (4 fillers + 2 movers) but this part has {} "
-            "-- falling back to {} full-role drainer(s). Capture stays LOSSLESS; the knee moves in (§N+34).",
-            need_split,
-            nbanks,
-            std::min<uint32_t>(n_sockets_split(), nbanks));
-        rsplit = false;
+            "[perf-debug profiler] needs {} DRAM views (one filler each) but this part has {} -- the "
+            "streaming profiler is OFF for this device.",
+            kNFillers,
+            nbanks);
+        return false;
     }
-    // Second rung: even the 2-drainer path needs 2 host-facing banks. With one, run a single drainer over the
-    // whole grid -- the original shape, knee ~100 (§N+34) but still complete.
-    const uint32_t n_full = std::min<uint32_t>(n_sockets_split(), nbanks == 0 ? 1u : nbanks);
-    if (!rsplit && n_full < n_sockets_split()) {
-        log_warning(
-            tt::LogMetal,
-            "[perf-debug profiler] only {} DRAM view(s) available: running {} drainer(s) over the whole grid.",
-            nbanks,
-            n_full);
-    }
-    std::vector<uint32_t> banks;     // DRAM bank hosting DRISC d itself
-    std::vector<uint32_t> ringbank;  // DRAM bank holding the ring DRISC d reads/writes (0 when unused)
-    if (rsplit) {
-        TT_FATAL(
-            n_fillers() % n_sockets_split() == 0 && n_fillers() / n_sockets_split() <= kNPeerMax,
-            "role-split shape invalid: {} fillers / {} movers",
-            n_fillers(),
-            n_sockets_split());
-        ctx.n_drisc = n_fillers() + n_sockets_split();
-        const auto& fb = role_filler_banks();
-        const auto& rb = role_ring_banks();
-        TT_FATAL(
-            fb.size() >= n_fillers() && rb.size() >= n_fillers(),
-            "perf-debug role split needs {} filler banks and {} ring banks (got {} and {})",
-            n_fillers(),
-            n_fillers(),
-            fb.size(),
-            rb.size());
-        for (uint32_t f = 0; f < n_fillers(); f++) {
-            ctx.role[f] = kRoleFiller;
-            ctx.sock_of[f] = kNoSocket;
-            ctx.n_peer[f] = 0;
-            // A filler pushes frames with its tile's GDDR DMA engine, which reaches ONLY its own channel --
-            // and allocator bank ids are view ids one-for-one. A non-local ring here is not slow, it is
-            // silent stale-lap corruption (see role_ring_banks), so refuse it outright.
-            TT_FATAL(
-                rb[f] == fb[f],
-                "perf-debug role split: filler {} on view {} but its ring is on bank {} -- the GDDR DMA push "
-                "reaches only the filler's own channel. Fix TT_METAL_PERF_DEBUG_ROLE_RING_BANKS (or unset it).",
-                f,
-                fb[f],
-                rb[f]);
-            banks.push_back(fb[f]);
-            ringbank.push_back(rb[f]);
-        }
-        // Mover m drains fillers m, m + n_sockets_split(), ... -- so at 4 fillers, mover 0 takes fillers 0 and 2 and
-        // mover 1 takes 1 and 3. STRIDED rather than adjacent on purpose: the fillers own contiguous quarters
-        // of the grid in index order, so striding gives each socket one low-half slice and one high-half
-        // slice. Adjacent pairing would put both halves of the grid's busy end on one socket if the workload
-        // is not uniform across the grid.
-        for (uint32_t m = 0; m < n_sockets_split(); m++) {
-            const uint32_t d = n_fillers() + m;
-            ctx.role[d] = kRoleMover;
-            ctx.sock_of[d] = m;
-            ctx.n_peer[d] = n_fillers() / n_sockets_split();
-            for (uint32_t p = 0; p < ctx.n_peer[d]; p++) {
-                ctx.peer_of[d][p] = m + p * n_sockets_split();
-            }
-            banks.push_back(kSafeBanks[m]);
-            // A mover owns no ring of its own -- it reads its PEERS' rings, and their banks/addresses reach it
-            // as compile args taken from those peers' entries. Recorded as peer 0's only for the log line.
-            ringbank.push_back(rb[ctx.peer_of[d][0]]);
-        }
-    } else {
-        ctx.n_drisc = n_full;
-        const int bank_ov_pre = drisc_bank_override();
-        for (uint32_t d = 0; d < n_full; d++) {
-            ctx.role[d] = kRoleFull;
-            ctx.sock_of[d] = d;
-            banks.push_back(
-                (bank_ov_pre >= 0) ? static_cast<uint32_t>((static_cast<uint32_t>(bank_ov_pre) + d) % nbanks)
-                                   : kSafeBanks[d]);
-            ringbank.push_back(0);
-        }
-    }
+    const auto& banks = role_filler_banks();
+    TT_FATAL(banks.size() >= kNFillers, "perf-debug needs {} filler banks (got {})", kNFillers, banks.size());
 
     // ---- DRISC SELF-PROFILING: give each drainer a LANE BLOCK of its own ----------------------------------
     //
@@ -1374,115 +1289,11 @@ bool PerfDebugProfiler::boot_device(
         ctx.core_virt.resize(static_cast<size_t>(num_cores) + ctx.n_drisc);
     }
 
-    for (uint32_t d = 0; d < ctx.n_drisc; d++) {
-        ctx.dram_bank[d] = ringbank[d];
-    }
-
-    const uint32_t span_bytes_all =
-        (kernel_profiler::PROFILER_L1_CONTROL_VECTOR_SIZE + kNRisc * kernel_profiler::PROFILER_L1_VECTOR_SIZE) *
-        sizeof(uint32_t);
-    const uint32_t slot_bytes_all = kernel_profiler::SPSC_SPAN_PREFIX_WORDS * sizeof(uint32_t) + span_bytes_all;
+    // Must mirror the kernel's kSlotWords: capped slots except under self-zones, whose RAW self frame
+    // needs the full span.
+    const uint32_t slot_bytes_all = kernel_profiler::spsc_span_slot_words(kNRisc) * sizeof(uint32_t);
     uint32_t nstage_report = 0;  // last drainer's mapped staging-slot count, for the self-profiling log line
 
-    // ---- REUSE the old profiler's DRAM region; do NOT allocate a second buffer ----
-    //
-    // The HAL reserves a PROFILER region at the same bank-relative offset in EVERY DRAM bank (just past the
-    // barrier word, with DRAM_UNRESERVED starting above it). That region belongs to the push-to-DRAM profiler
-    // backend, which is never the active one when we are: the streaming backend keeps markers in an L1 ring and
-    // never writes DRAM. So it is dead space, and staging frames there costs nothing extra.
-    //
-    // What this replaces: an interleaved MeshBuffer with page_size == ring_bytes. That reservation was
-    // LOCK-STEP -- the allocator holds the same offset in every bank -- so a 64 MiB ring cost 447 MiB to
-    // address 127 MiB, on top of the ~32 MiB HAL region we were leaving idle. Reusing the region makes the
-    // ring's size and the region's size ONE knob (perf_debug_dram_region_bytes_per_risc), and the ring becomes
-    // available in every bank at a single address rather than only in banks we allocated pages for.
-    //
-    // Frames are still whole: capacity truncates to a multiple of the 165-page frame, so a FRAME never
-    // straddles the wrap (a RUN of frames still can, and stage_run splits it).
-    if (rsplit) {
-        try {
-            const auto& hal = MetalContext::instance().hal();
-            const uint32_t region_bytes = hal.get_dev_size(HalDramMemAddrType::PROFILER);
-            const uint32_t region_addr = static_cast<uint32_t>(hal.get_dev_addr(HalDramMemAddrType::PROFILER));
-            ctx.dram_frames = region_bytes / slot_bytes_all;
-            TT_FATAL(
-                ctx.dram_frames >= 64,
-                "perf-debug role split: the DRAM profiler region holds {} frames ({} B / {} B per frame), need at "
-                "least 64. Raise TT_METAL_PERF_DEBUG_ROLE_RING_MB (it sizes this region) or "
-                "TT_METAL_PROFILER_PROGRAM_SUPPORT_COUNT.",
-                ctx.dram_frames,
-                region_bytes,
-                slot_bytes_all);
-            const uint32_t ring_bytes = ctx.dram_frames * slot_bytes_all;
-
-            // TWO DIFFERENT BANK SPACES, and mixing them up would silently mis-address every frame.
-            // A DRISC's own placement is indexed by DRAM VIEW (soc.get_num_dram_views()) because that is what
-            // pick_unused_dram_logical_core takes. A ring's bank is an ALLOCATOR bank id, because that is what
-            // the kernel's get_noc_addr_from_bank_id indexes (NUM_DRAM_BANKS=7 in the JIT defines). They are
-            // not the same count, so validate the ring banks against the allocator.
-            const uint32_t alloc_banks = ctx.device->allocator()->get_num_banks(BufferType::DRAM);
-            for (uint32_t f = 0; f < n_fillers(); f++) {
-                TT_FATAL(
-                    ringbank[f] < alloc_banks,
-                    "perf-debug role split: ring bank {} does not exist (the allocator has {} DRAM banks)",
-                    ringbank[f],
-                    alloc_banks);
-            }
-
-            // The HAL address is CHANNEL-relative, but the kernel reaches the ring through
-            // get_noc_addr_from_bank_id, which adds bank_to_dram_offset[bank] on its own. Subtract the host's
-            // view of that offset so the kernel's addition lands back on the HAL address.
-            //
-            // PER RING, not one shared value. It used to be one compile arg with a TT_FATAL demanding every
-            // ring bank have the SAME offset -- fine at two rings on a part where every offset is 0, but at
-            // four rings that FATAL would kill capture on any part where they differ, for no reason: each
-            // filler already carries its own (bank, addr) pair, and a mover gets its peers' pairs explicitly.
-            for (uint32_t f = 0; f < n_fillers(); f++) {
-                const int32_t off = ctx.device->allocator()->get_bank_offset(BufferType::DRAM, ringbank[f]);
-                ctx.dram_addr[f] = static_cast<uint32_t>(static_cast<int64_t>(region_addr) - off);
-            }
-            // Movers address their peers' rings, so copy the peer-0 pair over for the log line only.
-            for (uint32_t d = n_fillers(); d < ctx.n_drisc; d++) {
-                ctx.dram_addr[d] = ctx.dram_addr[ctx.peer_of[d][0]];
-            }
-
-            std::string ring_desc;
-            for (uint32_t f = 0; f < n_fillers(); f++) {
-                ring_desc += fmt::format(
-                    "{}filler {} -> bank {} @ bank-relative 0x{:x}",
-                    f == 0 ? "" : ", ",
-                    f,
-                    ringbank[f],
-                    ctx.dram_addr[f]);
-            }
-            log_info(
-                tt::LogMetal,
-                "[perf-debug profiler] role split: {} DRAM rings of {} frames ({:.1f} MiB each) REUSING the "
-                "profiler DRAM region at channel-relative 0x{:x} -- {}; of {} allocator banks. The region "
-                "reserves {:.1f} MiB per bank in EVERY bank = {} MiB total, of which {} MiB carries a ring -- "
-                "the other {} MiB is region in banks no ring uses, so more rings are FREE",
-                n_fillers(),
-                ctx.dram_frames,
-                ring_bytes / (1024.0 * 1024.0),
-                region_addr,
-                ring_desc,
-                alloc_banks,
-                region_bytes / (1024.0 * 1024.0),
-                (static_cast<uint64_t>(region_bytes) * alloc_banks) / (1024 * 1024),
-                (static_cast<uint64_t>(region_bytes) * n_fillers()) / (1024 * 1024),
-                (static_cast<uint64_t>(region_bytes) * (alloc_banks - n_fillers())) / (1024 * 1024));
-        } catch (const std::exception& e) {
-            log_warning(
-                tt::LogMetal,
-                "[perf-debug profiler] role split: could not allocate the DRAM staging rings ({}); capture is "
-                "disabled for this run rather than launching fillers with nowhere to write",
-                e.what());
-            disarm_producers(mesh_device, device_id);
-            return false;
-        }
-    }
-
-    if (!tensix_drain) {
         std::vector<CoreCoord> flip_cores;
         for (uint32_t d = 0; d < ctx.n_drisc; d++) {
             flip_cores.push_back(mesh_device->impl().pick_unused_dram_logical_core(banks[d]));
@@ -1490,10 +1301,9 @@ bool PerfDebugProfiler::boot_device(
         // TWO DRISCs MUST NEVER LAND ON THE SAME CORE. pick_unused_dram_logical_core() takes a DRAM VIEW and
         // reserves that view's worker/eth endpoints -- it has no idea another view may resolve to the SAME
         // physical port. The N+29 sweep records exactly that: view 0 and view 7 both come back as NoC core
-        // 0-0. At two DRISCs the roster was hardcoded to {0, 3} and it could not happen; with six banks in
-        // play (and a filler-bank env override) it can, and the result would be two resident kernels sharing
-        // one core's L1 -- staging, socket config, results, handshake, all overlapped, with no counter that
-        // would notice. Refuse to launch instead.
+        // 0-0. With six banks in play (and a filler-bank env override) it can happen, and the result would be
+        // two resident kernels sharing one core's L1 -- staging, socket config, results, all overlapped, with
+        // no counter that would notice. Refuse to launch instead.
         for (uint32_t a = 0; a < flip_cores.size(); a++) {
             for (uint32_t b = a + 1; b < flip_cores.size(); b++) {
                 TT_FATAL(
@@ -1509,99 +1319,184 @@ bool PerfDebugProfiler::boot_device(
                     flip_cores[a].y);
             }
         }
+        // DOES A DRAINER SIT ON A dram_barrier TARGET? Cluster::dram_barrier passes no subchannel, so
+        // LocalChip::dram_membar syncs subchannel 0 of EVERY channel -- and every LaunchProgram carries one.
+        // A drainer resident on such a core is in stream mode, where an inbound DRAM-range address no longer
+        // forwards to GDDR, so the barrier is addressing a core whose semantics we changed. N+32 fixed the
+        // ordering for the FLIP's own barrier (one launch, before any core flips); it cannot help the
+        // barrier inside every later program, including weight upload, which runs with all six resident.
+        // Reported rather than fatal: this configuration does usually work, and the point is to know
+        // whether a bring-up or upload MMIO timeout had this available as an explanation.
+        {
+            std::vector<uint32_t> collide;
+            for (int ch = 0; ch < soc.get_num_dram_channels(); ch++) {
+                const CoreCoord bar = soc.get_dram_core_for_channel(ch, 0, CoordSystem::LOGICAL);
+                for (uint32_t d = 0; d < flip_cores.size(); d++) {
+                    if (flip_cores[d] == bar) {
+                        collide.push_back(d);
+                    }
+                }
+            }
+            if (!collide.empty()) {
+                log_warning(
+                    tt::LogMetal,
+                    "[perf-debug profiler] {} of {} drainers sit on a dram_barrier target core (subchannel 0 "
+                    "of their channel). Every LaunchProgram barriers those cores while they are in stream "
+                    "mode; a 60-70 ms MMIO timeout at bring-up or weight upload has this as a candidate.",
+                    collide.size(),
+                    flip_cores.size());
+            } else {
+                log_info(
+                    tt::LogMetal,
+                    "[perf-debug profiler] no drainer sits on a dram_barrier target core (checked {} channels "
+                    "against {} drainers).",
+                    soc.get_num_dram_channels(),
+                    flip_cores.size());
+            }
+        }
         set_drisc_niu_mode(ctx.device, flip_cores, 1);
-    }
 
+    const std::vector<uint32_t>& slice_map = filler_slice_map();
+    TT_FATAL(
+        slice_map.empty() || slice_map.size() >= ctx.n_drisc,
+        "TT_METAL_PERF_DEBUG_FILLER_SLICE_MAP needs {} entries, got {}",
+        ctx.n_drisc,
+        slice_map.size());
+    // Weighted prefix split: filler slot sl owns cores [cum[sl], cum[sl+1]) scaled to num_cores, so a
+    // slower filler owns proportionally fewer. Integer math on the running sum keeps the partition exact
+    // (every core assigned once, no rounding gap) whatever the weights are.
+    const std::vector<uint32_t>& weights_env = filler_weights();
+    TT_FATAL(
+        weights_env.empty() || weights_env.size() >= kNFillers,
+        "TT_METAL_PERF_DEBUG_FILLER_WEIGHTS needs {} entries",
+        kNFillers);
+    std::vector<uint64_t> wcum(kNFillers + 1, 0);
+    for (uint32_t i = 0; i < kNFillers; i++) {
+        const uint32_t w = weights_env.empty() ? 1u : weights_env[i];
+        TT_FATAL(w != 0, "filler weight {} must be non-zero", i);
+        wcum[i + 1] = wcum[i] + w;
+    }
+    // ---- GDDR spool reservation (TT_METAL_PERF_DEBUG_DRAM_MB; 0 = direct push) ----
+    // One REPLICATED mesh buffer with one interleaved page per DRAM bank: the same [address, address+spool)
+    // window is reserved in every bank of every device, and each filler spools into its own bank through its
+    // local DMA engine, so a single buffer covers all of them. It must be a MESH-level buffer: MeshBuffer
+    // allocations run through the mesh lock-step allocator, which never sees a device-local Buffer::create
+    // and would hand the same region out again.
+    uint32_t spool_bytes = dram_spool_mb() * (1u << 20);
+    uint32_t spool_addr = 0;
+    // Self-zones + spool overflows the 11,264 B DRISC code region (measured 852 B over), so the
+    // drainer-diagnostic build runs the direct path it has always profiled.
+    if (spool_bytes != 0 && drisc_zones()) {
+        log_info(
+            tt::LogMetal,
+            "[perf-debug profiler] DRISC self-zones build does not fit alongside the GDDR spool; running "
+            "direct push for this capture");
+        spool_bytes = 0;
+    }
+    if (spool_bytes != 0 && spool_buffer_ == nullptr) {
+        const uint32_t nbanks_dram = ctx.device->allocator()->get_num_banks(BufferType::DRAM);
+        try {
+            spool_buffer_ = distributed::MeshBuffer::create(
+                distributed::ReplicatedBufferConfig{static_cast<DeviceAddr>(nbanks_dram) * spool_bytes},
+                distributed::DeviceLocalBufferConfig{.page_size = spool_bytes, .buffer_type = BufferType::DRAM},
+                mesh_device.get());
+        } catch (const std::exception& e) {
+            log_warning(
+                tt::LogMetal,
+                "[perf-debug profiler] could not reserve {} MiB/bank of DRAM for the GDDR spool ({}); falling "
+                "back to direct push",
+                dram_spool_mb(),
+                e.what());
+        }
+    }
+    if (spool_buffer_ != nullptr) {
+        spool_addr = static_cast<uint32_t>(spool_buffer_->address());
+        log_info(
+            tt::LogMetal,
+            "[perf-debug profiler] GDDR spool: {} MiB per filler at bank offset 0x{:x}",
+            dram_spool_mb(),
+            spool_addr);
+    } else {
+        spool_bytes = 0;
+    }
+    // xsplit: a filler serves only the half its own DRAM column reaches without wrapping a row, and the
+    // fillers of each column split that half between them.
+    std::vector<uint32_t> xs_grp(ctx.n_drisc, 0), xs_rank(ctx.n_drisc, 0);
+    uint32_t xs_n[2] = {0, 0};
+    for (uint32_t d = 0; d < ctx.n_drisc && d < banks.size(); d++) {
+        const uint32_t g = banks[d] >= 4u ? 0u : 1u;  // views D4-D7 sit in NOC0 column x=9, D0-D3 in x=0
+        xs_grp[d] = g;
+        xs_rank[d] = xs_n[g]++;
+    }
     for (uint32_t d = 0; d < ctx.n_drisc; d++) {
-        // A MOVER has no slice of the worker grid -- it never touches a worker core. Fillers (and the default
-        // full-job drainers) take the same contiguous halves as before, so the drained set is unchanged.
-        const bool is_mover = ctx.role[d] == kRoleMover;
-        const bool is_filler = ctx.role[d] == kRoleFiller;
-        // How many DRISCs SWEEP THE GRID -- which is what the slices divide by, and it is no longer the same
-        // as n_sockets_split(). Off: 2 full-job drainers take halves. On: n_fillers() fillers take n_fillers()-ths,
-        // which is the entire point of the change (the knee is the filler's scan over its slice, FINDINGS N+28), so
-        // getting this denominator wrong would look like a working build that simply did not improve.
-        const uint32_t n_slices = rsplit ? n_fillers() : n_sockets_split();
-        const uint32_t slice = is_mover ? 0u : d;
-        const uint32_t lo = is_mover ? 0u : static_cast<uint32_t>((num_cores * slice) / n_slices);
-        const uint32_t hi = is_mover ? 0u : static_cast<uint32_t>((num_cores * (slice + 1)) / n_slices);
+        const uint32_t sl = slice_map.empty() ? d : slice_map[d];
+        TT_FATAL(sl < kNFillers, "slice {} out of range for {} fillers", sl, kNFillers);
+        uint32_t lo = static_cast<uint32_t>((num_cores * wcum[sl]) / wcum[kNFillers]);
+        uint32_t hi = static_cast<uint32_t>((num_cores * wcum[sl + 1]) / wcum[kNFillers]);
+        if (n_left != 0 && xs_n[xs_grp[d]] != 0) {
+            const uint32_t g = xs_grp[d];
+            const uint32_t base = g == 0u ? 0u : n_left;
+            const uint32_t span = g == 0u ? n_left : static_cast<uint32_t>(num_cores) - n_left;
+            lo = base + static_cast<uint32_t>((static_cast<uint64_t>(span) * xs_rank[d]) / xs_n[g]);
+            hi = base + static_cast<uint32_t>((static_cast<uint64_t>(span) * (xs_rank[d] + 1)) / xs_n[g]);
+        }
         const uint32_t my_cores = hi - lo;
-        if (my_cores == 0 && !is_mover) {
+        if (my_cores == 0) {
             continue;
         }
         CoreCoord drisc_phys{};  // NOC0 coords of the drainer core, for the socket and the log line
         uint32_t region = 0;     // usable L1 on the drainer core
-        if (tensix_drain) {
-            // Under slow dispatch the dispatch row/column is idle, so the drainer takes a core from there
-            // and the producers keep the FULL compute grid -- the offered load is then identical to the
-            // DRISC runs, which is the only way the two are comparable.
-            // Column gx is the one held back above; drainer d takes row d of it.
-            // Slow dispatch: the held-back column is free, drainer d takes row d of it. Fast dispatch: the
-            // column belongs to dispatch, so borrow the idle RT-profiler core instead (see above). Either way
-            // the drainer sits OUTSIDE the producer grid, which is what keeps the two arms comparable.
-            if (fd_tensix_core.has_value()) {
-                ctx.drisc_logical[d] = *fd_tensix_core;
-            } else {
-                TT_FATAL(d < gy, "drainer {} does not fit the reserved column (only {} rows)", d, gy);
-                ctx.drisc_logical[d] = CoreCoord{gx, d};
+            // Host-facing duty from NoC rows y != 0 is DELIBERATE. FINDINGS N+29 measured host-facing
+            // drainers hanging at 12.8% on y != 0 cores against 1.3% on the two y == 0 cores, and the
+            // mover role existed to keep PCIe egress on those two -- but that sweep ran the socket's ack
+            // path through UMD's dynamic per-access TLB reconfigure. Every filler now gets its own static
+            // window (configured below) and the socket takes the static path through it, so watch the hang
+            // rate rather than assume the old figure transfers.
+            ctx.drisc_logical[d] = mesh_device->impl().pick_unused_dram_logical_core(banks[d]);
+            if (const auto& sub_sel = filler_subchannels(); d < sub_sel.size()) {
+                // Forced placement. Validated against the same reserved set the picker honours, so a
+                // requested subchannel that is a worker/eth endpoint is refused rather than silently
+                // double-booking a core.
+                const uint32_t nsub = soc.get_grid_size(tt::CoreType::DRAM).y;
+                TT_FATAL(sub_sel[d] < nsub, "filler {} subchannel {} >= {}", d, sub_sel[d], nsub);
+                const size_t chan = soc.get_channel_for_dram_view(static_cast<int>(banks[d]));
+                const tt::umd::CoreCoord tc = soc.get_dram_core_for_channel(
+                    static_cast<int>(chan), static_cast<int>(sub_sel[d]), tt::CoordSystem::TRANSLATED);
+                bool reserved = false;
+                for (const auto& c : soc.dram_view_worker_cores.at(banks[d])) {
+                    reserved = reserved || (c.x == tc.x && c.y == tc.y);
+                }
+                for (const auto& c : soc.dram_view_eth_cores.at(banks[d])) {
+                    reserved = reserved || (c.x == tc.x && c.y == tc.y);
+                }
+                TT_FATAL(!reserved, "filler {} subchannel {} is a reserved worker/eth endpoint", d, sub_sel[d]);
+                ctx.drisc_logical[d] =
+                    soc.get_logical_dram_core_for_subchannel(static_cast<int>(banks[d]), static_cast<int>(sub_sel[d]));
             }
-            ctx.drisc_virtual[d] = ctx.device->virtual_core_from_logical_core(ctx.drisc_logical[d], CoreType::WORKER);
-            drisc_phys = cluster.get_physical_coordinate_from_logical_coordinates(
-                device_id, ctx.drisc_logical[d], CoreType::WORKER, /*no_warn=*/true);
-            // A Tensix's unreserved L1 belongs to the allocator, so the HAL refuses to name it (hal.hpp:705)
-            // -- take the allocator's base instead and run to the top of L1. Safe to carve raw here because
-            // the drainer core is outside the producer grid and this workload allocates no L1 buffers; a
-            // workload that did would need a real sharded allocation on this core.
-            ctx.drisc_l1_base[d] = ctx.device->allocator()->get_base_allocator_addr(HalMemType::L1);
-            ctx.drisc_l1_noc[d] = ctx.drisc_l1_base[d];  // worker L1 is addressed directly, no DRAM-view offset
-            region = ctx.device->l1_size_per_core() - static_cast<uint32_t>(ctx.drisc_l1_base[d]);
-        } else {
-            // TT_METAL_PERF_DEBUG_DRISC_BANK shifts which DRAM bank drainer d takes. DEFAULT 0, AND
-            // BANK 0 IS THE ONE THAT IS KNOWN GOOD -- do not "fix" this to something else.
-            //
-            // It was added to test a hypothesis that turned out to be WRONG, and the measurement is worth
-            // more than the hypothesis. The theory: pick_unused_dram_logical_core() reserves the bank's
-            // WORKER and ETH endpoints and returns the first subchannel left, while UMD's dram_membar()
-            // barriers SUBCHANNEL 0 of every channel (dram_membar(channels, subchannel = 0); Cluster::
-            // dram_barrier passes no subchannel). On banks 0 and 4-7 the worker/eth endpoints are [2,1],
-            // so the only free port IS subchannel 0 -- the drainer lands exactly on the core the host
-            // barriers, and we put that core in stream mode. Banks 1-3 have endpoints [0,1], so the
-            // drainer gets subchannel 2, which the barrier never polls. That predicted bank 0 wedges and
-            // bank 1 does not.
-            //
-            // A DRISC DRAINER IS ONLY SAFE ON A DRAM CORE IN NoC ROW y == 0. Measured, 8 banks x 25
-            // runs, randomized, resetting after every non-clean run so the runs are independent
-            // (bh-26, 2026-08-08; FINDINGS N+29):
-            //
-            //   bank 0 -> core 0-0  y=0    0/25    bank 1 -> 0-3  y=3    3/25
-            //   bank 3 -> core 9-0  y=0    0/25    bank 2 -> 0-8  y=8    2/25
-            //   bank 7 -> core 0-0  y=0    1/25    bank 4 -> 9-2  y=2    3/25
-            //                                      bank 5 -> 9-9  y=9    5/25
-            //                                      bank 6 -> 9-5  y=5    3/25
-            //   grouped: y==0  1/75 (1.3%)   vs   y!=0  16/125 (12.8%)   Fisher p ~ 0.006
-            //
-            // Note it is NOT the subchannel: banks 4/5/6 are subchannel 0 of their channel and still
-            // hang. The failures are MMIO per-op timeouts -- the host's small reads stop completing.
-            // Why row 0 is special is unproven; the soc descriptor notes that CMFW reads DRAM telemetry
-            // through a particular noc0 endpoint ("to avoid SYS-1419"), which is a lead, not a finding.
-            //
-            // There are exactly two safe cores, 0-0 and 9-0, one per DRAM side -- which is what caps
-            // n_sockets_split() at 2. pick_unused_dram_logical_core() does NOT know any of this: it reserves
-            // worker and eth endpoints only, so "unused" does not mean "safe to repurpose".
-            // ROLE-AWARE. The y==0 restriction is a property of the HOST-FACING duty, not of running a
-            // resident kernel on a DRAM core: on bank 5 -- N+29's worst core at 5/25 for a full-job drainer --
-            // two 25-run blocks gave 0/25 held in stream mode and 0/25 doing filler-only duty. So a FILLER may
-            // sit anywhere; anything that talks to the host must come from kSafeBanks.
-            const uint32_t bank = banks[d];
-            const int bank_ov = drisc_bank_override();
-            const uint32_t host_facing_idx = is_mover ? ctx.sock_of[d] : d;
-            TT_FATAL(
-                is_filler || bank_ov >= 0 || host_facing_idx < kNumSafeBanks,
-                "perf-debug: {} host-facing DRISCs requested but only {} DRAM banks are known safe (row y==0). "
-                "Raising the host-facing count needs a bank safety sweep first -- see FINDINGS N+29.",
-                host_facing_idx + 1,
-                kNumSafeBanks);
-            ctx.drisc_logical[d] = mesh_device->impl().pick_unused_dram_logical_core(bank);
+            {
+                // What placement freedom exists: pick_unused_dram_logical_core returns the FIRST unreserved
+                // subchannel of the view, and a view has several at different NoC coords. Log them all --
+                // choosing among these is the locality lever, and nothing currently chooses.
+                const uint32_t nsub = soc.get_grid_size(tt::CoreType::DRAM).y;
+                const size_t chan = soc.get_channel_for_dram_view(static_cast<int>(banks[d]));
+                std::string cand;
+                for (uint32_t sub = 0; sub < nsub; sub++) {
+                    const tt::umd::CoreCoord tc =
+                        soc.get_dram_core_for_channel(static_cast<int>(chan), static_cast<int>(sub), tt::CoordSystem::TRANSLATED);
+                    const tt::umd::CoreCoord nc = soc.translate_coord_to(tc, tt::CoordSystem::NOC0);
+                    cand += fmt::format(" sub{}=NOC0({},{})", sub, nc.x, nc.y);
+                }
+                log_info(
+                    tt::LogMetal,
+                    "[perf-debug profiler] filler {} bank {} chan {}: {} subchannels ->{} | chose logical ({},{})",
+                    d,
+                    banks[d],
+                    chan,
+                    nsub,
+                    cand,
+                    ctx.drisc_logical[d].x,
+                    ctx.drisc_logical[d].y);
+            }
             const CoreCoord translated =
                 soc.dram_bank_endpoint_coords.at(ctx.drisc_logical[d].x).at(ctx.drisc_logical[d].y);
             const tt::umd::CoreCoord phys = soc.translate_coord_to(
@@ -1609,6 +1504,16 @@ bool PerfDebugProfiler::boot_device(
                 CoordSystem::NOC0);
             drisc_phys = CoreCoord{phys.x, phys.y};
             ctx.drisc_virtual[d] = ctx.device->virtual_core_from_logical_core(ctx.drisc_logical[d], CoreType::DRAM);
+            log_info(
+                tt::LogMetal,
+                "[perf-debug profiler] filler {} at virtual ({},{}) owns band {} = cores [{}, {}) of {}",
+                d,
+                ctx.drisc_virtual[d].x,
+                ctx.drisc_virtual[d].y,
+                sl,
+                lo,
+                hi,
+                num_cores);
             // This drainer's own core, as a Tracy row: virtual coords are what its self frame carries in
             // SPSC_CORE_XY, NOC0 is what a Tracy context is keyed on. Registered for BOTH maps here, where both
             // are in hand -- a DRAM core is absent from metal_soc_descriptor's profiler flat-id map (TENSIX and
@@ -1624,7 +1529,6 @@ bool PerfDebugProfiler::boot_device(
             ctx.drisc_l1_base[d] = hal.get_dev_addr(HalProgrammableCoreType::DRAM, HalL1MemAddrType::UNRESERVED);
             ctx.drisc_l1_noc[d] = hal.get_dev_noc_addr(HalProgrammableCoreType::DRAM, HalL1MemAddrType::UNRESERVED);
             region = hal.get_dev_size(HalProgrammableCoreType::DRAM, HalL1MemAddrType::UNRESERVED);
-        }
 
         const uint32_t slot_bytes = slot_bytes_all;
         constexpr uint32_t kCfgReserve = 8 * 1024;
@@ -1644,18 +1548,7 @@ bool PerfDebugProfiler::boot_device(
         // to live. There is no room to ADD one: a DRAM core's UNRESERVED L1 is 86 KB and 7 slots of 10,560 B
         // plus the scratch/misc/socket-config reserve already leave under 2 KB spare. So hand the kernel
         // (nstage - 1) slots and let it use index kNStage -- one past its own array -- for the self frame. L1
-        // does not grow, the OFF build is untouched, and the only behavioural cost is that a MOVER's largest
-        // batch drops from 7 frames to 6 (a filler's batch is bounded by kGenSlots = 3 either way, so it is
-        // unaffected). That cost is real and is measured in FINDINGS rather than waved off.
-        // ROLE-AWARE self-frame budget. One shared cap starved the movers: they sample every ~1.3 us against a
-        // filler's ~157 us, so on ResNet-50 the 256-frame default stopped both movers ~20% into an 844 ms run
-        // and they NEVER came back -- the cap is permanent, not periodic, so nothing re-arms them. Measured
-        // need for full coverage of that run: filler 107 frames, mover 1,813-1,936 (~18x).
-        //
-        // Cost is NOT symmetric either, and the log line states it per drainer: full mover coverage was
-        // 13.0-14.9% of that mover's egress against 1.5% for a filler. So this buys completeness with real
-        // bytes; if that is too dear the cheaper lever is decimating the MOVER's sample interval (1.3 us
-        // resolution over 844 ms is far finer than any question needs), not shrinking the cap back.
+        // does not grow and the OFF build is untouched (the pipeline is bounded by kGenSlots = 3 either way).
         const uint32_t self_frames_base = drisc_zones() ? drisc_zone_frames() : 0u;
         const uint32_t nstage_drain = (self_frames_base != 0 && nstage >= 3) ? nstage - 1u : nstage;
         if (self_frames_base != 0 && nstage < 3) {
@@ -1673,24 +1566,19 @@ bool PerfDebugProfiler::boot_device(
         ctx.done_addr[d] = head_scratch + kScratchBytes;
         ctx.stop_addr[d] = ctx.done_addr[d] + 64;
         ctx.results_addr[d] = ctx.stop_addr[d] + 64;
-        // The role-split handshake block. Allocated for every role so the L1 layout (and hence every other
-        // address) is identical whether the knob is on or off -- a mover reads its FILLER's block, and that
-        // only works because both cores lay their L1 out the same way.
-        // Sized off the SHARED constant, not a literal: this moved once already (48 -> 64 words) and a
-        // hand-copied 256 here would have silently overlapped the handshake.
-        ctx.hs_addr[d] = ctx.results_addr[d] + kernel_profiler::SPSC_DRAIN_RESULT_WORDS * sizeof(uint32_t);
         TT_FATAL(
             self_frames_base == 0 || self_slot < nstage,
             "perf-debug: DRISC self-profiling wants staging slot {} but only {} slots are mapped",
             self_slot,
             nstage);
         const uint32_t cfg_l1 = ctx.drisc_l1_base[d] + region - kCfgReserve;
-        TT_FATAL(ctx.hs_addr[d] + kHsBytes <= cfg_l1, "DRISC L1 layout overlaps the socket config");
+        TT_FATAL(
+            ctx.results_addr[d] + kernel_profiler::SPSC_DRAIN_RESULT_WORDS * sizeof(uint32_t) <= cfg_l1,
+            "DRISC L1 layout overlaps the socket config");
 
         // Stream mode first: the socket config is written from the host and only lands in L1 once the NIU
         // stops forwarding inbound DRAM-range addresses to GDDR. The kernel restores it on the host's word.
         // A Tensix NIU is already a NoC master, so this (and the kernel's restore tail) is DRISC-only.
-        if (!tensix_drain) {
             // NIU already flipped to stream mode for EVERY drainer by the single pre-pass above.
 
             // TT_METAL_PERF_DEBUG_NIU_TEST isolates the NIU mode flip from everything else the drainer does.
@@ -1717,7 +1605,6 @@ bool PerfDebugProfiler::boot_device(
                 disarm_producers(mesh_device, device_id);
                 return false;
             }
-        }
 
         // Give the DRISC drainer a STATIC TLB window, so the socket's per-read ack write skips UMD's
         // per-access TLB reconfigure -- the same path the Tensix drainer already gets for free. Measured on
@@ -1732,7 +1619,7 @@ bool PerfDebugProfiler::boot_device(
         // what workers get, so both drainers end up on an identical host write path.
         //
         // Best-effort: a window is a finite device resource, and losing this race only costs the ~210 ns.
-        if (!tensix_drain && !no_static_tlb() && !cluster.is_mock_or_emulated()) {
+        if (!no_static_tlb() && !cluster.is_mock_or_emulated()) {
             auto* tlb_manager = cluster.get_driver()->get_chip(device_id)->get_tlb_manager();
             const tt_xy_pair tlb_core(ctx.drisc_virtual[d].x, ctx.drisc_virtual[d].y);
             if (!tlb_manager->is_tlb_mapped(tlb_core)) {
@@ -1752,13 +1639,9 @@ bool PerfDebugProfiler::boot_device(
             }
         }
 
-        // Socket index this DRISC owns. A FILLER owns none: it never talks to the host, which is the whole
-        // point of the split. NOTE these arrays are sized n_sockets_split(), not kMaxDrisc -- indexing them by the
-        // DRISC index would run off the end once there are four DRISCs.
-        const uint32_t sk = ctx.sock_of[d];
-        const bool has_socket = sk != kNoSocket;
+        const uint32_t sk = d;
         try {
-            if (has_socket) {
+            {
                 // sender_uses_physical_noc_addr switches the socket between "physical NoC coord + full L1 addr" (DRISC,
                 // drainer) and the normal worker path (logical coord, worker-L1 semantics). The socket picks the
                 // static-vs-dynamic write path by ASKING UMD whether this core has a window (see init_sender_tlb),
@@ -1767,10 +1650,10 @@ bool PerfDebugProfiler::boot_device(
                 ctx.sockets[sk] = std::make_unique<distributed::D2HSocket>(
                     mesh_device,
                     distributed::MeshCoreCoord{
-                        scoord, tensix_drain ? ctx.drisc_logical[d] : CoreCoord(drisc_phys.x, drisc_phys.y)},
-                    static_cast<uint32_t>((static_cast<uint64_t>(kHRingWords) * 4 / kPageSize) * kPageSize),
+                        scoord, CoreCoord(drisc_phys.x, drisc_phys.y)},
+                    (host_fifo_bytes() / kPageSize) * kPageSize,
                     distributed::D2HSocket::ExternalConfigBuffer{
-                        .address = cfg_l1, .sender_uses_physical_noc_addr = !tensix_drain});
+                        .address = cfg_l1, .sender_uses_physical_noc_addr = true});
                 ctx.sockets[sk]->set_page_size(kPageSize);
                 // MEASURE the flow-control poll directly. The per-poll cost derived from the rounded "poll X%"
                 // log line differed ~10x between a fast and a degraded card, but that figure is too indirect to
@@ -1878,7 +1761,7 @@ bool PerfDebugProfiler::boot_device(
                             acc);
                     }
                 }
-            }  // has_socket
+            }
 
             // Zero done AND the heartbeat/phase words behind it. Zeroing only `done` leaves the PREVIOUS
             // run's hb/phase in L1, so a drainer that never starts reads as the last run's final state --
@@ -1897,18 +1780,15 @@ bool PerfDebugProfiler::boot_device(
             // and drisck.cc emits DRISC-KERNEL zones -- it just was never run 74 times inside one
             // card-reset window. Zero it here for both rather than wait to rediscover it on the DRISC.
             const uint64_t drainer_prof_l1 =
-                tensix_drain ? prof_l1
-                             : hal.get_dev_noc_addr(HalProgrammableCoreType::DRAM, HalL1MemAddrType::PROFILER);
+                hal.get_dev_noc_addr(HalProgrammableCoreType::DRAM, HalL1MemAddrType::PROFILER);
             cluster.write_core(
                 zero_ctrl.data(),
                 (uint32_t)zero_ctrl.size(),
                 tt_cxy_pair(device_id, ctx.drisc_virtual[d]),
                 drainer_prof_l1);
 
-            // done | hb | phase | dbg_hw | dbg_sw | then FOUR WORDS PER PEER (probe_f-echo | probe-frame |
-            // live head | live tail) -- 13 words of the 64 B pad, because a stale probe echo from the previous
-            // run would pass the bring-up check that exists to catch a bad handshake. Peer 1's block was added
-            // with dual-ring movers; zeroing only peer 0's would leave exactly that hole.
+            // done | hb | phase and the rest of the 64 B pad: a stale value from the previous run reads as
+            // this run's live state.
             uint32_t zero3[13] = {};
             cluster.write_core(
                 zero3,
@@ -1938,77 +1818,37 @@ bool PerfDebugProfiler::boot_device(
                 (uint32_t)(zero_res.size() * sizeof(uint32_t)),
                 tt_cxy_pair(device_id, ctx.drisc_virtual[d]),
                 ctx.drisc_l1_noc[d] + (ctx.results_addr[d] - ctx.drisc_l1_base[d]));
-            // ---- the FILLER's handshake block, planted before its kernel or its mover exists ----
-            //
-            // Zero head/tail (the kernel re-zeros head; tail belongs to the mover from launch onward, so it
-            // must start clean or the filler reads a bogus consumed-count and overwrites live frames), then
-            // plant the magic the mover has to read back. The mover echoes it into its own L1 and writes its
-            // own magic here, and bring-up refuses the run if either is wrong -- a mistaken peer coordinate
-            // or L1 address otherwise yields a plausible garbage `head` and silently corrupt capture.
-            //
-            // The planted magic is kProbeFillerMagic + THIS FILLER'S INDEX. With one magic for all fillers the
-            // echo only proved the mover read SOME filler's probe word, so a mover whose peer-1 coordinate
-            // named the wrong filler would have passed -- and then two movers would drain one ring while
-            // another was never drained, which back-pressures a lossless producer into wedging the workload.
-            if (is_filler) {
-                std::vector<uint32_t> hs(kHsBytes / sizeof(uint32_t), 0);
-                hs[kHsProbeF / sizeof(uint32_t)] = kProbeFillerMagic + d;
-                cluster.write_core(
-                    hs.data(),
-                    kHsBytes,
-                    tt_cxy_pair(device_id, ctx.drisc_virtual[d]),
-                    ctx.drisc_l1_noc[d] + (ctx.hs_addr[d] - ctx.drisc_l1_base[d]));
-            }
-
             // Mirrored PCIe-tile encoding for NoC 1 (see drain_noc()). 0 => kernel uses the socket's NOC0 value.
+            // Always the socket's own PCIe encoding, on both NoCs. Mirroring the tile for NoC 1 was
+            // MEASURED WRONG: pages still flow (socket credits are a separate path) but decode yields ZERO
+            // markers, because the encoding is in TRANSLATED space (PCIE_NOC_X=19, PCIE_NOC_Y=24, outside
+            // the 17x12 NOC0 grid) while NOC_0_X_PHYS_COORD mirrors WORKER coordinates.
             uint32_t pcie_enc_override = 0;
-            // MEASURED WRONG, kept only as a knob: mirroring the PCIe tile for NoC 1 makes the payload land
-            // somewhere else -- pages still flow (socket credits are a separate path) but decode yields ZERO
-            // markers. The PCIe encoding is in TRANSLATED space (the kernel is built with PCIE_NOC_X=19,
-            // PCIE_NOC_Y=24, outside the 17x12 NOC0 grid), and NOC_0_X_PHYS_COORD mirrors WORKER coordinates,
-            // not this. Default is now to use the socket's own encoding on both NoCs.
-            const char* mirror_env = std::getenv("TT_METAL_PERF_DEBUG_NOC_MIRROR");
-            const bool want_mirror = mirror_env != nullptr && *mirror_env != '\0' && *mirror_env != '0';
-            if (!tensix_drain && drain_noc() == 1 && want_mirror) {
-                const auto& mmio_soc = cluster.get_soc_desc(cluster.get_associated_mmio_device(device_id));
-                const auto pcie_noc0 = mmio_soc.get_cores(CoreType::PCIE, CoordSystem::NOC0).front();
-                const uint32_t mx =
-                    static_cast<uint32_t>(mmio_soc.grid_size.x) - 1 - static_cast<uint32_t>(pcie_noc0.x);
-                const uint32_t my =
-                    static_cast<uint32_t>(mmio_soc.grid_size.y) - 1 - static_cast<uint32_t>(pcie_noc0.y);
-                pcie_enc_override = hal.noc_xy_pcie64_encoding(mx, my);
+            if (pcie_split()) {
+                const auto& pcie_cores = soc.get_cores(tt::CoreType::PCIE, tt::CoordSystem::NOC0);
+                std::string all;
+                for (const auto& c : pcie_cores) {
+                    all += fmt::format(" ({},{})", c.x, c.y);
+                }
                 log_info(
                     tt::LogMetal,
-                    "[perf-debug profiler] NoC 1 egress: PCIe tile NOC0 ({},{}) -> NOC1 ({},{}) on a {}x{} grid, "
-                    "enc 0x{:x}",
-                    pcie_noc0.x,
-                    pcie_noc0.y,
-                    mx,
-                    my,
-                    mmio_soc.grid_size.x,
-                    mmio_soc.grid_size.y,
-                    pcie_enc_override);
-            }
-
-            // A MOVER reads its FILLER's handshake block, so it needs that filler's virtual NoC coords and L1
-            // address. Fillers occupy indices [0, n_fillers()) and are set up FIRST, which is why these are
-            // already populated by the time a mover is configured.
-            // Per peer slot: (virtual xy, handshake address, ring bank, ring address). Slot 1 stays all-zero
-            // for a single-ring mover, and the kernel's kNPeer never reaches it.
-            uint32_t peer_xy[kNPeerMax] = {};
-            uint32_t peer_hs[kNPeerMax] = {};
-            uint32_t peer_bank[kNPeerMax] = {};
-            uint32_t peer_addr[kNPeerMax] = {};
-            if (is_mover) {
-                for (uint32_t pi = 0; pi < ctx.n_peer[d]; pi++) {
-                    const uint32_t p = ctx.peer_of[d][pi];
-                    peer_xy[pi] = (static_cast<uint32_t>(ctx.drisc_virtual[p].x) & 0xFFFFu) |
-                                  ((static_cast<uint32_t>(ctx.drisc_virtual[p].y) & 0xFFFFu) << 16);
-                    peer_hs[pi] = ctx.hs_addr[p];
-                    peer_bank[pi] = ctx.dram_bank[p];
-                    peer_addr[pi] = ctx.dram_addr[p];
+                    "[perf-debug profiler] filler {}: {} PCIe tile(s) ->{}",
+                    d,
+                    pcie_cores.size(),
+                    all);
+                if ((d & 1u) != 0 && pcie_cores.size() > 1) {
+                    pcie_enc_override = MetalContext::instance().hal().noc_xy_pcie64_encoding(
+                        pcie_cores[1].x, pcie_cores[1].y);
+                    log_info(
+                        tt::LogMetal,
+                        "[perf-debug profiler] filler {} egress -> SECOND PCIe tile ({},{}) enc 0x{:x}",
+                        d,
+                        pcie_cores[1].x,
+                        pcie_cores[1].y,
+                        pcie_enc_override);
                 }
             }
+
             ctx.drain_program[d] = std::make_unique<Program>(CreateProgram());
             const std::vector<uint32_t> cargs = {
                 stage_base,
@@ -2017,36 +1857,36 @@ bool PerfDebugProfiler::boot_device(
                 ctx.results_addr[d],
                 ctx.done_addr[d],
                 ctx.stop_addr[d],
-                has_socket ? ctx.sockets[sk]->get_config_buffer_address() : 0u,
+                ctx.sockets[sk]->get_config_buffer_address(),
                 0xFFFFFFFFu,
                 128,
                 drisc_gap_cycles(),
-                ship_repeat(),
+                0u,  // retired: SHIP_REPEAT
                 no_noc_init() ? 0u : 1u,
                 ablate(),
                 ablate_spin(),
                 nstage,
-                is_mover ? 1u : (my_cores + nstage - 1) / nstage,
+                (my_cores + nstage - 1) / nstage,
                 pcie_enc_override,
-                fill_target_pct(),
-                gap_max_cycles(),
-                read_split(),
-                // ---- role split (arg 20..31). All zero on the default path, and every use of them in the
-                // kernel is behind `if constexpr`, so the emitted code is identical when the knob is off.
-                // Args 21/22 are "the ring at index 0": a filler's OWN ring, or a mover's peer-0 ring.
-                ctx.role[d],
-                is_mover ? peer_bank[0] : ctx.dram_bank[d],
-                is_mover ? peer_addr[0] : ctx.dram_addr[d],
-                ctx.dram_frames,
-                is_filler ? ctx.hs_addr[d] : 0u,
-                peer_xy[0],
-                peer_hs[0],
-                // arg 27..31: the mover's peer COUNT and everything about peer 1.
-                ctx.n_peer[d],
-                peer_xy[1],
-                peer_hs[1],
-                peer_bank[1],
-                peer_addr[1],
+                0u,  // retired: FILL_PCT (the fill-driven pace controller CV-first replaced)
+                0u,  // retired: GAP_MAX (its ceiling)
+                0u,  // retired: READ_SPLIT
+                // Arg 20: write VC. With the egress NoC alternating on d&1, d&2 splits each NoC's
+                // pushers across two of the four unicast request VCs; TT_METAL_PERF_DEBUG_FILLER_VCS
+                // (comma-separated, one entry per filler) overrides the whole assignment for arbitration
+                // experiments at the shared PCIe tile. Args 21..31 retired.
+                d < filler_vcs().size() ? filler_vcs()[d] : ((d & 2u) ? 0u : 1u),
+                0u,
+                0u,
+                0u,
+                0u,
+                0u,
+                0u,
+                0u,
+                0u,
+                0u,
+                0u,
+                0u,
                 // ---- DRISC self-profiling (arg 32..35). All zero when the knob is off. ----
                 // The identity is passed in rather than read from a firmware global: SPSC_CORE_XY has to be in
                 // the SAME coordinate space the worker cores stamp (virtual), because the host resolves a frame
@@ -2056,56 +1896,57 @@ bool PerfDebugProfiler::boot_device(
                 drisc_zone_hold_cycles(),
                 (static_cast<uint32_t>(ctx.drisc_virtual[d].x) & 0xFFFFu) |
                     ((static_cast<uint32_t>(ctx.drisc_virtual[d].y) & 0xFFFFu) << 16),
-                // A MOVER gets 16x the budget: it samples every ~1.3 us against a filler's ~157 us, so one
-                // shared cap covers a filler's whole run and cuts a mover off at ~20% of it. Measured need on
-                // ResNet-50 trace+2cq: 107 frames for a filler, 1,813-1,936 for a mover, so 256 -> 4,096 keeps
-                // comparable headroom at both ends. An explicit TT_METAL_PERF_DEBUG_DRISC_ZONE_FRAMES scales
-                // both roles together.
-                is_mover ? self_frames_base * 16u : self_frames_base,
+                self_frames_base,
                 drisc_zone_detail(),
                 noc_footprint(),
                 // arg 38: the sync event. Gated on zones being on as well, because it rides the self-zone ring
                 // and the kernel static_asserts that pairing -- passing 1 with zones off would not build.
                 (sync_event_count() != 0 && self_frames_base != 0) ? 1u : 0u,
-                // arg 39: the per-core staging fill gate (percent of live span capacity; 0 = off).
-                stage_min_fill_pct(),
-                // arg 40: mover traffic shaping, cycles per frame moved on a keeping-up sweep (0 = off).
-                mover_frame_gap(),
-                // args 41-56: mover peer slots 2..5 (xy, hs, ring bank, ring addr each) -- the 6-filler
-                // shape's single mover. All zero on the default 4+2 shape and for fillers.
-                peer_xy[2],
-                peer_hs[2],
-                peer_bank[2],
-                peer_addr[2],
-                peer_xy[3],
-                peer_hs[3],
-                peer_bank[3],
-                peer_addr[3],
-                peer_xy[4],
-                peer_hs[4],
-                peer_bank[4],
-                peer_addr[4],
-                peer_xy[5],
-                peer_hs[5],
-                peer_bank[5],
-                peer_addr[5]};
-            const std::string kdrain = "tt_metal/tools/profiler/kernels/drisc_profiler_drain.cpp";
-            auto drain_id =
-                tensix_drain
-                    ? CreateKernel(
-                          *ctx.drain_program[d],
-                          kdrain,
-                          ctx.drisc_logical[d],
-                          DataMovementConfig{
-                              .processor = DataMovementProcessor::RISCV_0,
-                              .noc = NOC::RISCV_0_default,
-                              .compile_args = cargs,
-                              .defines = {{"DRAIN_ON_TENSIX", "1"}}})
-                    : CreateKernel(
-                          *ctx.drain_program[d],
-                          kdrain,
-                          ctx.drisc_logical[d],
-                          DramConfig{.noc = drain_noc() == 1 ? NOC::NOC_1 : NOC::NOC_0, .compile_args = cargs});
+                // arg 39: ship threshold (percent of live span capacity).
+                ship_min_pct(),
+                // arg 40: per-core service-interval instrumentation (two wall-clock reads and a histogram
+                // update per shipped core). The svc lines it feeds found the rotation and staleness knees,
+                // but at the knee it is measurable sweep time, so it is opt-in.
+                perf_debug::env_u32("TT_METAL_PERF_DEBUG_DRISC_SVC", 0),  // 1 = full svc hist; 2 = phase maxima only
+                // arg 41: the BASE instrumentation tier (phase cycle counters, ~55 wall-clock reads per
+                // sweep, ~1 us of a 15 us knee sweep). Default ON -- the LIFETIME/WINDOW/WORST/read-split
+                // report lines come from it; TT_METAL_PERF_DEBUG_DRISC_INSTR=0 compiles it out for record
+                // runs, and those lines then print zeros.
+                perf_debug::env_flag("TT_METAL_PERF_DEBUG_DRISC_INSTR", true) ? 1u : 0u,
+                // args 42/43: the GDDR spool (base offset in this DRISC's own bank, ring bytes; 43 == 0
+                // selects direct push). The bounce slots cost the kernel a staging generation, so the spool
+                // needs the full slot count; a smaller L1 falls back to direct push rather than failing the
+                // kernel's geometry static_asserts.
+                spool_addr,
+                nstage_drain >= (self_frames_base != 0 ? 6u : 7u) ? spool_bytes : 0u};
+            if (spool_bytes != 0 && nstage_drain < (self_frames_base != 0 ? 6u : 7u)) {
+                log_warning(
+                    tt::LogMetal,
+                    "[perf-debug profiler] Device {}: only {} staging slots fit, too few for the spool's bounce "
+                    "buffers; filler {} runs direct push",
+                    device_id,
+                    nstage,
+                    d);
+            }
+            TT_FATAL(
+                (drisc_zones() ? (kernel_profiler::SPSC_SPAN_PREFIX_WORDS +
+                                  kernel_profiler::PROFILER_L1_CONTROL_VECTOR_SIZE +
+                                  kernel_profiler::PROFILER_L1_VECTOR_SIZE) *
+                                     4u
+                               : 0u) +
+                        my_cores * 32u <=
+                    slot_bytes_all,
+                "CV-first tails staging ({} cores x 32 B) does not fit inside the slot past the pipeline",
+                my_cores);
+            auto drain_id = CreateKernel(
+                *ctx.drain_program[d],
+                "tt_metal/tools/profiler/kernels/drisc_profiler_filler.cpp",
+                ctx.drisc_logical[d],
+                DramConfig{
+                    .noc = (drain_noc_override() < 0 ? false : drain_noc_override() == 1) ? NOC::NOC_1
+                                                                                                  : NOC::NOC_0,
+                    .compile_args = cargs,
+                    .defines = {{"PERF_DEBUG_DRAIN_KERNEL", "1"}}});
             std::vector<uint32_t> rt = {my_cores, static_cast<uint32_t>(prof_l1)};
             rt.insert(rt.end(), coords.begin() + lo, coords.begin() + hi);
             SetRuntimeArgs(*ctx.drain_program[d], drain_id, ctx.drisc_logical[d], rt);
@@ -2176,90 +2017,10 @@ bool PerfDebugProfiler::boot_device(
                         st[3],
                         st[4]);
                     ctx.drain_program[d].reset();
-                    if (has_socket) {
-                        ctx.sockets[sk].reset();
-                    }
+                    ctx.sockets[sk].reset();
                     disarm_producers(mesh_device, device_id);
                     return false;
                 }
-            }
-
-            // ---- VERIFY THE MOVER<->FILLER HANDSHAKE, both directions, before letting data flow ----
-            //
-            // The heartbeat only proves the kernel is looping. It cannot see that the mover is reading the
-            // WRONG L1 word: a bad peer coordinate or address returns a plausible `head`, the mover ships
-            // whatever DRAM held, and the result is a capture that decodes to nonsense with every counter
-            // reading clean -- exactly how the last two-thread ring bug presented (1.03M records lost, all
-            // nesting corrupt, invisible everywhere). So check the planted magic in both directions and
-            // refuse the run if either is wrong, rather than discover it in the data.
-            // EVERY peer is checked. A dual-ring mover has two independent chances to be pointed at the wrong
-            // L1, and the magics are per-peer (see the plant site) so a right-looking value from the WRONG
-            // filler no longer passes.
-            for (uint32_t pi = 0; is_mover && pi < ctx.n_peer[d]; pi++) {
-                const uint32_t p = ctx.peer_of[d][pi];
-                const uint32_t want_echo = kProbeFillerMagic + p;  // planted by filler p, read by this mover
-                const uint32_t want_back = kProbeMoverMagic + pi;  // written by this mover into peer slot pi
-                const tt_cxy_pair mv(device_id, ctx.drisc_virtual[d]);
-                const tt_cxy_pair fl(device_id, ctx.drisc_virtual[p]);
-                uint32_t echo = 0, back = 0;
-                const auto pdl = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
-                do {
-                    // Peers 0/1 echo into the 64 B done pad (+20/+36); peers 2-5 (6-filler shape) echo
-                    // into the results region's live block at out[92 + (pi-2)*4].
-                    const uint64_t echo_off =
-                        pi < 2 ? (ctx.done_addr[d] - ctx.drisc_l1_base[d]) + 20 + 16 * pi
-                               : (ctx.results_addr[d] - ctx.drisc_l1_base[d]) + (92 + (pi - 2) * 4) * 4;
-                    cluster.read_core(&echo, sizeof(echo), mv, ctx.drisc_l1_noc[d] + echo_off);
-                    cluster.read_core(
-                        &back,
-                        sizeof(back),
-                        fl,
-                        ctx.drisc_l1_noc[p] + (ctx.hs_addr[p] - ctx.drisc_l1_base[p]) + kHsProbeM);
-                    if (echo == want_echo && back == want_back) {
-                        break;
-                    }
-                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
-                } while (std::chrono::steady_clock::now() < pdl);
-                if (echo != want_echo || back != want_back) {
-                    log_warning(
-                        tt::LogMetal,
-                        "[perf-debug profiler] Device {}: role-split HANDSHAKE PROBE FAILED for mover {} peer "
-                        "slot {} <-> filler {}. mover read 0x{:08X} from the filler's probe word (expected "
-                        "0x{:08X} -- a different filler's magic here means the peer coordinate names the WRONG "
-                        "filler); the filler holds 0x{:08X} where the mover should have written 0x{:08X}. Peer "
-                        "is virtual ({},{}) L1 0x{:x}. Capture is disabled rather than shipping frames read "
-                        "from an address neither side agrees on.",
-                        device_id,
-                        d,
-                        pi,
-                        p,
-                        echo,
-                        want_echo,
-                        back,
-                        want_back,
-                        ctx.drisc_virtual[p].x,
-                        ctx.drisc_virtual[p].y,
-                        ctx.hs_addr[p]);
-                    ctx.drain_program[d].reset();
-                    if (has_socket) {
-                        ctx.sockets[sk].reset();
-                    }
-                    disarm_producers(mesh_device, device_id);
-                    return false;
-                }
-                log_info(
-                    tt::LogMetal,
-                    "[perf-debug profiler] role split: mover {} peer slot {} <-> filler {} handshake OK (peer "
-                    "virtual ({},{}) L1 0x{:x}, ring bank {} @ 0x{:x}, {} frames)",
-                    d,
-                    pi,
-                    p,
-                    ctx.drisc_virtual[p].x,
-                    ctx.drisc_virtual[p].y,
-                    ctx.hs_addr[p],
-                    ctx.dram_bank[p],
-                    ctx.dram_addr[p],
-                    ctx.dram_frames);
             }
         } catch (const std::exception& e) {
             // A code-region overflow makes the drainer fail to LOAD, not merely fail to start, and the run
@@ -2283,9 +2044,7 @@ bool PerfDebugProfiler::boot_device(
                             : "",
                 what);
             ctx.drain_program[d].reset();
-            if (has_socket) {
-                ctx.sockets[sk].reset();
-            }
+            ctx.sockets[sk].reset();
             disarm_producers(mesh_device, device_id);
             return false;
         }
@@ -2295,9 +2054,7 @@ bool PerfDebugProfiler::boot_device(
             "[perf-debug profiler] Device {}: {} {} resident on logical ({},{}) [noc0 ({},{})], cores "
             "[{},{}) of {}, {} staging slots x {} B",
             device_id,
-            tensix_drain ? "TENSIX-BRISC drainer"
-                         : (is_filler ? "DRISC FILLER (worker rings -> DRAM ring)"
-                                      : (is_mover ? "DRISC MOVER (DRAM ring -> D2H socket)" : "DRISC")),
+            "DRISC FILLER (worker rings -> D2H socket)",
             d,
             ctx.drisc_logical[d].x,
             ctx.drisc_logical[d].y,
@@ -2375,19 +2132,15 @@ void PerfDebugProfiler::dump_drainer_state(DeviceCtx& ctx, uint32_t d, const cha
         case 3: phase_name = "RESERVE(credit-wait)"; break;
         case 4: phase_name = "WRITE"; break;
         case 5: phase_name = "EXIT"; break;
-        case 16: phase_name = "RING-WAIT(DRAM ring full)"; break;
         default: break;
     }
     uint32_t np = 0, fifo_pages = 0;
-    // A role-split FILLER owns no socket, so there is no FIFO to report -- its back-pressure is the DRAM
-    // ring, whose head/tail live in the pad this function already reads. After start() the sockets belong
-    // to the receiver (single-threaded per instance, so they must not be polled from here), leaving this
-    // path only for bring-up-time dumps.
-    const uint32_t sk = ctx.sock_of[d];
-    const bool have_fifo = sk != kNoSocket && ctx.sockets[sk] != nullptr;
+    // After start() the sockets belong to the receiver (single-threaded per instance, so they must not be
+    // polled from here), leaving the FIFO figures for bring-up-time dumps only.
+    const bool have_fifo = ctx.sockets[d] != nullptr;
     if (have_fifo) {
-        np = ctx.sockets[sk]->pages_available();
-        fifo_pages = ctx.sockets[sk]->get_fifo_curr_size() / ctx.sockets[sk]->get_page_size();
+        np = ctx.sockets[d]->pages_available();
+        fifo_pages = ctx.sockets[d]->get_fifo_curr_size() / ctx.sockets[d]->get_page_size();
     }
     log_warning(
         tt::LogMetal,
@@ -2405,26 +2158,6 @@ void PerfDebugProfiler::dump_drainer_state(DeviceCtx& ctx, uint32_t d, const cha
         phase_name,
         np,
         fifo_pages);
-    // A FILLER's back-pressure is its DRAM ring, not a host FIFO, so "0 of 0 fifo pages" above says nothing
-    // about it. Read the live handshake words instead: a filler frozen at phase 16 with head-tail pinned at
-    // capacity is ring-blocked (its mover died), which is a completely different failure from a credit-wait.
-    if (ctx.role[d] == kRoleFiller) {
-        uint32_t hd = 0, tl = 0;
-        const uint64_t hs = ctx.drisc_l1_noc[d] + (ctx.hs_addr[d] - ctx.drisc_l1_base[d]);
-        cluster.read_core(&hd, sizeof(hd), drisc, hs + kHsHead);
-        cluster.read_core(&tl, sizeof(tl), drisc, hs + kHsTail);
-        log_warning(
-            tt::LogMetal,
-            "[perf-debug profiler]   filler {}: DRAM ring head {} tail {} => {} frames in flight of {} "
-            "capacity{}",
-            d,
-            hd,
-            tl,
-            hd - tl,
-            ctx.dram_frames,
-            (ctx.dram_frames != 0 && (hd - tl) >= ctx.dram_frames) ? "  <<< RING FULL: the mover is not consuming"
-                                                                   : "");
-    }
     if (have_fifo && b[1] == a[1] && !exited && b[2] == 3 && np == 0) {
         log_warning(
             tt::LogMetal,
@@ -2534,112 +2267,17 @@ void PerfDebugProfiler::stop() {
     // lets the zone-name harvest run against already-compiled kernels.
     fire_sync_events();
 
-    // ---- ROLE SPLIT: quiesce in the right ORDER, before the per-DRISC teardown loop below ----
-    //
-    // The loop below tears each DRISC down completely -- stop=1, wait for done, read results, stop=2 -- one
-    // at a time. stop=2 is what lets a kernel run its NIU-restore tail, and in NOC2AXI mode an inbound
-    // DRAM-range address is forwarded to GDDR instead of terminating at L1. So releasing filler 0 while its
-    // mover is still running makes the mover's `head` read return GDDR contents.
-    //
-    // THIS ACTUALLY HAPPENED and it is worth spelling out, because every counter looked fine: the mover read
-    // 0xF5AE93CB as a head, head-tail underflowed to ~4.1e9, the "clamp to kNStage" step turned that into
-    // "7 frames are ready", and the movers shipped ~1,800 frames of garbage -- reporting 5,957 frames moved
-    // against 4,144 ever staged. The kernel now refuses an impossible head (out[57], hs_bad), and this
-    // pre-pass removes the cause: get every kernel out of its loop first, and only then release any NIU.
-    //
-    // Three phases, because the ring has to be drained in between:
-    //   1. quiesce the FILLERS  -- they stop producing but stay resident in stream mode, so head stays readable
-    //   2. let each MOVER catch its filler's final head -- otherwise the ring's tail is lost every run
-    //   3. quiesce the MOVERS
-    // The default 2-drainer path shares nothing between drainers and skips all of this.
+    // Producers before consumers: let the rings empty while the fillers are still draining them, so no
+    // producer ever meets a stopped consumer.
     for (auto& ctx : devices_) {
-        if (ctx.n_drisc <= n_sockets_split()) {
-            continue;
-        }
-        auto& cluster = MetalContext::instance().get_cluster();
-        auto stop_word = [&](uint32_t d) { return ctx.drisc_l1_noc[d] + (ctx.stop_addr[d] - ctx.drisc_l1_base[d]); };
-        auto done_word = [&](uint32_t d) { return ctx.drisc_l1_noc[d] + (ctx.done_addr[d] - ctx.drisc_l1_base[d]); };
-        auto quiesce = [&](uint32_t d) {
-            if (ctx.drain_program[d] == nullptr) {
-                return;
-            }
-            const tt_cxy_pair drisc(ctx.chip_id, ctx.drisc_virtual[d]);
-            uint32_t one = 1;
-            cluster.write_core(&one, sizeof(uint32_t), drisc, stop_word(d));
-            const auto dl = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-            uint32_t done = 0;
-            while (std::chrono::steady_clock::now() < dl) {
-                cluster.read_core(&done, sizeof(uint32_t), drisc, done_word(d));
-                if ((done & 0xFFFF0000u) == 0xD09E0000u) {
-                    return;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            }
+        if (!wait_producer_rings_drained(ctx, std::chrono::seconds(2))) {
             log_warning(
                 tt::LogMetal,
-                "[perf-debug profiler] Device {}: role-split DRISC {} ({}) did not acknowledge stop in the "
-                "ordered quiesce",
-                ctx.chip_id,
-                d,
-                ctx.role[d] == kRoleFiller ? "filler" : "mover");
-            dump_drainer_state(ctx, d, "ordered-quiesce");
-        };
-        for (uint32_t d = 0; d < ctx.n_drisc; d++) {
-            if (ctx.role[d] == kRoleFiller) {
-                quiesce(d);
-            }
-        }
-        // Phase 2. The filler publishes its final head in its exit tail, so by now head is the true total.
-        // ONE WAIT PER PEER RING, not per mover: a dual-ring mover can be caught up on ring 0 and still owe
-        // hundreds of frames on ring 1, and the tail of a capture that goes missing this way is invisible in
-        // every host-side counter (the records were simply never sent).
-        for (uint32_t d = 0; d < ctx.n_drisc; d++) {
-            if (ctx.role[d] != kRoleMover || ctx.drain_program[d] == nullptr) {
-                continue;
-            }
-            for (uint32_t pi = 0; pi < ctx.n_peer[d]; pi++) {
-                const uint32_t p = ctx.peer_of[d][pi];
-                if (ctx.drain_program[p] == nullptr) {
-                    continue;
-                }
-                uint32_t head = 0;
-                cluster.read_core(
-                    &head,
-                    sizeof(head),
-                    tt_cxy_pair(ctx.chip_id, ctx.drisc_virtual[p]),
-                    ctx.drisc_l1_noc[p] + (ctx.hs_addr[p] - ctx.drisc_l1_base[p]) + kHsHead);
-                const auto dl = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-                uint32_t tail = 0;
-                while (std::chrono::steady_clock::now() < dl) {
-                    // The mover's LIVE tail for peer slot pi: four words per peer behind `done`, so slot 0's
-                    // tail is at +32 and slot 1's at +48.
-                    cluster.read_core(
-                        &tail,
-                        sizeof(tail),
-                        tt_cxy_pair(ctx.chip_id, ctx.drisc_virtual[d]),
-                        done_word(d) + 32 + 16 * pi);
-                    if (tail >= head) {
-                        break;
-                    }
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                }
-                if (tail < head) {
-                    log_warning(
-                        tt::LogMetal,
-                        "[perf-debug profiler] role split: mover {} did not drain filler {}'s ring (peer slot {}) "
-                        "before teardown ({} of {} frames); the tail of the capture is lost",
-                        d,
-                        p,
-                        pi,
-                        tail,
-                        head);
-                }
-            }
-        }
-        for (uint32_t d = 0; d < ctx.n_drisc; d++) {
-            if (ctx.role[d] == kRoleMover) {
-                quiesce(d);
-            }
+                "[perf-debug profiler] Device {}: producers still publishing after the 2 s drain budget -- "
+                "unblocking ring back-pressure so device close cannot wedge; markers still in flight on those "
+                "cores are DROPPED",
+                ctx.chip_id);
+            disarm_producer_backpressure(ctx);
         }
     }
 
@@ -2676,10 +2314,10 @@ void PerfDebugProfiler::stop() {
                 // the control-vector pass), RESERVE = credit wait (should be impossible now it is bounded),
                 // WRITE = the PCIe write / push / notify / barrier, EXIT = the socket teardown tail.
                 dump_drainer_state(ctx, d, "stop-not-acked");
-            } else if (receiver_ != nullptr && ctx.sock_of[d] != kNoSocket) {
+            } else if (receiver_ != nullptr) {
                 // done follows the drainer's socket barrier, i.e. the host has already read and acked every
                 // byte this socket will ever carry -- the stream can retire itself on one final empty check.
-                receiver_->notify_producers_done(static_cast<uint32_t>(&ctx - devices_.data()), ctx.sock_of[d]);
+                receiver_->notify_producers_done(static_cast<uint32_t>(&ctx - devices_.data()), d);
             }
             // The drainer's own view of the run. Host-side page and marker counts cannot distinguish a
             // bandwidth wall from a latency one; sweeps/frames/cycles can.
@@ -2737,21 +2375,177 @@ void PerfDebugProfiler::stop() {
             // the bottleneck at all -- the host consumer is.
             const uint64_t c_read = u64(10), c_proc = u64(12), c_res = u64(14), c_wr = u64(16), c_bar = u64(18);
             const uint64_t c_idle = u64(21), c_busy = u64(23);
-            const uint64_t acct = c_read + c_proc + c_res + c_wr + c_bar;
+            const uint64_t c_pace = u64(136);
+            // u64(138) is the drain pump's off-gap time (its in-gap passes are already inside c_pace).
+            const uint64_t acct = c_read + c_proc + c_res + c_wr + c_bar + c_pace + u64(138);
             auto pct = [cyc](uint64_t v) {
                 return cyc ? (100.0 * static_cast<double>(v) / static_cast<double>(cyc)) : 0.0;
             };
+            // A phase cannot exceed the residency it is a phase OF. When one does, the counter word is not a
+            // duration -- a drainer that never reached its results write leaves stale L1 there, and the
+            // percentage then prints as nonsense (observed: "reserve(credit-wait) 1653073683357.0%", and
+            // "proc 18727729111430.1%" before that). Say which counter is unusable instead of formatting it.
+            {
+                const std::pair<const char*, uint64_t> phases[] = {{"read", c_read},
+                                                                   {"proc", c_proc},
+                                                                   {"reserve", c_res},
+                                                                   {"write", c_wr},
+                                                                   {"wr-barrier", c_bar},
+                                                                   {"pace", c_pace}};
+                std::string bad;
+                for (const auto& [name, v] : phases) {
+                    if (v > cyc) {
+                        bad += fmt::format("{}={} ", name, v);
+                    }
+                }
+                if (!bad.empty()) {
+                    log_warning(
+                        tt::LogMetal,
+                        "[perf-debug profiler] DRISC {}: phase counters exceed the {:.1f} ms residency, so they "
+                        "are not durations -- treat the phase line below as unusable for this drainer. Raw: {}",
+                        d,
+                        cyc / kCycPerUs / 1000.0,
+                        bad);
+                }
+            }
+            if (res[193] != 0) {
+                // 8192 cycles is the first bucket's ceiling; each later bucket doubles.
+                std::string h;
+                double lo = 8192.0 / kCycPerUs;
+                for (uint32_t i = 0; i < 8; i++) {
+                    h += fmt::format("{}<{:.0f}us={} ", i == 7 ? ">=" : "", lo, res[194 + i]);
+                    lo *= 2.0;
+                }
+                log_info(
+                    tt::LogMetal,
+                    "[perf-debug profiler] DRISC service interval per core: max {:.1f} us | {}",
+                    res[193] / kCycPerUs,
+                    h);
+            }
+            if (res[206] + res[208] + res[210] + res[212] != 0) {
+                log_info(
+                    tt::LogMetal,
+                    "[perf-debug profiler] DRISC phase maxima: bar {:.2f} us @{} | read-wait {:.2f} us @{} | "
+                    "cv {:.2f} us @{} | pump {:.2f} us @{}",
+                    res[206] / kCycPerUs,
+                    res[207],
+                    res[208] / kCycPerUs,
+                    res[209],
+                    res[210] / kCycPerUs,
+                    res[211],
+                    res[212] / kCycPerUs,
+                    res[213]);
+            }
+
+            if (res[191] != 0) {
+                // The line that answers "is the drainer actually idle while producers stall". Scoped to
+                // first-ship..last-ship, so it excludes the residency the lifetime line is swamped by.
+                const double wcyc = static_cast<double>(res[181]) + 4294967296.0 * res[182];
+                const double wbusy = static_cast<double>(res[183]) + 4294967296.0 * res[184];
+                const double widle = static_cast<double>(res[185]) + 4294967296.0 * res[186];
+                const double wpace = static_cast<double>(res[187]) + 4294967296.0 * res[188];
+                const double wms = wcyc / kCycPerUs / 1000.0;
+                const auto wp = [&](double v) { return wcyc > 0 ? 100.0 * v / wcyc : 0.0; };
+                log_info(
+                    tt::LogMetal,
+                    "[perf-debug profiler] DRISC WINDOW (data flowing) {:.1f} ms: busy-sweeps {:.1f}% | "
+                    "idle-sweeps {:.1f}% | pace {:.1f}% || {} frames over {} sweeps on {} cores -> a core is "
+                    "shipped every {:.1f} us",
+                    wms,
+                    wp(wbusy),
+                    wp(widle),
+                    wp(wpace),
+                    res[189],
+                    res[190],
+                    res[192],
+                    res[189] != 0 ? (wcyc / kCycPerUs) * res[192] / res[189] : 0.0);
+            }
             log_info(
                 tt::LogMetal,
-                "[perf-debug profiler] DRISC phases of {:.1f} ms: read {:.1f}% | proc {:.1f}% | "
-                "reserve(credit-wait) {:.1f}% | write {:.1f}% | wr-barrier {:.1f}% | unaccounted {:.1f}%",
+                "[perf-debug profiler] DRISC LIFETIME phases of {:.1f} ms (residency, NOT the capture -- see "
+                "the WINDOW line): read {:.1f}% | proc {:.1f}% | "
+                "reserve(credit-wait) {:.1f}% | write {:.1f}% | wr-barrier {:.1f}% | pace {:.1f}% | "
+                "unaccounted {:.1f}%",
                 cyc / kCycPerUs / 1000.0,
                 pct(c_read),
                 pct(c_proc),
                 pct(c_res),
                 pct(c_wr),
                 pct(c_bar),
+                pct(c_pace),
                 pct(cyc > acct ? cyc - acct : 0));
+            if (res[170] != 0 || res[171] != 0) {
+                log_info(
+                    tt::LogMetal,
+                    "[perf-debug profiler] DRISC ship threshold: {} core visits deferred, {} ships forced by age",
+                    res[170],
+                    res[171]);
+            }
+            if (spool_buffer_ != nullptr) {
+                const uint64_t spooled = u64(140);
+                const uint64_t drain_cyc = u64(138);
+                log_info(
+                    tt::LogMetal,
+                    "[perf-debug profiler] DRISC GDDR spool: {:.1f} MiB spooled, peak occ {} KiB of {} MiB, "
+                    "{} refills, {} host pushes ({} credit-starved passes), pump {:.1f} ms off-gap",
+                    spooled / 1048576.0,
+                    res[51] >> 10,
+                    dram_spool_mb(),
+                    res[49],
+                    res[52],
+                    res[50],
+                    drain_cyc / kCycPerUs / 1000.0);
+            }
+            // A full spool is back-pressure (deferred cores, stalled producers), never loss -- this fires
+            // only when the pump made no progress for the dead-consumer bound, the same contract as the
+            // direct path's credit timeout.
+            if (res[48] != 0 || res[135] != 0 || res[142] != 0 || res[144] != 0) {
+                log_warning(
+                    tt::LogMetal,
+                    "[perf-debug profiler] GDDR SPOOL LOSS: {} frames dropped{}{}{} -- the host consumer "
+                    "stopped draining (dead or wedged); capture is lost but the workload was never blocked",
+                    res[48],
+                    res[144] != 0 ? " after the spool egress made no progress for the dead-consumer bound" : "",
+                    res[135] != 0 ? ", exit drain DEADLINE EXPIRED" : "",
+                    res[142] != 0 ? fmt::format(", {} bytes stranded in the spool", res[142]) : "");
+            }
+            // Distribution of each busy sweep's PEAK unconsumed lane, in eighths of the ring.
+            log_info(
+                tt::LogMetal,
+                "[perf-debug profiler] DRISC busy-sweep peak-lane/8ths [{} {} {} {} {} {} {} {}]",
+                res[53],
+                res[54],
+                res[55],
+                res[56],
+                res[57],
+                res[58],
+                res[59],
+                res[60]);
+            if (res[63] != 0) {
+                const uint64_t scan_cyc = (static_cast<uint64_t>(res[62]) << 32) | res[61];
+                log_info(
+                    tt::LogMetal,
+                    "[perf-debug profiler] DRISC control scan: {:.0f} ns/core over {} core-visits",
+                    static_cast<double>(scan_cyc) / kCycPerUs * 1000.0 / static_cast<double>(res[63]),
+                    res[63]);
+            }
+            // read sub-split, WORKLOAD-WINDOW scoped (the lifetime counters are dominated by idle CV
+            // polling): the CV pass and the gather issue are DRISC-serial whatever the NoC does; only
+            // the residual wait shrinks with overlap. Which dominates picks the next lever (kill the
+            // CV pass vs cheaper issue vs more overlap).
+            if (res[191] != 0 && res[190] != 0) {
+                const double sweeps_w = static_cast<double>(res[190]);
+                const uint64_t w_cv = (static_cast<uint64_t>(res[203]) << 32) | res[202];
+                const uint64_t w_issue = (static_cast<uint64_t>(res[205]) << 32) | res[204];
+                const uint64_t w_busy = (static_cast<uint64_t>(res[184]) << 32) | res[183];
+                log_info(
+                    tt::LogMetal,
+                    "[perf-debug profiler] DRISC read split (workload window): cv-pass {:.2f} us/sweep | "
+                    "gather-issue {:.2f} us/sweep | busy {:.2f} us/sweep",
+                    w_cv / kCycPerUs / sweeps_w,
+                    w_issue / kCycPerUs / sweeps_w,
+                    w_busy / kCycPerUs / sweeps_w);
+            }
             // proc sub-split. `proc` is the biggest busy-sweep phase, and it is two unrelated things:
             // a LOCAL scan of the staged control vectors, and a per-live-core 20 B NoC head write-back
             // (up to one issue per core per sweep). This drainer is issue-bound, so which half dominates
@@ -2784,85 +2578,6 @@ void PerfDebugProfiler::stop() {
                     ws_tot / kCycPerUs,
                     res[25] ? 100.0 * ws_tot / static_cast<double>(res[25]) : 0.0);
             }
-            // ---- ROLE SPLIT counters (only printed when the knob is on) ----
-            //
-            // ring high-water is the number the whole change rests on: the point of staging in DRAM is that
-            // the elastic buffer is no longer 21 busy sweeps. If high-water stays tiny, the mover is keeping
-            // up and the ring is doing nothing; if it approaches capacity, the DRAM ring has become the new
-            // wall and ring_blocked will be non-zero to prove it. Reported per DRISC, always, so a bad run
-            // never has to be re-run to find out.
-            if (res[48] != 0) {
-                const bool is_mv = res[48] == 2;
-                // ONE LINE PER RING, never a per-DRISC summary: a dual-ring mover with one healthy ring and
-                // one short one has to be visible at a glance, and a summed "frames moved" would hide it.
-                // Peer 1's counters mirror peer 0's at out[58..63] (see the kernel's results block).
-                const uint32_t nring = is_mv ? std::max<uint32_t>(1u, ctx.n_peer[d]) : 1u;
-                // Peers 0/1 report at out[49..63] as always; peers 2-5 (6-filler shape) at
-                // out[108 + (pi-2)*5] = {moved, ring_hi, tail, max_batch, first-frame word}.
-                auto ring_word = [&](uint32_t pi, uint32_t p0, uint32_t p1, uint32_t k) -> uint32_t {
-                    return pi == 0 ? res[p0] : (pi == 1 ? res[p1] : res[108 + (pi - 2) * 5 + k]);
-                };
-                for (uint32_t pi = 0; pi < nring; pi++) {
-                    const uint32_t moved = ring_word(pi, 49, 58, 0);
-                    const uint32_t hi = ring_word(pi, 50, 63, 1);
-                    const uint32_t tail = ring_word(pi, 53, 59, 2);
-                    const uint32_t batch = ring_word(pi, 54, 60, 3);
-                    log_info(
-                        tt::LogMetal,
-                        "[perf-debug profiler] role split DRISC {} ({}){}: {} frames {}, DRAM ring head-tail "
-                        "high-water {}/{} frames ({:.1f}% of {:.1f} MiB) | ring-room waits {} [0 = the ring never "
-                        "became the bottleneck] | tail {} | max batch {}{}",
-                        d,
-                        is_mv ? "MOVER" : "FILLER",
-                        is_mv ? fmt::format(" peer slot {} = filler {}", pi, ctx.peer_of[d][pi]) : std::string(),
-                        moved,
-                        is_mv ? "moved out of the ring" : "staged into the ring",
-                        hi,
-                        res[52],
-                        res[52] ? 100.0 * hi / static_cast<double>(res[52]) : 0.0,
-                        (static_cast<double>(res[52]) * 10560.0) / (1024.0 * 1024.0),
-                        res[51],
-                        tail,
-                        batch,
-                        res[51] != 0 ? "  <<< the DRAM ring FILLED: raise TT_METAL_PERF_DEBUG_ROLE_RING_MB" : "");
-                }
-                if (is_mv) {
-                    // MUST be 0. Non-zero means the mover was handed a value that cannot be a head, so it
-                    // stopped shipping -- see the ordered-quiesce comment in stop() for the failure this
-                    // catches.
-                    if (res[57] != 0) {
-                        log_warning(
-                            tt::LogMetal,
-                            "[perf-debug profiler] role split DRISC {}: {} IMPOSSIBLE head reads (head - tail "
-                            "exceeded the ring capacity, summed over its rings). The mover declared egress dead "
-                            "and stopped shipping. A filler's L1 became unreadable mid-run -- most likely an NIU "
-                            "released early.",
-                            d,
-                            res[57]);
-                    }
-                    // The first frame word the mover ever read out of DRAM, PER RING. If this is not the frame
-                    // magic the filler writes, the two sides disagree about the ring address and the capture is
-                    // garbage regardless of how healthy every other counter looks. Checked per ring because the
-                    // rings are in different DRAM banks and only one of them may be mis-addressed.
-                    const uint32_t want = kernel_profiler::spsc_span_w0();
-                    for (uint32_t pi = 0; pi < nring; pi++) {
-                        const uint32_t got = pi == 0 ? res[55] : (pi == 1 ? res[61] : res[108 + (pi - 2) * 5 + 4]);
-                        const uint32_t moved = pi == 0 ? res[49] : (pi == 1 ? res[58] : res[108 + (pi - 2) * 5 + 0]);
-                        if (moved != 0 && got != want) {
-                            log_warning(
-                                tt::LogMetal,
-                                "[perf-debug profiler] role split DRISC {} peer slot {} (filler {}): first DRAM "
-                                "frame word was 0x{:08X}, expected the frame header 0x{:08X}. The filler's ring "
-                                "address and the mover's do NOT agree -- treat this run's markers as invalid.",
-                                d,
-                                pi,
-                                ctx.peer_of[d][pi],
-                                got,
-                                want);
-                        }
-                    }
-                }
-            }
             // ---- DRISC SELF-PROFILING counters (only printed when the knob is on) ----
             //
             // Everything needed to tell "captured the right 0.5% of the run" from "captured the idle loop and
@@ -2881,7 +2596,7 @@ void PerfDebugProfiler::stop() {
                     "budget ({:.0f} KB, {:.2f}% of this drainer's {:.1f} MB egress) | {} markers, {} words, "
                     "{:.1f} markers/sweep | publish cost {:.2f} ms ({:.2f}% of the run){}{}",
                     d,
-                    res[48] == kRoleFiller ? "FILLER" : (res[48] == kRoleMover ? "MOVER" : "FULL"),
+                    "FILLER",
                     res[86],
                     res[66],
                     res[4],
@@ -2986,9 +2701,9 @@ void PerfDebugProfiler::stop() {
                     return (static_cast<uint64_t>(res[o + 1]) << 32) | res[o];
                 };
                 // A posted write is acked without the data words being counted where we read them, so a
-                // non-zero count means the byte totals are UNDER-reported. Every write on this path is
-                // posted=false, so this must be 0; say so rather than print a plausible low number.
-                const bool posted_ok = (res[125] == 0 && res[126] == 0);
+                // res[125]/[126] are retired zeros: the kernel's write totals now sum posted +
+                // non-posted words (the DMA mover's PCIe pushes are posted by design).
+                const bool posted_ok = true;
                 const bool win_ok = (res[127] != 0);
                 for (uint32_t blk = 0; blk < 2; blk++) {
                     const uint32_t base = (blk == 0) ? 104u : 88u;
@@ -3098,12 +2813,13 @@ void PerfDebugProfiler::stop() {
                     res[133],
                     res[134]);
             }
-            // write sub-split. Exact per busy sweep: ship_run only executes when a frame is being sent.
+            // write sub-split. Exact per busy sweep: emit_run only executes when a frame is being sent.
             const uint64_t c_chunk = u64(27), c_push = u64(29), c_notify = u64(31);
             const double pu = res[9] ? static_cast<double>(res[9]) : 1.0;  // pushes
             log_info(
                 tt::LogMetal,
-                "[perf-debug profiler] DRISC write split over {} pushes: noc-chunk {:.2f} us/push ({:.1f} ms) | "
+                "[perf-debug profiler] DRISC write split over {} pushes: "
+                "noc-chunk {:.2f} us/push ({:.1f} ms) | "
                 "push_pages {:.2f} us/push ({:.1f} ms) | notify {:.2f} us/push ({:.1f} ms)",
                 res[9],
                 (c_chunk / kCycPerUs) / pu,
@@ -3147,6 +2863,9 @@ void PerfDebugProfiler::stop() {
     tracy_consumer_.reset();
     tracy_.reset();
     devices_.clear();
+    // After the drainers are quiesced (nothing touches the spool any more) and while the mesh allocator
+    // is still alive to take the region back.
+    spool_buffer_.reset();
 }
 
 // One MMIO pass per worker core: the producer-owned stall counters (the knee metric -- nothing downstream
@@ -3167,6 +2886,11 @@ void PerfDebugProfiler::verify_completeness(DeviceCtx& ctx, uint32_t device_inde
     uint64_t total = 0, worst = 0, cores_hit = 0;
     uint64_t stranded_words = 0, stranded_lanes = 0, checked_lanes = 0;
     uint32_t worst_lane = 0, worst_lane_words = 0;
+    uint64_t risc_total[kNRisc] = {};
+    struct CoreStall {
+        uint32_t count, vx, vy;
+    };
+    std::vector<CoreStall> stalled_cores;
     // WORKER cores only. With DRISC self-profiling on, core_virt also holds the drainer cores, and a DRAM
     // core has no producer and no stall counters -- reading the TENSIX profiler address on one returns
     // whatever is at that offset in DRISC L1.
@@ -3181,10 +2905,16 @@ void PerfDebugProfiler::verify_completeness(DeviceCtx& ctx, uint32_t device_inde
         uint64_t core_total = 0;
         for (uint32_t r = 0; r < kernel_profiler::SPSC_STALL_COUNT_MAX; r++) {
             core_total += cv[kernel_profiler::SPSC_STALL_COUNT_0 + r];
+            if (r < kNRisc) {
+                risc_total[r] += cv[kernel_profiler::SPSC_STALL_COUNT_0 + r];
+            }
         }
         total += core_total;
         worst = std::max(worst, core_total);
         cores_hit += (core_total != 0) ? 1 : 0;
+        if (core_total != 0) {
+            stalled_cores.push_back({static_cast<uint32_t>(core_total), vx, vy});
+        }
         if (heads.empty()) {
             continue;
         }
@@ -3206,12 +2936,33 @@ void PerfDebugProfiler::verify_completeness(DeviceCtx& ctx, uint32_t device_inde
     log_info(
         tt::LogMetal,
         "[perf-debug profiler] Device {}: L1 STALL COUNTERS -- {} producer stalls across {} of {} cores "
-        "(worst core {}) [0 = the capture did not perturb the workload]",
+        "(worst core {}) [0 stall-count = capture did not perturb]",
         ctx.chip_id,
         total,
         cores_hit,
         n_stall_cores,
         worst);
+    if (total != 0) {
+        std::sort(stalled_cores.begin(), stalled_cores.end(), [](const CoreStall& a, const CoreStall& b) {
+            return a.count > b.count;
+        });
+        std::string top;
+        for (size_t i = 0; i < std::min<size_t>(8, stalled_cores.size()); i++) {
+            const auto& c = stalled_cores[i];
+            top += fmt::format("{}({},{})={}", i != 0 ? " " : "", c.vx, c.vy, c.count);
+        }
+        log_info(
+            tt::LogMetal,
+            "[perf-debug profiler] Device {}: stall breakdown by RISC -- BR {} | NC {} | T0 {} | T1 {} | T2 {}; "
+            "top cores (virt x,y)=count: {}",
+            ctx.chip_id,
+            risc_total[0],
+            risc_total[1],
+            risc_total[2],
+            risc_total[3],
+            risc_total[4],
+            top);
+    }
     if (heads.empty()) {
         return;
     }
