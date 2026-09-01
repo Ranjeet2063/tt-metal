@@ -172,7 +172,8 @@ static_assert(
 #define I_ZONE_SWEEP() ZoneSweep z_sweep(self_mark_now)                                                         //
 #define I_CV_BEGIN() const uint64_t t_cv0 = kInstr != 0 ? instr_now() : 0                                       //
 #define I_CV_ZONE() ZoneRead z_cv(self_mark_phase); const uint64_t t_cvw0 = kSvcInstr != 0 ? instr_now() : 0    //
-#define I_CV_ISSUED() instr_add32(n_cv_rd, num_cores)                                                           //
+#define I_CV_ISSUED() instr_add32(n_cv_rd, cv_chunk)                                                            //
+#define I_LATE_CVS() instr_add32(n_cv_rd, num_cores - scan_hi)                                                  //
 #define I_CV_WAITED() svc_note_max(true, max_cvw, max_cvw_at, t_cvw0)                                           //
 #define I_CV_END() instr_cv_end(t_cv0)                                                                          //
 #define I_SCAN_BEGIN() const uint64_t t_scan0 = kInstr != 0 ? instr_now() : 0                                   //
@@ -235,10 +236,8 @@ void kernel_main() {
     // arithmetic would otherwise run at every issue site of a sweep that is instruction-stream
     // bound.
     static uint64_t core_noc[kMaxCores];
-    static uint32_t core_xy[kMaxCores];
     for (uint32_t i = 0; i < num_cores; i++) {
         const uint32_t xy = coords[i];
-        core_xy[i] = xy;
         core_noc[i] = get_noc_addr(xy & 0xFFFFu, xy >> 16, cv_src);
     }
     // Resync the software NoC counter mirrors from hardware. They persist across launches on this
@@ -249,9 +248,7 @@ void kernel_main() {
         noc_local_state_init(kReadNoc);
     }
     I_NOC_IDX_BEFORE();
-    Noc noc{kReadNoc};
     I_NOC_IDX_AFTER();
-    UnicastEndpoint src;
 
     SocketSenderInterface sender = create_sender_socket_interface(kSocketConfigAddr);
     const uint32_t pcie_xy_enc = kPcieEncOverride != 0 ? kPcieEncOverride : sender.d2h.pcie_xy_enc;
@@ -1450,15 +1447,12 @@ void kernel_main() {
                     // Responses can arrive out of order, so a counted response may belong to a
                     // later core -- a chunk core then scans last sweep's tails, which are stale but
                     // valid (tails are monotonic): it under-ships and catches up next visit.
-                    for (uint32_t i = 0; i < num_cores; i++) {
-                        const uint32_t xy = core_xy[i];
-                        CoreLocalMem<uint32_t> dst(kCvBase + i * kCvReadBytes);
-                        noc.async_read<NocOptions::DEFAULT, kCvReadBytes>(
-                            src,
-                            dst,
-                            kCvReadBytes,
-                            {.noc_x = xy & 0xFFFFu, .noc_y = xy >> 16, .addr = cv_src + kCvReadSrcOff},
-                            {});
+                    // Only the first chunk's CVs are read here; the rest of the grid's are issued
+                    // at the refill pause, mid-sweep, so the late scan sees tails fresh enough to
+                    // catch a core that started producing in this very sweep.
+                    for (uint32_t i = 0; i < cv_chunk; i++) {
+                        noc_async_read<kCvReadBytes>(
+                            core_noc[i] + kCvReadSrcOff, kCvBase + i * kCvReadBytes, kCvReadBytes, kReadNoc);
                     }
                     I_CV_ISSUED();
                     while (NOC_STATUS_READ_REG(kReadNoc, NIU_MST_RD_RESP_RECEIVED) - rd0 < cv_chunk) {
@@ -1560,7 +1554,7 @@ void kernel_main() {
                 // capacity is a multiple of the alignment.
                 auto issue_core = [&](uint32_t c, uint32_t sl) {
                     const uint32_t slot = kStageBase + sl * kSlotBytes;
-                    const uint32_t xy = core_xy[c];
+                    const uint32_t xy = coords[c];
                     const tt_l1_ptr uint32_t* __restrict tails =
                         reinterpret_cast<const tt_l1_ptr uint32_t*>(kCvBase + c * kCvReadBytes);
                     uint32_t* __restrict mine = &head_mirror[c * kNumRisc];
@@ -1792,9 +1786,19 @@ void kernel_main() {
                     }
                     break;
                 }
-                // The rest of the grid's CV reads flew behind the batches above. Wait on the
-                // response count, not a full barrier: gather responses also bump it, which only
-                // ever lets a scan see last sweep's tails -- stale but valid, a benign under-ship.
+                // The rest of the grid's CV reads issue HERE, mid-sweep, not at sweep start:
+                // the late scan runs mid-sweep either way, and sweep-start data maximizes the
+                // staleness of exactly the cores scanned last. Read now, their tails can show a
+                // core that started producing during this sweep, cutting the join blind window by
+                // most of a sweep. Same reads, later timing.
+                for (uint32_t i = scan_hi; i < num_cores; i++) {
+                    noc_async_read<kCvReadBytes>(
+                        core_noc[i] + kCvReadSrcOff, kCvBase + i * kCvReadBytes, kCvReadBytes, kReadNoc);
+                }
+                I_LATE_CVS();
+                // Wait on the response count, not a full barrier: gather responses also bump it,
+                // which only ever lets a scan see stale-but-valid tails (monotonic) -- a benign
+                // under-ship.
                 while (NOC_STATUS_READ_REG(kReadNoc, NIU_MST_RD_RESP_RECEIVED) - rd0 < num_cores) {
                 }
                 invalidate_l1_cache();
