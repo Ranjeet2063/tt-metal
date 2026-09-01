@@ -297,6 +297,11 @@ __attribute__((noinline)) void ring_ensure_room_slow(uint32_t nwords) {
 // the difference is the reserve). L1 is touched only to refresh the cache when it runs dry.
 inline __attribute__((always_inline)) void ring_ensure_room(uint32_t nwords) {
     if (__builtin_expect((wIndex - g_head_cache) > (RING_USABLE - nwords), 0)) {
+        // Invalidate BEFORE the refresh: the drainer's head write-back arrives over the NoC, which
+        // the core's L1 read cache does not observe -- without this, a ring the drainer already
+        // freed re-reads as full and the slow path opens (and counts) a stall the producer never
+        // had to take. Once per near-full episode, never per packet.
+        invalidate_l1_cache();
         g_head_cache = profiler_control_buffer[HEAD_INDEX];
         if ((wIndex - g_head_cache) > (RING_USABLE - nwords)) {
             ring_ensure_room_slow(nwords);
