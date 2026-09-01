@@ -344,6 +344,20 @@ constexpr std::uint32_t spsc_span_pack_pad(std::uint32_t start_counter, std::uin
     return (start_counter - frame_off_words) & (SPSC_SPAN_PACK_ALIGN_WORDS - 1u);
 }
 
+// A wrapping run ships as its whole ring image ONLY when the dead remainder is small. The one-read
+// image saves a NoC issue on the drainer's critical path, which pays exactly at the saturation
+// boundary -- where runs are near-full and the remainder is a few words. At sustained rates runs
+// wrap at a few hundred words, and shipping the image inflates egress bytes by the remainder
+// (measured +33% at delay 9, enough to push the drain past its equilibrium ceiling: sustained knee
+// 9 -> 12). Below the threshold the run ships as the two-piece wrap split, byte-exact. Both sides
+// derive the condition from (start, extent) alone, so the wire carries no flag -- but they MUST
+// use this one predicate: a disagreement mis-walks every lane after the first.
+constexpr static std::uint32_t SPSC_SPAN_WRAP_IMAGE_MAX_PAD_WORDS = 64;
+constexpr bool spsc_span_wrap_image(std::uint32_t start, std::uint32_t extent, std::uint32_t ring_cap) {
+    return (start & (ring_cap - 1u)) + extent > ring_cap &&
+           ring_cap - extent <= SPSC_SPAN_WRAP_IMAGE_MAX_PAD_WORDS;
+}
+
 inline std::uint32_t spsc_span_w0() { return SPSC_SPAN_PACKET_TYPE << SPSC_SPAN_TYPE_SHIFT; }
 
 // Compact on-wire control block for PACKED span frames: just the words the decoder walks. The L1

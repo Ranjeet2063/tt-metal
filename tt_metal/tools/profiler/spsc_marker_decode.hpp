@@ -681,13 +681,13 @@ inline uint32_t spsc_decode_frame(
         }
         const uint32_t start = tail - extent;
         const uint32_t* p = nullptr;
-        // A packed lane whose run WRAPS the ring arrives as the WHOLE RING IMAGE, ring-ordered, in
-        // one device read (the wrap split it saves is a whole NoC issue on the drainer's critical
-        // path). The key -- start phase + extent crossing capacity -- is computed identically on
-        // both sides, the pad is then phased for ring offset 0, and the payload advance is the full
-        // ring, not the extent.
+        // A packed lane whose NEAR-FULL run wraps the ring arrives as the WHOLE RING IMAGE,
+        // ring-ordered, in one device read; a small wrapping run arrives as the two-piece split,
+        // already in run order. The predicate is shared with the device (spsc_span_wrap_image), the
+        // pad is then phased for ring offset 0, and the payload advance is the full ring, not the
+        // extent.
         const bool ring_ordered =
-            !raw && extent != 0 && (start & kSpscRingMask) + extent > kSpscRingCap;
+            !raw && extent != 0 && kernel_profiler::spsc_span_wrap_image(start, extent, kSpscRingCap);
         if (!raw && extent != 0) {
             off += kernel_profiler::spsc_span_pack_pad(ring_ordered ? 0u : start, off);
             p = frame + off;
