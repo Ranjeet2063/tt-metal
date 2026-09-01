@@ -8,6 +8,7 @@
 #include "data_format.hpp"
 #include <algorithm>
 #include <cstdint>
+#include <span>
 #include <tt_backend_api_types.hpp>
 #include <cstddef>
 #include <cstring>
@@ -123,6 +124,47 @@ bool write_named_ct_arg_map_header(const string& out_dir, const JitBuildSettings
     return true;
 }
 
+/**
+ * Emit get_binding_if_present() helper for a given binding type.
+ *
+ * get_binding_if_present() is a helper function on the device side that performs lookup of the resource binding token
+ * by name. The function returns a pointer to the binding token if found, otherwise nullptr.
+ *
+ * This is used by kernels to check if a binding is present when kernel is meant to be reusable across different
+ * programs.
+ */
+template <typename Entry>
+void emit_programatic_binding_token_getter(ostream& content, const vector<Entry>& entries) {
+    // Function header
+    content << "template <::internal::TemplateString name>\n"
+            // Using auto to avoid pulling in includes when no bindings are emitted.
+            << "constexpr auto get_binding_if_present() {\n";
+
+    // If statements for each entry, switching between `if constexpr` and `else if constexpr`
+    const char* if_kw = "    if constexpr";
+    for (const auto& entry : entries) {
+        // Emits equivlanet to:
+        // if constexpr (name == "entry_name") {
+        //     return &entry_name;
+        // }
+        content << if_kw << " (name == \"" << entry.name << "\") {\n"
+                << "        return &" << entry.name << ";\n";
+
+        if_kw = "    } else if constexpr";
+    }
+
+    // Emit "cannot find binding" case
+    if (entries.empty()) {
+        content << "   return nullptr;\n";
+    } else {
+        content << "    } else {\n"
+                << "        return nullptr;\n"
+                << "    }\n";
+    }
+
+    content << "}\n";
+}
+
 // METAL 2.0 only:
 // This is only invoked for Metal 2.0 kernels created via the new ProgramSpec host APIs.
 // Legacy kernels (created via CreateKernel) do not get kernel_bindings_generated.h.
@@ -132,17 +174,25 @@ void write_kernel_bindings_generated_header(const string& out_dir, const JitBuil
     // Get the DFB bindings from the settings callback
     // Sort them to ensure the file output is deterministic for the JIT build cache
     // (aka the on-disk per-object dephash cache)
-    vector<pair<string, uint16_t>> dfb_entries;
+    struct DfbEntry {
+        string name;
+        uint16_t id;
+    };
+    vector<DfbEntry> dfb_entries;
     settings.process_dataflow_buffer_binding_handles(
-        [&dfb_entries](const string& name, uint16_t id) { dfb_entries.emplace_back(name, id); });
-    sort(dfb_entries.begin(), dfb_entries.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        [&dfb_entries](const string& name, uint16_t id) { dfb_entries.push_back({name, id}); });
+    sort(dfb_entries.begin(), dfb_entries.end(), [](const auto& a, const auto& b) { return a.name < b.name; });
 
     // Get the semaphore bindings from the settings callback
     // Sort them to ensure the file output is deterministic, as explained above
-    vector<pair<string, uint16_t>> sem_entries;
+    struct SemEntry {
+        string name;
+        uint16_t id;
+    };
+    vector<SemEntry> sem_entries;
     settings.process_semaphore_binding_handles(
-        [&sem_entries](const string& name, uint16_t id) { sem_entries.emplace_back(name, id); });
-    sort(sem_entries.begin(), sem_entries.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        [&sem_entries](const string& name, uint16_t id) { sem_entries.push_back({name, id}); });
+    sort(sem_entries.begin(), sem_entries.end(), [](const auto& a, const auto& b) { return a.name < b.name; });
 
     // Get the tensor binding handles from the settings callback
     // Tensor bindings come from a std::vector populated in user-specified order, so no sort is needed here.
@@ -204,131 +254,90 @@ void write_kernel_bindings_generated_header(const string& out_dir, const JitBuil
     ostringstream content;
     content << "// AUTO-GENERATED — do not edit.\n\n"
                "#pragma once\n\n";
-    if (dfb_entries.empty() && sem_entries.empty() && ta_entries.empty() && scratch_entries.empty() &&
-        tensor_binding_sequence_entries.empty()) {
-        content << "// No bindings for this kernel.\n";
-    } else {
-        content << "#include \"internal/template_string.h\"\n";
-        if (!dfb_entries.empty()) {
-            content << "#include \"api/dataflow/dataflow_buffer.h\"\n";
-        }
-        if (!sem_entries.empty()) {
-            content << "#include <cstdint>\n";
-        }
-        if (!ta_entries.empty()) {
-            // This header defines TensorBindingToken, a type which can be used
-            // to construct a TensorAccessor or LocalTensorAccessor.
-            content << "#include \"api/tensor/tensor_binding_token.h\"\n";
-        }
-        if (!tensor_binding_sequence_entries.empty()) {
-            content << "#include <tuple>\n";
-        }
-        if (!scratch_entries.empty()) {
-            // The full Scratchpad type (NOC-free, so it compiles on both data-movement and
-            // compute/TRISC builds), which also pulls in the ScratchpadBindingToken type.
-            content << "#include \"api/scratchpad.h\"\n";
-        }
-        content << "\n";
 
-        if (!dfb_entries.empty()) {
-            content << "namespace dfb {\n";
-            for (const auto& [name, id] : dfb_entries) {
-                content << "constexpr DFBBindingToken " << name << "{" << id << "};\n";
-            }
-
-            content << "template <::internal::TemplateString name>\n"
-                    << "constexpr const DFBBindingToken* get_binding_if_present() {\n";
-            const char* if_kw = "    if constexpr";
-            for (const auto& entry : dfb_entries) {
-                content << if_kw << " (name == \"" << entry.first << "\") {\n"
-                        << "        return &" << entry.first << ";\n";
-                if_kw = "    } else if constexpr";
-            }
-            content << "    } else {\n"
-                    << "        return nullptr;\n"
-                    << "    }\n";
-            content << "}\n";
-
-            content << "}  // namespace dfb\n";
-        }
-
-        if (!sem_entries.empty()) {
-            content << "namespace sem {\n";
-            for (const auto& [name, id] : sem_entries) {
-                content << "constexpr std::uint32_t " << name << " = " << id << "u;\n";
-            }
-            content << "}  // namespace sem\n";
-        }
-
-        if (!ta_entries.empty()) {
-            // TensorBindingToken<CTA_OFFSET, ADDR_CRTA_OFFSET>: pairs the binding's
-            // static layout metadata (TensorAccessorArgs<CTA_OFFSET>) with the byte offset of
-            // its implicit base-address CRTA.
-            // The kernel-side TensorAccessor (or LocalTensorAccessor) constructor unpacks both pieces.
-            //
-            // Per-binding type alias (`<name>_t`) lets the framework extend the underlying token
-            // template with extra metadata in the future without touching kernel source.
-            //
-            // Tensor binding sequences are constexpr std::tuple of those member tokens (members order).
-            content << "namespace tensor {\n";
-            for (const auto& entry : ta_entries) {
-                content << "using " << entry.name << "_t = ::tensor_accessor::TensorBindingToken<" << entry.cta_offset
-                        << "u, " << entry.addr_crta_offset << "u>;\n";
-                content << "constexpr " << entry.name << "_t " << entry.name << "{};\n";
-            }
-
-            // return type is auto as individual binding tokens have different template parameters.
-            content << "template <::internal::TemplateString name>\n"
-                    << "constexpr auto get_binding_if_present() {\n";
-            const char* if_kw = "    if constexpr";
-            for (const auto& entry : ta_entries) {
-                content << if_kw << " (name == \"" << entry.name << "\") {\n"
-                        << "        return &" << entry.name << ";\n";
-                if_kw = "    } else if constexpr";
-            }
-            content << "    } else {\n"
-                    << "        return nullptr;\n"
-                    << "    }\n";
-
-            content << "}\n";
-
-            for (const auto& sequence : tensor_binding_sequence_entries) {
-                content << fmt::format(
-                    "constexpr auto {} = std::make_tuple({});\n", sequence.name, fmt::join(sequence.members, ", "));
-            }
-
-            content << "}  // namespace tensor\n";
-        }
-
-        if (!scratch_entries.empty()) {
-            // ScratchpadBindingToken scratchpad_accessor_name{ADDR_CRTA_WORD, SIZE_BYTES}
-            // Carries the word index of the scratchpad's (framework-allocated) base-address CRTA
-            // and the scratchpad's compile-time per-node size.
-            // The kernel-side Scratchpad(token) constructor unpacks both.
-            // The token's members are opaque, so the framework can extend it later without touching
-            // kernel source.
-            content << "namespace scratch {\n";
-            for (const auto& entry : scratch_entries) {
-                content << "constexpr ScratchpadBindingToken " << entry.name << "{" << entry.addr_crta_word << "u, "
-                        << entry.size_bytes << "u};\n";
-            }
-
-            content << "template <::internal::TemplateString name>\n"
-                    << "constexpr const ScratchpadBindingToken* get_binding_if_present() {\n";
-            const char* if_kw = "    if constexpr";
-            for (const auto& entry : scratch_entries) {
-                content << if_kw << " (name == \"" << entry.name << "\") {\n"
-                        << "        return &" << entry.name << ";\n";
-                if_kw = "    } else if constexpr";
-            }
-            content << "    } else {\n"
-                    << "        return nullptr;\n"
-                    << "    }\n";
-            content << "}\n";
-
-            content << "}  // namespace scratch\n";
-        }
+    content << "#include \"internal/template_string.h\"\n";
+    if (!dfb_entries.empty()) {
+        content << "#include \"api/dataflow/dataflow_buffer.h\"\n";
     }
+    if (!sem_entries.empty()) {
+        content << "#include <cstdint>\n";
+    }
+    if (!ta_entries.empty()) {
+        // This header defines TensorBindingToken, a type which can be used
+        // to construct a TensorAccessor or LocalTensorAccessor.
+        content << "#include \"api/tensor/tensor_binding_token.h\"\n";
+    }
+    if (!tensor_binding_sequence_entries.empty()) {
+        content << "#include <tuple>\n";
+    }
+    if (!scratch_entries.empty()) {
+        // The full Scratchpad type (NOC-free, so it compiles on both data-movement and
+        // compute/TRISC builds), which also pulls in the ScratchpadBindingToken type.
+        content << "#include \"api/scratchpad.h\"\n";
+    }
+    content << "\n";
+
+    // Emit DFB bindings
+    content << "namespace dfb {\n";
+    for (const auto& entry : dfb_entries) {
+        content << "constexpr DFBBindingToken " << entry.name << "{" << entry.id << "};\n";
+    }
+    emit_programatic_binding_token_getter(content, dfb_entries);
+    content << "}  // namespace dfb\n";
+
+    // Emit Semaphore bindings
+    content << "namespace sem {\n";
+    for (const auto& entry : sem_entries) {
+        content << "constexpr std::uint32_t " << entry.name << " = " << entry.id << "u;\n";
+    }
+    emit_programatic_binding_token_getter(content, sem_entries);
+    content << "}  // namespace sem\n";
+
+    // Emit Tensor bindings
+    content << "namespace tensor {\n";
+    // TensorBindingToken<CTA_OFFSET, ADDR_CRTA_OFFSET>: pairs the binding's
+    // static layout metadata (TensorAccessorArgs<CTA_OFFSET>) with the byte offset of
+    // its implicit base-address CRTA.
+    // The kernel-side TensorAccessor (or LocalTensorAccessor) constructor unpacks both pieces.
+    //
+    // Per-binding type alias (`<name>_t`) lets the framework extend the underlying token
+    // template with extra metadata in the future without touching kernel source.
+    //
+    // Tensor binding sequences are constexpr std::tuple of those member tokens (members order).
+    for (const auto& entry : ta_entries) {
+        content << "using " << entry.name << "_t = ::tensor_accessor::TensorBindingToken<" << entry.cta_offset << "u, "
+                << entry.addr_crta_offset << "u>;\n";
+        content << "constexpr " << entry.name << "_t " << entry.name << "{};\n";
+    }
+
+    emit_programatic_binding_token_getter(content, ta_entries);
+
+    // Emit TensorBindingToken sequences
+    for (const auto& sequence : tensor_binding_sequence_entries) {
+        content << fmt::format(
+            "constexpr auto {} = std::make_tuple({});\n", sequence.name, fmt::join(sequence.members, ", "));
+    }
+
+    content << "}  // namespace tensor\n";
+
+    // Emit Scratchpad bindings
+    content << "namespace scratch {\n";
+
+    // ScratchpadBindingToken scratchpad_accessor_name{ADDR_CRTA_WORD, SIZE_BYTES}
+    // Carries the word index of the scratchpad's (framework-allocated) base-address CRTA
+    // and the scratchpad's compile-time per-node size.
+    // The kernel-side Scratchpad(token) constructor unpacks both.
+    // The token's members are opaque, so the framework can extend it later without touching
+    // kernel source.
+    for (const auto& entry : scratch_entries) {
+        content << "constexpr ScratchpadBindingToken " << entry.name << "{" << entry.addr_crta_word << "u, "
+                << entry.size_bytes << "u};\n";
+    }
+
+    emit_programatic_binding_token_getter(content, scratch_entries);
+
+    content << "}  // namespace scratch\n";
+
     write_file(path, content.str());
 }
 
