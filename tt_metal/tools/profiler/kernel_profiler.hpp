@@ -45,7 +45,11 @@
 // kernels contain DeviceZoneScoped* sites, and no drainer serves dispatch cores. Without the
 // !DISPATCH_KERNEL clause a dispatch core fills its blocking ring and the NEXT device open's drainer
 // bring-up wedges at its write barrier (heartbeat stuck, phase=11).
-#if defined(PROFILE_KERNEL) && !defined(DISPATCH_KERNEL)
+// PERF_DEBUG_DRAIN_KERNEL opts the streaming profiler's own drain kernel out for the same reason (no
+// drainer serves a DRAM core, so its producer ring is write-only dead weight) plus a harder one: the
+// producer machinery is ~1 KB of a code region the drain kernel has already overflowed twice. Its
+// self-profiling rides its staging slots (SpscZoneScope in profiler_common.h), not this producer.
+#if defined(PROFILE_KERNEL) && !defined(DISPATCH_KERNEL) && !defined(PERF_DEBUG_DRAIN_KERNEL)
 
 #if defined(KERNEL_BUILD) && !defined(COMPILE_FOR_ERISC)
 // Kernel-link stack floor (kernel_<risc>.ld), for the stack canary below. Declared at GLOBAL scope --
@@ -98,9 +102,9 @@ TT_ZONE_DEFINE_ID(PROFILER_STALL_ZONE_ID, "PRODUCER-STALL");
 // build lacks that include path). word0 = type(5) | low27. A zone ships WHOLE at scope close, sized
 // by need: a 2-word ZONE_S when its end sits within 2^16 cycles of the lane cursor (the previous
 // S/ATOMIC zone's end) and its duration fits 16 bits, else the 3-word ZONE_ATOMIC (id | end timer_low
-// | duration), which also re-anchors the cursor; a >3.2s duration ships as the self-contained 5-word
-// ZONE_L (two full 64-bit values). The legacy 2-word START/END markers have NO emitter here any more. Lane identity and
-// time's high half are host-reconstructed from stickies: STICKY_PROG (runtime host-id, 1 word; 2-word PROG_EXT past
+// | duration), which also re-anchors the cursor; the legacy 2-word START/END markers survive only for
+// the stall zone and the >3.2s fallback. Lane identity and time's high half
+// are host-reconstructed from stickies: STICKY_PROG (runtime host-id, 1 word; 2-word PROG_EXT past
 // 2^27), STICKY_TIMER (timer_hi, on high-half tick), STICKY_SRC (injected by the drainer reader).
 struct ppfmt {
     static constexpr uint32_t TYPE_SHIFT = 27;
@@ -108,8 +112,8 @@ struct ppfmt {
     static constexpr uint32_t LOW27_MASK = 0x7FFFFFFu;
     // This wire's OWN type space -- never pass a hostdevcommon PacketTypes value through (that aliased
     // unrelated types on this wire before). Retired values (11 = ZONE_TOTAL) are never reused.
-    static constexpr uint32_t T_ZONE_START = 0u;        // PP_ZONE_START (retired from this producer; decode-only)
-    static constexpr uint32_t T_ZONE_END = 1u;          // PP_ZONE_END   (retired from this producer; decode-only)
+    static constexpr uint32_t T_ZONE_START = 0u;        // PP_ZONE_START (stall zone + long-zone fallback only)
+    static constexpr uint32_t T_ZONE_END = 1u;          // PP_ZONE_END   (stall zone + long-zone fallback only)
     static constexpr uint32_t T_ZONE_ATOMIC = 2u;       // PP_ZONE_ATOMIC (3 words: id | end_lo | duration)
     static constexpr uint32_t T_ZONE_S = 3u;            // PP_ZONE_S (2 words: id | end_delta16<<16 | dur16)
     static constexpr uint32_t T_ZONE_L = 4u;            // PP_ZONE_L (5 words: id | end_lo | end_hi | dur_lo | dur_hi)
@@ -143,13 +147,9 @@ static constexpr uint32_t SPSC_MARKER_WORDS = 2;
 // Last high half emitted in a STICKY_TIMER; ~0 forces a fresh sticky on a launch's first marker.
 [[maybe_unused]] static uint32_t g_prev_timer_hi = 0xFFFFFFFFu;
 
-// Lane cursor: the END of the last ZONE_S/ZONE_ATOMIC this RISC emitted, mirrored exactly by the
-// decoder (spsc_marker_decode.hpp) so a ZONE_S can carry its end as a 16-bit delta. ONLY those two
-// packet types move it, on both sides identically; the long-pair fallback leaves it stale, which is
-// merely conservative (the next zone's delta overflows and falls back to ZONE_ATOMIC, re-anchoring).
-// hi = ~0 marks the cursor INVALID -- any real (hi - cursor_hi) is then nonzero, so the S-class test
-// fails arithmetically and the first zone after a launch/rewind is always an absolute re-anchor. Set
-// at init_profiler() and on the idle-launch rewind, where the decoder never saw what we last wrote.
+// Lane cursor: the end of the last S/ATOMIC zone this producer emitted -- the base a ZONE_S's 16-bit
+// end delta counts from, mirrored exactly by the decoder. hi = ~0 is INVALID (no S can match it, so
+// the next zone ships ATOMIC and re-anchors both sides); set at init and on the idle-launch rewind.
 [[maybe_unused]] static uint32_t g_cursor_lo = 0;
 [[maybe_unused]] static uint32_t g_cursor_hi = 0xFFFFFFFFu;
 
@@ -158,6 +158,7 @@ static constexpr uint32_t SPSC_MARKER_WORDS = 2;
 // -- once per drained batch instead of once per packet (the per-packet L1 head load was measured as
 // the bulk of the in-zone overhead). 0 is the safe floor: head <= tail = wIndex's seed.
 [[maybe_unused]] static uint32_t g_head_cache = 0;
+
 
 // Branchless latched read: reading L latches the high half, H returns it -- the ORDER is the protocol.
 // Known tradeoff (tt-isa-documentation, TensixTile/DebugTimestamper.md): the latch is single-agent; a
@@ -199,27 +200,6 @@ inline __attribute__((always_inline)) void publish_tail_batched(uint32_t words_w
     }
 }
 
-// ZONE_ATOMIC packet size: word0 (type|id) + end timer_low + 32-bit duration.
-static constexpr uint32_t SPSC_ATOMIC_ZONE_WORDS = 3;
-
-// The stall reserve: the stall zone writes into a ring that is BY DEFINITION full, so its own words
-// can never come from the ordinary budget -- ordinary markers may only fill to RING_USABLE and the
-// reserve belongs to the stall zone alone.
-//
-// RE-DERIVED for atomic zones: the stall OPEN now writes NOTHING (its start timestamp rides in the
-// scope object, like every other zone), so the reserve only has to cover the CLOSE -- one 3-word
-// ZONE_ATOMIC packet plus the 1-word STICKY_TIMER a stall straddling a timer_hi tick needs. That is
-// 4 words, down from the 6 the START/END pair required (2 halves x (2-word marker + sticky)).
-//
-// MEASURED (bh-26, 6F+1M, RING_MB=448, 10k iters, 2 reps): those 2 recovered words ARE the knee.
-// Pinning the reserve back at 6 while keeping the atomic packet reproduces the old numbers exactly
-// (d7 2-4 stalls, d6 ~15k); at 4 the same build is CLEAN at d7 and ~10.5k at d6. So the atomic
-// conversion is knee-NEUTRAL on its own -- the gain is the smaller reserve it makes correct.
-constexpr uint32_t STALL_CLOSE_WORDS = SPSC_ATOMIC_ZONE_WORDS + 1;
-constexpr uint32_t STALL_RESERVE_WORDS = STALL_CLOSE_WORDS;
-constexpr uint32_t RING_USABLE = RING_CAPACITY - STALL_RESERVE_WORDS;
-static_assert(RING_USABLE > STALL_RESERVE_WORDS, "the ring is too small to carry a stall reserve");
-
 inline __attribute__((always_inline)) void ring_write_word(uint32_t v) {
     profiler_data_buffer[myRiscID].data[wIndex % RING_CAPACITY] = v;
     wIndex++;
@@ -237,6 +217,26 @@ inline __attribute__((always_inline)) void ring_write_sticky_timer(uint32_t hi) 
         g_prev_timer_hi = hi;
     }
 }
+
+// ZONE_ATOMIC packet size: word0 (type|id) + end timer_low + 32-bit duration.
+static constexpr uint32_t SPSC_ATOMIC_ZONE_WORDS = 3;
+
+// The stall reserve: the stall zone writes into a ring that is BY DEFINITION full, so its own words
+// can never come from the ordinary budget -- ordinary markers may only fill to RING_USABLE and the
+// reserve belongs to the stall zone alone.
+//
+// RE-DERIVED for atomic zones: the stall OPEN now writes NOTHING (its start timestamp rides in the
+// scope object, like every other zone), so the reserve only has to cover the CLOSE -- one 3-word
+// ZONE_ATOMIC packet plus the 1-word STICKY_TIMER a stall straddling a timer_hi tick needs. That is
+// 4 words, down from the 6 the START/END pair required (2 halves x (2-word marker + sticky)).
+//
+// MEASURED (Mo, bh-26, DRAM-ring pipeline, 2 reps): those 2 recovered words ARE the knee step --
+// pinning the reserve back at 6 while keeping the atomic packet reproduced the old numbers exactly,
+// so the atomic conversion is knee-NEUTRAL on its own; the gain is the smaller reserve it makes correct.
+constexpr uint32_t STALL_CLOSE_WORDS = SPSC_ATOMIC_ZONE_WORDS + 1;
+constexpr uint32_t STALL_RESERVE_WORDS = STALL_CLOSE_WORDS;
+constexpr uint32_t RING_USABLE = RING_CAPACITY - STALL_RESERVE_WORDS;
+static_assert(RING_USABLE > STALL_RESERVE_WORDS, "the ring is too small to carry a stall reserve");
 
 // Stall-zone close: ONE ZONE_ATOMIC packet, written STRAIGHT into the reserve with NO room check.
 // The missing check is the whole point -- ring_ensure_room() from here would re-enter the full-ring
@@ -274,8 +274,7 @@ struct profileScopeStall {
 
 // Full-ring path, out-of-line on purpose (one copy, not one per zone site). Bumps the L1 stall
 // counter (the host's decode-free knee ground truth), opens the stall zone, then waits for the
-// caller's words AND the stall zone's own closing packet, which is emitted (in the destructor here)
-// BEFORE the caller writes its words.
+// caller's words AND the zone's own closing half so the reserve is whole again for the next stall.
 __attribute__((noinline)) void ring_ensure_room_slow(uint32_t nwords) {
     if constexpr (myRiscID < SPSC_STALL_COUNT_MAX) {
         profiler_control_buffer[SPSC_STALL_COUNT_0 + myRiscID]++;
@@ -314,7 +313,7 @@ static constexpr uint32_t SPSC_ZONE_L_WORDS = 5;
 // cursor alone for L). The decoder normalizes it to a synthetic START/END pair for the pairing stack,
 // whose in-the-past START trips the per-lane order-regression diagnostic ONCE -- kept on purpose as
 // visibility: a >3.2 s on-device zone is a wedge, not a measurement. With this, NOTHING on a worker
-// emits the legacy wire pair any more (types 0/1 remain decode-only until they are retired).
+// emits the legacy wire pair except the pre-atomic stall path in stale cached ELFs.
 // Out of line: this path must cost nothing at the (always_inline) zone sites that can never take it.
 __attribute__((noinline)) void mark_zone_long(
     uint32_t timer_id, uint32_t start_hi, uint32_t start_lo, uint32_t end_hi, uint32_t end_lo) {
@@ -335,7 +334,7 @@ __attribute__((noinline)) void mark_zone_long(
 // jump on the lane. Worst case is 1-word sticky + the 3-word packet, so the check runs once.
 // The duration is a 64-bit subtract done as sub + borrow (rv32); hi_d != 0 means >= 2^32 cycles.
 inline __attribute__((always_inline)) void mark_zone_close(uint32_t timer_id, uint32_t start_hi, uint32_t start_lo) {
-    ring_ensure_room(SPSC_ATOMIC_ZONE_WORDS + 1);  // worst case (M + sticky); an S zone simply uses less
+    ring_ensure_room(SPSC_ATOMIC_ZONE_WORDS + 1);  // worst case (ATOMIC + sticky); an S zone simply uses less
     uint32_t hi, lo;
     read_wall_clock(hi, lo);
     const uint32_t lo_d = lo - start_lo;

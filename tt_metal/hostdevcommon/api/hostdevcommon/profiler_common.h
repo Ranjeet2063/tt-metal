@@ -197,14 +197,13 @@ enum SpscControlBuffer {
 // differently (a stale counter, a short read, an overlapping handshake). Was 64 and exactly full; the DRISC
 // self-profiling counters need out[64..87], and the NoC-footprint counters out[88..119].
 //
-// WHY 144 IS FREE, and why it must not be raised carelessly. This block lives inside the drain kernel's
-// `kMiscBytes` budget in perf_debug_profiler.cpp, which is 1024 B holding done(64) + stop(64) + results +
-// handshake(64). At 96 words that was 576 B of 1024, i.e. 448 B of slack, and 144 words spends 192 of it
-// (768 B total). Nothing else moves: `kMiscBytes` is unchanged, so `fixed` is unchanged, so the number of
-// STAGING SLOTS the same L1 can hold is unchanged -- which matters because nstage is 7 by a margin of well
-// under one slot, and losing one would silently drop a mover's max batch 7 -> 6. Raising this past ~208
-// words WOULD grow kMiscBytes and cost a staging slot. Check that arithmetic, not just this constant.
-static constexpr std::uint32_t SPSC_DRAIN_RESULT_WORDS = 144;
+// WHY 208 IS FREE, and why it must not be raised further. This block lives inside the drain kernel's
+// `kMiscBytes` budget in perf_debug_profiler.cpp, which is 1024 B holding done(64) + stop(64) + results.
+// 208 words is 832 B, so done + stop + results = 960 of 1024. Nothing else moves: `kMiscBytes` is
+// unchanged, so `fixed` is unchanged, so the number of STAGING SLOTS the same L1 can hold is unchanged --
+// which matters because nstage is 7 by a margin of well under one slot. Check that arithmetic, not just
+// this constant, before raising it past the budget.
+static constexpr std::uint32_t SPSC_DRAIN_RESULT_WORDS = 224;
 
 // ---- DRAINER-AUTHORED zones (DRISC self-profiling) --------------------------------------------------
 //
@@ -347,6 +346,17 @@ constexpr std::uint32_t spsc_span_pack_pad(std::uint32_t start_counter, std::uin
 
 inline std::uint32_t spsc_span_w0() { return SPSC_SPAN_PACKET_TYPE << SPSC_SPAN_TYPE_SHIFT; }
 
+// Compact on-wire control block for PACKED span frames: just the words the decoder walks. The L1
+// control vector is 64 words laid out for 24 RISCs (heads at 0..4 but tails at 24..28 and XY at 49),
+// and shipping it verbatim made ~50 dead words per frame in the loaded direction of the PCIe tile.
+// RAW (self) frames still carry the true vector at its L1 layout -- the w0 raw flag picks the geometry.
+constexpr static std::uint32_t SPSC_SPAN_WIRE_CTRL_WORDS = 16;
+enum SpscWireCtrl : std::uint32_t {
+    SPSC_WIRE_HEAD_0 = 0,  // ..4
+    SPSC_WIRE_TAIL_0 = 5,  // ..9
+    SPSC_WIRE_XY = 10,
+};
+
 // Layout flag in w0's reserved-zero low bits: set = the payload is the RAW span (control vector +
 // five whole rings at fixed offsets, ring wrap NOT resolved) instead of packed live runs. The drainer
 // ships whichever costs its egress less -- packing trades bytes for NoC write issues (~10 extra per
@@ -363,21 +373,19 @@ constexpr static std::uint32_t SPSC_SPAN_RAW_FLAG = 1u;
 // and the frame layout above all already live. Codes MUST match spsc_packet.h's PP_* -- asserted in
 // spsc_marker_decode.hpp, which is the one place that sees both headers.
 // Producer tail-publish batch (kernel_profiler.hpp publish_tail_batched): the published TAIL can lag
-// true ring occupancy by up to this many words between fenced publishes. The drainer's anti-stall
-// pacing valves subtract it, so they fire on the earliest occupancy the lag could be hiding.
-static constexpr std::uint32_t SPSC_PUBLISH_BATCH_WORDS = 64;
+// true ring occupancy by up to this many words between fenced publishes -- drainer-invisible occupancy
+// against the producer's 506-word bar. Must be a power of two. 16, not 64: the interleaved microbench
+// (device reset between runs, 200k zones/RISC) measured 64 at 59.82/60.31 cycles/zone and 16 at
+// 59.34/59.36 -- the "global producer-overhead knob" fear that once kept this at 64 has the sign
+// wrong, and the recovered margin is what the knee needed: with the barrier-hoisted heads, delay 10
+// goes 25-44 stalls to 0/0/0. NOT 8: it buys delay 9 (0-1 stalls) but measures 59.87 cycles/zone --
+// a real producer cost over 16 -- and producer overhead outranks the knee here by policy.
+static constexpr std::uint32_t SPSC_PUBLISH_BATCH_WORDS = 16;
 
-static constexpr std::uint32_t SPSC_TYPE_ZONE_START = 0;   // legacy pair (workers: >3.2s fallback only)
+static constexpr std::uint32_t SPSC_TYPE_ZONE_START = 0;   // legacy pair (workers: stall zone, >3.2s fallback)
 static constexpr std::uint32_t SPSC_TYPE_ZONE_END = 1;     // legacy pair
 static constexpr std::uint32_t SPSC_TYPE_ZONE_ATOMIC = 2;  // one whole zone: id | end timer_low | duration32
-// Variable-width zone family around ZONE_ATOMIC (the 3-word "medium"), sharing one decode-side model:
-// per lane both sides track a 64-bit CURSOR = the end of the last S/M zone (ends are monotonic per lane
-// -- zones are emitted at close, in end order -- which is what makes an end-relative delta unsigned).
-// ZONE_S encodes end = cursor + delta16 and start = end - dur16 in ONE payload word; ZONE_ATOMIC (M)
-// re-anchors the cursor with its absolute end. ZONE_L carries two full 64-bit values for the >3.2 s
-// case. Only S and M move the cursor, on both producer and decoder identically.
-static constexpr std::uint32_t SPSC_TYPE_ZONE_S = 3;  // 2 words: id | (end_delta16 << 16 | dur16)
-static constexpr std::uint32_t SPSC_TYPE_ZONE_L = 4;  // 5 words: id | end_lo | end_hi | dur_lo | dur_hi
+static constexpr std::uint32_t SPSC_TYPE_ZONE_L = 4;       // >3.2 s zone: id | end_lo | end_hi | dur_lo | dur_hi
 static constexpr std::uint32_t SPSC_TYPE_STICKY_TIMER = 9;
 static constexpr std::uint32_t SPSC_TIMER_HI_MASK = 0x7FFFFFFu;  // the 27-bit low field of word0
 
@@ -386,6 +394,10 @@ static constexpr std::uint32_t SPSC_TIMER_HI_MASK = 0x7FFFFFFu;  // the 27-bit l
 // EVERY copy of the packer at once -- this one, ppfmt in kernel_profiler.hpp, and pp_* in spsc_packet.h.
 inline std::uint32_t spsc_zone_atomic_w0(std::uint32_t zone_id) {
     return (SPSC_TYPE_ZONE_ATOMIC << SPSC_SPAN_TYPE_SHIFT) | (zone_id & TT_ZONE_ID_MASK);
+}
+
+inline std::uint32_t spsc_marker_w0(std::uint32_t type, std::uint32_t zone_id) {
+    return (type << SPSC_SPAN_TYPE_SHIFT) | (zone_id & TT_ZONE_ID_MASK);
 }
 inline std::uint32_t spsc_sticky_timer_w0(std::uint32_t timer_hi) {
     return (SPSC_TYPE_STICKY_TIMER << SPSC_SPAN_TYPE_SHIFT) | (timer_hi & SPSC_TIMER_HI_MASK);
@@ -403,30 +415,30 @@ inline std::uint32_t spsc_data_w2(std::uint32_t size_words) { return (size_words
 
 // ---- The drainer's zone scope ------------------------------------------------------------------------
 //
-// An ATOMIC RAII zone, same shape as a worker's profileScope: the constructor only reads the clock (via
-// NowFn, which returns the 64-bit device now or 0 when instrumentation is off), and the destructor ships
-// the whole zone as one ZONE_ATOMIC packet through CloseFn(word0, start). Identity, ELF record and
-// naming are identical to a worker zone; only the transport differs.
+// An ordinary RAII zone: the constructor stamps ZONE_START, the destructor stamps ZONE_END, each from its
+// own clock read. Identity, ELF record and naming are identical to a worker zone; only the transport is
+// different, and that arrives as `mark`, a callable taking a packed word0 and returning whether the
+// marker was actually written.
 //
-// start_ == 0 preserves the old started_ semantics: the drainer decides MID-SWEEP whether to instrument
-// (self_on in drisc_profiler_drain.cpp), and a zone opened while off stays off. A zone whose arming
-// turns off before it closes is dropped WHOLE by the close transport -- strictly better than the legacy
-// pair's orphan START.
-template <std::uint32_t ZoneId, typename NowFn, typename CloseFn>
+// `started_` exists because the drainer decides MID-SWEEP whether to instrument (see self_on in
+// drisc_profiler_drain.cpp): if the constructor did not write START, the destructor must not write an
+// orphan END.
+template <std::uint32_t ZoneId, typename MarkFn>
 class SpscZoneScope {
 public:
-    inline __attribute__((always_inline)) SpscZoneScope(NowFn& now, CloseFn& close) : close_(close), start_(now()) {}
+    inline __attribute__((always_inline)) explicit SpscZoneScope(MarkFn& mark) :
+        mark_(mark), started_(mark(spsc_marker_w0(SPSC_TYPE_ZONE_START, ZoneId))) {}
     inline __attribute__((always_inline)) ~SpscZoneScope() {
-        if (start_ != 0) {
-            close_(spsc_zone_atomic_w0(ZoneId), start_);
+        if (started_) {
+            (void)mark_(spsc_marker_w0(SPSC_TYPE_ZONE_END, ZoneId));
         }
     }
     SpscZoneScope(const SpscZoneScope&) = delete;
     SpscZoneScope& operator=(const SpscZoneScope&) = delete;
 
 private:
-    CloseFn& close_;
-    std::uint64_t start_;
+    MarkFn& mark_;
+    bool started_;
 };
 
 // ---- NoC-FOOTPRINT per-sweep sample: the PP_DATA payload contract ------------------------------------
@@ -450,7 +462,7 @@ private:
 // OVER THE INTERVAL since the previous sample, and a delta belongs to an interval, not to an instant. The
 // counters are also read back-to-back a few tens of cycles apart, so per-counter timestamps would be
 // fictitious precision. Do not "fix" this by splitting the packet.
-static constexpr std::uint32_t SPSC_NOCFP_WORDS = 4;  // payload words == values, in the order below
+static constexpr std::uint32_t SPSC_NOCFP_WORDS = 4;         // payload words == values, in the order below
 enum SpscNocFpWord {
     // A FILLER reads on kReadNoc (NoC 1) and writes on NOC_INDEX (NoC 0); a MOVER does both on NOC_INDEX.
     // So these four names are per-ROLE meanings of "the NoC this role reads on" / "the NoC it writes on",
@@ -463,6 +475,19 @@ enum SpscNocFpWord {
 };
 
 // Total words a frame occupies on the wire, including the prefix and the pad up to a socket page.
+// Words in a staging/ring slot. A slot must hold the PACKED image of a span, which can be LARGER than the
+// raw span it replaces: the raw layout needs no pads (lane r starts at prefix + ctrl + r*ring, inherently
+// congruent), while the packed layout places extents back to back, so each of `num_risc` lanes can need up
+// to SPSC_SPAN_PACK_ALIGN_WORDS-1 words of pad. Sizing a slot for the raw span alone let a nearly-full
+// span's packed image overrun the slot by 16 words -- into the next slot, or past the last one into the
+// drainer's head scratch -- which is why packing used to be gated behind a fill-fraction fallback. Sized
+// for the worst case, packing needs no gate at all.
+constexpr std::uint32_t spsc_span_slot_words(std::uint32_t num_risc) {
+    const std::uint32_t span = PROFILER_L1_CONTROL_VECTOR_SIZE + num_risc * PROFILER_L1_VECTOR_SIZE;
+    const std::uint32_t worst = SPSC_SPAN_PREFIX_WORDS + span + num_risc * (SPSC_SPAN_PACK_ALIGN_WORDS - 1u);
+    return (worst + SPSC_SPAN_PAGE_WORDS - 1u) & ~(SPSC_SPAN_PAGE_WORDS - 1u);
+}
+
 constexpr std::uint32_t spsc_span_frame_words(std::uint32_t payload_words) {
     const std::uint32_t n = SPSC_SPAN_PREFIX_WORDS + payload_words;
     return (n + SPSC_SPAN_PAGE_WORDS - 1u) & ~(SPSC_SPAN_PAGE_WORDS - 1u);

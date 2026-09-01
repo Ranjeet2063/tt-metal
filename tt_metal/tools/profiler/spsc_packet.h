@@ -38,11 +38,11 @@
  * its logical marker kind to these codes explicitly (see ppfmt in kernel_profiler.hpp). */
 #define PP_ZONE_START 0u
 #define PP_ZONE_END 1u
-/* ZONE_S / ZONE_L: the small and large ends of the variable-width zone family around ZONE_ATOMIC.
- * Both sides keep a per-lane 64-bit CURSOR = the end of the last S or ATOMIC zone on that lane. Ends
- * are monotonic per lane (zones are emitted at close, in end order), so an end-relative delta is
- * unsigned -- and a zone's START may freely precede the cursor (a closing parent), since start is
- * always reconstructed as end - duration.
+/* ZONE_S: the small end of the variable-width zone family around ZONE_ATOMIC. Both sides keep a
+ * per-lane 64-bit CURSOR = the end of the last S or ATOMIC zone on that lane. Ends are monotonic per
+ * lane (zones are emitted at close, in end order), so an end-relative delta is unsigned -- and a
+ * zone's START may freely precede the cursor (a closing parent), since start is always reconstructed
+ * as end - duration.
  *   ZONE_S (2 words): [0] type|id27  [1] end_delta16 << 16 | dur16
  *       end = cursor + delta ; start = end - dur ; cursor = end. The dense-zone hot case: end within
  *       ~48 us of the previous end AND duration <= ~48 us (@1.35 GHz). The 64-bit cursor add crosses
@@ -55,19 +55,12 @@
  * cursor is merely conservative (the next S falls back to ATOMIC when its delta overflows 16 bits). */
 #define PP_ZONE_S 3u
 #define PP_ZONE_L 4u
-/* ZONE_ATOMIC: one whole zone in ONE 3-word packet, emitted at scope CLOSE. The producer's RAII scope
- * object holds the start timestamp (hi, lo) from open to close, so the open touches nothing but the
- * wall clock and the wire carries 3 words per zone instead of 2+2:
- *   [0] word0 = pp_zone_atomic_w0(id)   [1] end timer_low   [2] duration (end - start, 32-bit cycles)
- * end = (sticky timer_hi << 32) | word1 ; start = end - word2. The 32-bit duration bounds a zone at
- * ~3.2 s @ 1.35 GHz; a producer whose zone outlives that ships a self-contained 5-word ZONE_L instead
- * (exact; the decoder's synthetic START still trips the per-lane order-regression diagnostic once --
- * desirable visibility for a >3.2 s on-device zone, which is a bug).
- * PRODUCER-STALL ships as ZONE_ATOMIC too (pinned to this width: its close writes into the stall
- * reserve with no room check, so its footprint must be fixed; a >=2^32-cycle stall saturates the
- * duration instead of taking the fallback). Per-lane wire order is END order, so nested zones
- * arrive inner-first; only the END timestamp is a per-lane order invariant (an outer zone's
- * reconstructed START legitimately precedes an already-arrived inner END). */
+/* 3-word COMPLETE zone: w0 = type|id27, w1 = END timer_low, w2 = duration in cycles. Anchored on the END,
+ * not the start, because records leave the producer in COMPLETION order: ends are monotonic per lane, so
+ * the STICKY_TIMER contract (one timer_hi covers everything after it) holds unchanged, while starts are
+ * not monotonic and would break it. The host recovers start = full_end - duration. A duration that does
+ * not fit 32 bits (>~3.2 s at 1.35 GHz) is emitted as a legacy START/END pair instead, so this word never
+ * needs a wider field. */
 #define PP_ZONE_ATOMIC 2u
 /* STICKY_META (LEGACY / synthetic bench path only): combined sticky carrying BOTH timer_hi(low27) and
  * prog_id(payload32) in one packet. Emitted by the throwaway producer_common.h stand-in. The REAL
@@ -123,8 +116,10 @@
  * itself. Its id is a compile-time structural id like any other, so an EVENT is named from the ELF too. */
 #define PP_EVENT 12u
 
-/* Type 11 is RETIRED (was PP_ZONE_TOTAL, the accumulated-duration SUM zone -- feature removed with
- * DeviceZoneScopedSumN*). Do NOT reuse the value: a stale JIT-cached ELF could still emit it. */
+/* ZONE_TOTAL: an accumulated-duration zone (DO_SUM / profileScopeAccumulate). 2 words, but word1 is the
+ * accumulated SUM, not a timer -- the host must not treat it as a timestamp. Moved off the DRAM path's
+ * value 2, which does not name a marker type on this wire. */
+#define PP_ZONE_TOTAL 11u
 
 /* --- PP_DATA word2 sub-fields (word0 is type|id27, identical to a zone marker) --- */
 #define PP_DATA_SIZE_SHIFT 25u
@@ -181,21 +176,6 @@ static inline uint32_t pp_timer_w1(void) { return 0u; }
 static inline uint32_t pp_marker_w0(uint32_t type, uint32_t zone_id) { return pp_word0(type, zone_id & PP_LOW27_MASK); }
 static inline uint32_t pp_marker_w1(uint32_t timer_low) { return timer_low; }
 
-/* ZONE_ATOMIC: word0 = type | full 27-bit id; word1 = END timer_low; word2 = duration in cycles. */
-static inline uint32_t pp_zone_atomic_w0(uint32_t zone_id) { return pp_word0(PP_ZONE_ATOMIC, zone_id); }
-static inline uint32_t pp_zone_atomic_dur(uint32_t w2) { return w2; }
-
-/* ZONE_S: word0 = type | id; word1 packs the end's cursor delta (hi16) and the duration (lo16). */
-static inline uint32_t pp_zone_s_w0(uint32_t zone_id) { return pp_word0(PP_ZONE_S, zone_id); }
-static inline uint32_t pp_zone_s_w1(uint32_t end_delta16, uint32_t dur16) {
-    return (end_delta16 << 16) | (dur16 & 0xFFFFu);
-}
-static inline uint32_t pp_zone_s_delta(uint32_t w1) { return w1 >> 16; }
-static inline uint32_t pp_zone_s_dur(uint32_t w1) { return w1 & 0xFFFFu; }
-
-/* ZONE_L: word0 = type | id; then end_lo, end_hi, dur_lo, dur_hi. */
-static inline uint32_t pp_zone_l_w0(uint32_t zone_id) { return pp_word0(PP_ZONE_L, zone_id); }
-
 /* DATA header word0 (type | full 27-bit id) and its separate length word2. */
 static inline uint32_t pp_data_w0(uint32_t id) { return pp_word0(PP_DATA, id & PP_LOW27_MASK); }
 static inline uint32_t pp_data_w2(uint32_t size_words) {
@@ -224,6 +204,18 @@ static inline int pp_is_event(uint32_t w0) { return pp_type(w0) == PP_EVENT; }
  * from that packet onward and produces plausible garbage. Branch on pp_is_event / pp_is_data separately. */
 static inline uint32_t pp_point_id(uint32_t w0) { return pp_low27(w0); }
 static inline uint32_t pp_data_size(uint32_t w2) { return (w2 >> PP_DATA_SIZE_SHIFT) & PP_DATA_SIZE_MASK; }
+static inline int pp_is_zone_total(uint32_t w0) { return pp_type(w0) == PP_ZONE_TOTAL; }
+static inline int pp_is_zone_atomic(uint32_t w0) { return pp_type(w0) == PP_ZONE_ATOMIC; }
+/* ZONE_S: word0 = type | id; word1 packs the end's cursor delta (hi16) and the duration (lo16). */
+static inline uint32_t pp_zone_s_w0(uint32_t zone_id) { return pp_word0(PP_ZONE_S, zone_id); }
+static inline uint32_t pp_zone_s_w1(uint32_t end_delta16, uint32_t dur16) {
+    return (end_delta16 << 16) | (dur16 & 0xFFFFu);
+}
+static inline uint32_t pp_zone_s_delta(uint32_t w1) { return w1 >> 16; }
+static inline uint32_t pp_zone_s_dur(uint32_t w1) { return w1 & 0xFFFFu; }
+
+/* ZONE_L: word0 = type | id; then end_lo, end_hi, dur_lo, dur_hi. */
+static inline uint32_t pp_zone_l_w0(uint32_t zone_id) { return pp_word0(PP_ZONE_L, zone_id); }
 
 /* Wire length (32-bit words) of a real-path packet: SRC/TIMER/PROG are 1 word (identity/timer_hi/host-id
  * fit in low27, no payload); zone markers, EVENT, PROG_EXT and META are 2; DATA is 3 + payload, and its length lives in
