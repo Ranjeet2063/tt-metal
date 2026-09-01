@@ -152,13 +152,11 @@ enum class SocketEndpoint : uint8_t { SENDER, RECEIVER };
 // through the socket_config object.
 class MeshSocket {
 public:
-    // A rank-scoped socket is a point-to-point link between two ranks, so this returns early on
-    // every other rank (a "null socket") and allocates nothing -- including on a rank that
-    // CO-OWNS the endpoint's mesh. That is safe because a socket on a co-owned mesh is required
-    // to be fully per-core (see socket_is_fully_per_core), so its buffers occupy L1 on the two
-    // endpoint cores only and there is nothing for a co-owner to reserve. Sockets that would need
-    // lockstep buffers are rejected at buffer creation rather than reserved on the co-owners; the
-    // create_mirror path that used to do that reservation is gone.
+    // A rank-scoped socket is point-to-point between two ranks, so this returns early on every
+    // other rank (a "null socket") and allocates nothing, including on ranks co-owning the
+    // endpoint's mesh. Such a socket must therefore be fully per-core (see
+    // socket_is_fully_per_core): its buffers then occupy L1 only on the two endpoint cores and a
+    // co-owner has nothing to reserve. One needing lockstep buffers is rejected instead.
     MeshSocket(const std::shared_ptr<MeshDevice>& device, const SocketConfig& config);
     // Sockets can only be created in sender/receiver pairs.
     static std::pair<MeshSocket, MeshSocket> create_socket_pair(

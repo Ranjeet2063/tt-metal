@@ -33,29 +33,22 @@ namespace per_core_allocation = tt::tt_metal::experimental::per_core_allocation;
 namespace tt::tt_metal::distributed {
 namespace {
 
-// --------------------------------------------------------------------------------------------
-// HYBRID lockstep placement on a submesh co-owned by several ranks (a JOINT stage).
+// HYBRID lockstep placement on a submesh co-owned by several ranks.
 //
-// The lockstep address is chosen by subtracting every per-bank (per-core) reservation from the
-// free list. A rank can only see the reservations on devices it drives -- MeshDeviceView::
-// get_devices() returns locals -- so on a co-owned submesh each co-owner subtracts a different
-// set and places what is meant to be ONE replicated buffer at a different address over the same
-// physical L1. Nothing detects it; the divergence shows up later as corruption, or as an
-// asymmetric "not enough space after considering dependencies" on one co-owner.
+// A lockstep address is chosen by subtracting the per-bank (per-core) reservations from the free
+// list, but MeshDeviceView::get_devices() returns only local devices. On a co-owned submesh each
+// co-owner therefore subtracts a different set and places one replicated buffer at a different
+// address over the same physical L1, silently.
 //
-// Fix: before the lockstep placement, all-gather the per-bank reservations over exactly the
-// ranks that co-own the mesh and hand every rank the union. All co-owners then run the same
-// deterministic selector over identical input and agree -- and, usefully, they now also succeed
-// or fail together instead of one of them OOMing alone.
-// --------------------------------------------------------------------------------------------
+// The reservations are all-gathered over the co-owning ranks so every rank subtracts the same set
+// and picks the same address. Co-owners also then fail together rather than one OOMing alone.
 
-// The MPI ranks that drive at least one device of `mesh_device`, sorted. Empty when the mesh is
-// driven entirely by this rank (the overwhelmingly common case), which is the signal to skip all
-// of the machinery below.
+// The MPI ranks driving at least one device of `mesh_device`, sorted; empty when this rank drives
+// the whole mesh.
 //
-// get_fabric_node_id() is a global control-plane lookup, so it answers for coordinates this rank
-// does not drive; the mesh graph then maps that chip to the host rank that owns it, and the
-// control plane's global bindings map (mesh, host rank) back to an MPI rank.
+// get_fabric_node_id() is a global control-plane lookup, so it answers for non-local coordinates;
+// the mesh graph maps each chip to its host rank, and the control plane's global bindings map
+// (mesh, host rank) to an MPI rank.
 std::vector<int> compute_coowner_ranks(MeshDevice* mesh_device) {
     const auto& view = mesh_device->get_view();
     if (view.num_devices() == view.get_devices().size()) {
@@ -76,12 +69,10 @@ std::vector<int> compute_coowner_ranks(MeshDevice* mesh_device) {
     for (const auto& coord : MeshCoordinateRange(mesh_device->shape())) {
         const auto fabric_node_id = mesh_device->get_fabric_node_id(coord);
 
-        // Every device gathered over must belong to ONE fabric mesh. The union below is only
-        // meaningful for allocators fronting the same physical L1 address space, which is a
-        // property of a single mesh: two fabric meshes have independent allocators, their own
-        // lockstep placements, and no reason to agree. A submesh straddling a mesh boundary
-        // would also pull ranks from both meshes into the sub-context, so the collective would
-        // be issued by ranks that never reach it together.
+        // Every device gathered over must belong to one fabric mesh: only devices of the same
+        // mesh share an allocator address space, and a submesh straddling a boundary would pull
+        // ranks from both meshes into the sub-context, where they never reach the collective
+        // together.
         const uint32_t coord_mesh_id = *fabric_node_id.mesh_id;
         if (!fabric_mesh_id.has_value()) {
             fabric_mesh_id = coord_mesh_id;
@@ -117,9 +108,9 @@ std::vector<int> compute_coowner_ranks(MeshDevice* mesh_device) {
     return {ranks.begin(), ranks.end()};
 }
 
-// Sub-context over `ranks`, created once and cached. create_sub_context is itself collective over
-// its members, and every co-owner reaches its first lockstep allocation on a given submesh
-// together, so the first call is made by all members at the same point.
+// Sub-context over `ranks`, created once and cached. create_sub_context is collective over its
+// members; co-owners reach their first lockstep allocation on a submesh together, so the first
+// call is made by all members at the same point.
 const std::shared_ptr<multihost::DistributedContext>& coowner_context(const std::vector<int>& ranks) {
     static std::mutex cache_mutex;
     static std::map<std::vector<int>, std::shared_ptr<multihost::DistributedContext>> cache;
@@ -156,9 +147,8 @@ std::vector<DeviceAddr> local_per_core_ranges(
 
 // All-gather `local` over `ctx` and return every OTHER rank's entries as ranges.
 //
-// Rank counts differ, and all_gather requires equal-sized contributions, so gather the counts
-// first and pad to the maximum -- the same two-phase shape the socket descriptor exchange uses.
-// Every member issues the same two collectives regardless of how much it contributes.
+// all_gather requires equal-sized contributions but rank counts differ, so gather the counts and
+// pad to the maximum. Every member issues the same two collectives regardless of its own count.
 std::vector<std::pair<DeviceAddr, DeviceAddr>> allgather_remote_ranges(
     const std::vector<DeviceAddr>& local, const std::vector<int>& ranks, const multihost::DistributedContext& ctx) {
     const auto world = static_cast<size_t>(*ctx.size());
@@ -323,11 +313,10 @@ std::shared_ptr<MeshBuffer> MeshBuffer::create(
             }
             mesh_allocator->set_hybrid_device_allocators(device_allocators);
 
-            // Co-owned submesh: the loop above saw only this rank's devices, so trade per-bank
-            // reservations with the other co-owners and let every one of them subtract the same
-            // occupied set. No-op (and no collective) on a mesh this rank drives alone.
-            // Collected here rather than inside AllocatorImpl because allocate_buffer() holds the
-            // allocator mutex, and a collective must not run underneath it.
+            // The loop above sees only local devices, so trade per-bank reservations with the
+            // co-owners and let each subtract the same occupied set. No collective on a mesh this
+            // rank drives alone. Done here rather than in AllocatorImpl because allocate_buffer()
+            // holds the allocator mutex, under which a collective must not run.
             if (device_local_config.buffer_type == BufferType::L1) {
                 const auto coowners = compute_coowner_ranks(mesh_device);
                 if (!coowners.empty()) {

@@ -227,10 +227,9 @@ bool socket_endpoint_uses_per_core_allocation(const SocketConfig& config, Socket
     if (!mem_config.per_core_allocation || mem_config.socket_storage_type != BufferType::L1) {
         return false;
     }
-    // A per-core buffer holds a different address on every core, while the peer descriptor carries
-    // ONE address per buffer. That is well defined only when this endpoint resolves to a single
-    // (device, core) -- the same restriction create_socket_data_buffer places on receivers. A
-    // fan-out sender keeps its lockstep config buffer.
+    // A per-core buffer holds a different address per core while the peer descriptor carries one
+    // address per buffer, so this requires a single (device, core) -- the same restriction
+    // create_socket_data_buffer places on receivers. A fan-out sender stays lockstep.
     return socket_endpoint_cores(config, socket_endpoint).size() == 1;
 }
 
@@ -239,14 +238,13 @@ bool socket_is_fully_per_core(const SocketConfig& config) {
            socket_endpoint_uses_per_core_allocation(config, SocketEndpoint::RECEIVER);
 }
 
-// Logical core -> page index within a device's shard of the config buffer, which is how
-// write_socket_configs finds the entry to fill in for a given socket core.
+// Logical core -> page index within a device's shard of the config buffer, used by
+// write_socket_configs to find the entry for a given socket core.
 //
-// A lockstep config buffer reads this off its backing buffer's page mapping. A PER-CORE config
-// buffer has no backing buffer -- MeshBuffer::create's per-core branch gives each device its own
-// independently allocated Buffer and never builds one -- so get_backing_buffer() returns nullptr
-// there. It does not need one: per-core requires a single (device, core) for the endpoint (see
-// socket_endpoint_uses_per_core_allocation), so the shard is one page belonging to that one core.
+// A lockstep config buffer reads this off its backing buffer's page mapping. A per-core config
+// buffer has no backing buffer (MeshBuffer::create's per-core branch gives each device its own
+// Buffer), and needs none: per-core requires a single (device, core) for the endpoint, so the
+// shard is one page belonging to that core.
 std::unordered_map<CoreCoord, uint32_t> config_buffer_core_to_id(
     const std::shared_ptr<MeshBuffer>& config_buffer, const SocketConfig& config, SocketEndpoint socket_endpoint) {
     if (socket_endpoint_uses_per_core_allocation(config, socket_endpoint)) {
@@ -291,10 +289,9 @@ std::shared_ptr<MeshBuffer> create_socket_config_buffer(
     auto shard_params =
         ShardSpecBuffer(all_cores, {1, 1}, ShardOrientation::ROW_MAJOR, {1, 1}, {static_cast<uint32_t>(num_cores), 1});
 
-    // A lockstep config buffer stays legal here: it is replicated across the mesh, which is
-    // correct whenever every co-owner allocates it (create_socket_pair, a mesh-scoped socket).
-    // Only the rank-scoped path skips co-owners, and that precondition is enforced once in the
-    // MeshSocket constructor rather than per buffer.
+    // A lockstep config buffer is replicated across the mesh, which is correct whenever every
+    // co-owner allocates it (create_socket_pair, mesh-scoped sockets). Only the rank-scoped path
+    // skips co-owners; that precondition is checked once in the MeshSocket constructor.
     auto sharding_args = BufferShardingArgs(shard_params, TensorMemoryLayout::HEIGHT_SHARDED);
     if (socket_endpoint_uses_per_core_allocation(config, socket_endpoint)) {
         TT_FATAL(
@@ -564,9 +561,8 @@ void write_socket_configs(
     }
 }
 
-// The address the peer must target for this endpoint's config buffer. A per-core buffer holds one
-// address per core, so resolve it at this endpoint's single core (socket_endpoint_uses_per_core_
-// allocation guarantees there is exactly one); a lockstep buffer has one address for the mesh.
+// The address the peer must target for this endpoint's config buffer. A lockstep buffer has one
+// address for the mesh; a per-core buffer is resolved at this endpoint's single core.
 DeviceAddr get_config_buffer_address(const MeshSocket& socket_endpoint) {
     const auto& config = socket_endpoint.get_config();
     const auto endpoint = socket_endpoint.get_socket_endpoint_type();

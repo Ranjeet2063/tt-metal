@@ -180,9 +180,9 @@ DeviceAddr AllocatorImpl::allocate_buffer(Buffer* buffer) {
                     }
                 }
             }
-            // On a co-owned submesh the loop above only reached this rank's devices; the peers'
-            // per-bank reservations arrive here instead. compute_available_addresses() sorts and
-            // coalesces the combined list, so appending unsorted/overlapping ranges is fine.
+            // The loop above reaches only local devices; co-owning ranks' per-bank reservations
+            // arrive here. compute_available_addresses() sorts and coalesces the combined list,
+            // so unsorted and overlapping ranges are fine.
             additional_ranges.insert(
                 additional_ranges.end(), hybrid_remote_occupied_ranges_.begin(), hybrid_remote_occupied_ranges_.end());
             address = l1_manager_->allocate_buffer(

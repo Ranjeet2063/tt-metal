@@ -248,15 +248,14 @@ MeshSocket::MeshSocket(const std::shared_ptr<MeshDevice>& device, const SocketCo
         is_sender = local_mesh_binding[0] == config_.sender_mesh_id.value();
     }
 
-    // Every rank that is neither endpoint took the early return above and allocates nothing --
-    // including a rank that CO-OWNS this submesh. That is only safe when the socket's buffers stay
-    // on the endpoint cores, i.e. when all of them are per-core. A lockstep buffer is replicated
-    // across the whole submesh, so it would occupy L1 on co-owners that never reserved it and
-    // whose next allocation would land on top of it; that is what create_mirror used to paper
-    // over. Reject it here, before anything is allocated, rather than corrupting a peer's L1.
+    // Ranks that are neither endpoint took the early return above and allocate nothing, including
+    // ranks co-owning this submesh. That is only safe when every socket buffer is per-core and so
+    // stays on the endpoint cores: a lockstep buffer is replicated across the submesh and would
+    // occupy L1 on co-owners that never reserved it, whose next allocation lands on top. Reject
+    // it before allocating rather than corrupting a peer's L1.
     //
-    // Only this path needs the check: create_socket_pair and mesh-scoped sockets are built by
-    // every co-owner, so lockstep buffers stay correct there.
+    // create_socket_pair and mesh-scoped sockets are built by every co-owner, so lockstep buffers
+    // remain correct there and are not checked.
     if ((rank_scoped_socket_ || same_mesh) && mesh_is_coowned(*device)) {
         const auto sender_cores = socket_endpoint_cores(config_, SocketEndpoint::SENDER).size();
         const auto receiver_cores = socket_endpoint_cores(config_, SocketEndpoint::RECEIVER).size();

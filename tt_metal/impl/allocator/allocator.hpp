@@ -38,13 +38,12 @@ public:
     void set_hybrid_device_allocators(const std::vector<AllocatorImpl*>& device_allocators);
     void clear_hybrid_device_allocators();
 
-    // HYBRID mode on a submesh CO-OWNED by several ranks (a joint stage): the per-bank ranges
-    // reserved on the devices this rank does NOT drive. set_hybrid_device_allocators() can only
-    // reach local devices (MeshDeviceView::get_devices() returns locals), so without these a
-    // co-owner subtracts a strictly smaller occupied set than its peers and places the same
-    // replicated buffer at a different address over the same physical L1. These are appended to
-    // the locally gathered ranges in allocate_buffer(); MeshBuffer::create collects them with an
-    // all-gather over the co-owning ranks. Empty on a single-rank mesh, where local == global.
+    // Per-bank ranges reserved on devices this rank does not drive, appended to the locally
+    // gathered ranges in allocate_buffer(). set_hybrid_device_allocators() reaches only local
+    // devices, so on a submesh co-owned by several ranks each co-owner would otherwise subtract a
+    // smaller occupied set and place the same replicated buffer at a different address over the
+    // same physical L1. MeshBuffer::create collects these by all-gather over the co-owning ranks.
+    // Empty on a single-rank mesh.
     void set_hybrid_remote_occupied_ranges(std::vector<std::pair<DeviceAddr, DeviceAddr>> ranges);
     void clear_hybrid_remote_occupied_ranges();
 
