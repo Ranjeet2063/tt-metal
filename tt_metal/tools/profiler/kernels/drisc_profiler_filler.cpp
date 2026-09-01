@@ -107,6 +107,19 @@ static_assert(
         kSlotBytes % (kernel_profiler::SPSC_SPAN_PACK_ALIGN_WORDS * 4u) == 0,
     "packed-gather congruence broken");
 
+// Control-vector wave: read cores [lo, hi)'s tails into CV staging, then wait until `expect`
+// responses have landed since `rd0`. Counted, not barriered: gather responses in flight also bump
+// the counter, which can only hand a scan stale-but-valid tails (they are monotonic).
+__attribute__((always_inline)) inline void cv_wave(
+    const uint64_t* core_noc, uint32_t lo, uint32_t hi, uint32_t rd0, uint32_t expect) {
+    for (uint32_t i = lo; i < hi; i++) {
+        noc_async_read<kCvReadBytes>(core_noc[i] + kCvReadSrcOff, kCvBase + i * kCvReadBytes, kCvReadBytes, kReadNoc);
+    }
+    while (NOC_STATUS_READ_REG(kReadNoc, NIU_MST_RD_RESP_RECEIVED) - rd0 < expect) {
+    }
+    invalidate_l1_cache();
+}
+
 void kernel_main() {
     const uint32_t num_cores = get_arg_val<uint32_t>(0);
     const uint32_t cv_src = get_arg_val<uint32_t>(1);  // profiler_msg_t base on every worker
@@ -173,11 +186,7 @@ void kernel_main() {
     }
     // Seed the head mirrors from the tails as they stand now: everything published before this
     // launch predates the capture.
-    for (uint32_t c = 0; c < num_cores; c++) {
-        noc_async_read<kCvReadBytes>(core_noc[c] + kCvReadSrcOff, kCvBase + c * kCvReadBytes, kCvReadBytes, kReadNoc);
-    }
-    noc_async_read_barrier(kReadNoc);
-    invalidate_l1_cache();
+    cv_wave(core_noc, 0, num_cores, NOC_STATUS_READ_REG(kReadNoc, NIU_MST_RD_RESP_RECEIVED), num_cores);
     for (uint32_t c = 0; c < num_cores; c++) {
         const tt_l1_ptr uint32_t* tails = reinterpret_cast<const tt_l1_ptr uint32_t*>(kCvBase + c * kCvReadBytes);
         uint32_t tsum = 0;
@@ -550,13 +559,7 @@ void kernel_main() {
         // Only the first chunk's CVs are read here; the rest of the grid's are issued
         // at the refill pause, mid-sweep, so the late scan sees tails fresh enough to
         // catch a core that started producing in this very sweep.
-        for (uint32_t i = 0; i < cv_chunk; i++) {
-            noc_async_read<kCvReadBytes>(
-                core_noc[i] + kCvReadSrcOff, kCvBase + i * kCvReadBytes, kCvReadBytes, kReadNoc);
-        }
-        while (NOC_STATUS_READ_REG(kReadNoc, NIU_MST_RD_RESP_RECEIVED) - rd0 < cv_chunk) {
-        }
-        invalidate_l1_cache();
+        cv_wave(core_noc, 0, cv_chunk, rd0, cv_chunk);
         uint32_t scan_lo = 0;
         uint32_t scan_hi = cv_chunk;
         uint32_t cur = 0;
@@ -847,16 +850,7 @@ void kernel_main() {
             // staleness of exactly the cores scanned last. Read now, their tails can show a
             // core that started producing during this sweep, cutting the join blind window by
             // most of a sweep. Same reads, later timing.
-            for (uint32_t i = scan_hi; i < num_cores; i++) {
-                noc_async_read<kCvReadBytes>(
-                    core_noc[i] + kCvReadSrcOff, kCvBase + i * kCvReadBytes, kCvReadBytes, kReadNoc);
-            }
-            // Wait on the response count, not a full barrier: gather responses also bump it,
-            // which only ever lets a scan see stale-but-valid tails (monotonic) -- a benign
-            // under-ship.
-            while (NOC_STATUS_READ_REG(kReadNoc, NIU_MST_RD_RESP_RECEIVED) - rd0 < num_cores) {
-            }
-            invalidate_l1_cache();
+            cv_wave(core_noc, scan_hi, num_cores, rd0, num_cores);
             scan_hi = num_cores;
         }
 
