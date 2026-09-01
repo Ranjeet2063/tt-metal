@@ -84,7 +84,7 @@ void clock_probe(const std::shared_ptr<distributed::MeshDevice>& mesh_device) {
 
     const uint32_t nbanks = static_cast<uint32_t>(soc.get_num_dram_views());
     for (uint32_t bank = 0; bank < nbanks; bank++) {
-        const CoreCoord lg = mesh_device->impl().pick_unused_dram_logical_core(bank);
+        const CoreCoord lg = mesh_device->impl().pick_unused_dram_logical_core(device, bank);
         const CoreCoord dv = device->virtual_core_from_logical_core(lg, CoreType::DRAM);
         targets.push_back(Target{fmt_label("DRAM bank " + std::to_string(bank), dv), tt_cxy_pair(chip, dv)});
     }

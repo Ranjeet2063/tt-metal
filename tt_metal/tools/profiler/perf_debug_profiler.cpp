@@ -1296,7 +1296,7 @@ bool PerfDebugProfiler::boot_device(
 
         std::vector<CoreCoord> flip_cores;
         for (uint32_t d = 0; d < ctx.n_drisc; d++) {
-            flip_cores.push_back(mesh_device->impl().pick_unused_dram_logical_core(banks[d]));
+            flip_cores.push_back(mesh_device->impl().pick_unused_dram_logical_core(ctx.device, banks[d]));
         }
         // TWO DRISCs MUST NEVER LAND ON THE SAME CORE. pick_unused_dram_logical_core() takes a DRAM VIEW and
         // reserves that view's worker/eth endpoints -- it has no idea another view may resolve to the SAME
@@ -1452,7 +1452,7 @@ bool PerfDebugProfiler::boot_device(
             // path through UMD's dynamic per-access TLB reconfigure. Every filler now gets its own static
             // window (configured below) and the socket takes the static path through it, so watch the hang
             // rate rather than assume the old figure transfers.
-            ctx.drisc_logical[d] = mesh_device->impl().pick_unused_dram_logical_core(banks[d]);
+            ctx.drisc_logical[d] = mesh_device->impl().pick_unused_dram_logical_core(ctx.device, banks[d]);
             if (const auto& sub_sel = filler_subchannels(); d < sub_sel.size()) {
                 // Forced placement. Validated against the same reserved set the picker honours, so a
                 // requested subchannel that is a worker/eth endpoint is refused rather than silently

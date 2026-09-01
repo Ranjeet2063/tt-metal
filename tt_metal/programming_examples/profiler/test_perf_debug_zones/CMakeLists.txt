@@ -19,6 +19,7 @@ target_include_directories(
         ${PROJECT_SOURCE_DIR}/tt_metal/impl
         ${PROJECT_SOURCE_DIR}/tt_metal/api
         ${PROJECT_SOURCE_DIR}/tt_metal/api/tt-metalium
+        ${PROJECT_SOURCE_DIR}/tt_metal/hw/inc
         ${PROJECT_BINARY_DIR}/tt_metal/api
         ${CMAKE_CURRENT_SOURCE_DIR}
 )

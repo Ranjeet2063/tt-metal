@@ -916,7 +916,7 @@ protected:
     std::vector<CoreCoord> free_drisc_cores(uint32_t count) const {
         std::vector<CoreCoord> cores;
         for (uint32_t bank = 0; bank < count; bank++) {
-            cores.push_back(mesh_device_->impl().pick_unused_dram_logical_core(bank));
+            cores.push_back(mesh_device_->impl().pick_unused_dram_logical_core(mesh_device_->get_devices()[0], bank));
         }
         return cores;
     }
@@ -1092,7 +1092,7 @@ TEST_F(DramKernelDRISCScatterFixture, DRISCControlVectorPollRoundRobin) {
 //     address, not drisc_l1_noc_addr_.
 TEST_F(DramKernelDRISCScatterFixture, DRISCD2HSocketEgress) {
     const auto& soc_desc = MetalContext::instance().get_cluster().get_soc_desc(mesh_device_->build_id());
-    const CoreCoord drisc_logical = mesh_device_->impl().pick_unused_dram_logical_core(0);
+    const CoreCoord drisc_logical = mesh_device_->impl().pick_unused_dram_logical_core(mesh_device_->get_devices()[0], 0);
     const CoreCoord drisc_translated = soc_desc.dram_bank_endpoint_coords.at(drisc_logical.x).at(drisc_logical.y);
     const tt::umd::CoreCoord drisc_phys = soc_desc.translate_coord_to(
         tt::umd::CoreCoord(drisc_translated.x, drisc_translated.y, CoreType::DRAM, CoordSystem::TRANSLATED),
@@ -1315,7 +1315,7 @@ TEST_F(DramKernelDRISCScatterFixture, DRISCFusedDrainToHost) {
         kCoreSpan,
         drisc_l1_unreserved_size_);
 
-    const CoreCoord d_logical = mesh_device_->impl().pick_unused_dram_logical_core(0);
+    const CoreCoord d_logical = mesh_device_->impl().pick_unused_dram_logical_core(mesh_device_->get_devices()[0], 0);
     const CoreCoord d_virtual = mesh_device_->virtual_core_from_logical_core(d_logical, CoreType::DRAM);
     const CoreCoord d_tr = soc_desc.dram_bank_endpoint_coords.at(d_logical.x).at(d_logical.y);
     const tt::umd::CoreCoord d_phys = soc_desc.translate_coord_to(
@@ -1469,7 +1469,7 @@ TEST_F(DramKernelDRISCScatterFixture, DRISCTwoTierDrainToHost) {
     const uint32_t page_buf = poll_ring + num_cores * kCvBytes;
     const uint32_t head_scratch = page_buf + 65536;  // past the largest page used here
 
-    const CoreCoord d_logical = mesh_device_->impl().pick_unused_dram_logical_core(0);
+    const CoreCoord d_logical = mesh_device_->impl().pick_unused_dram_logical_core(mesh_device_->get_devices()[0], 0);
     const CoreCoord d_virtual = mesh_device_->virtual_core_from_logical_core(d_logical, CoreType::DRAM);
     const CoreCoord d_tr = soc_desc.dram_bank_endpoint_coords.at(d_logical.x).at(d_logical.y);
     const tt::umd::CoreCoord d_phys = soc_desc.translate_coord_to(
@@ -1726,7 +1726,7 @@ TEST_F(DramKernelDRISCScatterFixture, DRISCAdaptiveDrainToHost) {
         kPageBytes,
         drisc_l1_unreserved_size_);
 
-    const CoreCoord d_logical = mesh_device_->impl().pick_unused_dram_logical_core(0);
+    const CoreCoord d_logical = mesh_device_->impl().pick_unused_dram_logical_core(mesh_device_->get_devices()[0], 0);
     const CoreCoord d_virtual = mesh_device_->virtual_core_from_logical_core(d_logical, CoreType::DRAM);
     const CoreCoord d_tr = soc_desc.dram_bank_endpoint_coords.at(d_logical.x).at(d_logical.y);
     const tt::umd::CoreCoord d_phys = soc_desc.translate_coord_to(
@@ -1915,7 +1915,7 @@ TEST_F(DramKernelDRISCScatterFixture, DRISCMultiDrainerScaling) {
         std::vector<CoreCoord> virt;
         std::vector<tt::umd::CoreCoord> phys;
         for (uint32_t i = 0; i < n_drisc; i++) {
-            const CoreCoord lg = mesh_device_->impl().pick_unused_dram_logical_core(i);
+            const CoreCoord lg = mesh_device_->impl().pick_unused_dram_logical_core(mesh_device_->get_devices()[0], i);
             logical.push_back(lg);
             virt.push_back(mesh_device_->virtual_core_from_logical_core(lg, CoreType::DRAM));
             const CoreCoord tr = soc_desc.dram_bank_endpoint_coords.at(lg.x).at(lg.y);
@@ -2072,7 +2072,7 @@ TEST_F(DramKernelDRISCScatterFixture, DRISCIngestStraightToHost) {
     const uint32_t clk_hz = MetalContext::instance().get_cluster().get_device_aiclk(mesh_device_->id()) * 1000000u;
 
     const auto& soc_desc = MetalContext::instance().get_cluster().get_soc_desc(mesh_device_->build_id());
-    const CoreCoord d_logical = mesh_device_->impl().pick_unused_dram_logical_core(0);
+    const CoreCoord d_logical = mesh_device_->impl().pick_unused_dram_logical_core(mesh_device_->get_devices()[0], 0);
     const CoreCoord d_virtual = mesh_device_->virtual_core_from_logical_core(d_logical, CoreType::DRAM);
     const CoreCoord d_translated = soc_desc.dram_bank_endpoint_coords.at(d_logical.x).at(d_logical.y);
     const tt::umd::CoreCoord d_phys = soc_desc.translate_coord_to(
@@ -2222,8 +2222,8 @@ TEST_F(DramKernelDRISCScatterFixture, DRISCPipelineAtoBtoHost) {
         dram_region);
 
     // A on bank 0, B on bank 1 -- different banks, so B reaches A's DRAM over the NoC, not by DMA.
-    const CoreCoord a_logical = mesh_device_->impl().pick_unused_dram_logical_core(0);
-    const CoreCoord b_logical = mesh_device_->impl().pick_unused_dram_logical_core(1);
+    const CoreCoord a_logical = mesh_device_->impl().pick_unused_dram_logical_core(mesh_device_->get_devices()[0], 0);
+    const CoreCoord b_logical = mesh_device_->impl().pick_unused_dram_logical_core(mesh_device_->get_devices()[0], 1);
     const CoreCoord a_virtual = mesh_device_->virtual_core_from_logical_core(a_logical, CoreType::DRAM);
     const CoreCoord b_virtual = mesh_device_->virtual_core_from_logical_core(b_logical, CoreType::DRAM);
     const CoreCoord bank0_noc1_ep = soc_desc.get_preferred_worker_core_for_dram_view(0, /*noc=*/1);
@@ -2556,7 +2556,7 @@ TEST_F(DramKernelDRISCScatterFixture, DRISCCombinedReadAndDma) {
 // hung socket is not.
 TEST_F(DramKernelDRISCScatterFixture, DRISCD2HSocketEgressTuned) {
     const auto& soc_desc = MetalContext::instance().get_cluster().get_soc_desc(mesh_device_->build_id());
-    const CoreCoord drisc_logical = mesh_device_->impl().pick_unused_dram_logical_core(0);
+    const CoreCoord drisc_logical = mesh_device_->impl().pick_unused_dram_logical_core(mesh_device_->get_devices()[0], 0);
     const CoreCoord drisc_translated = soc_desc.dram_bank_endpoint_coords.at(drisc_logical.x).at(drisc_logical.y);
     const tt::umd::CoreCoord drisc_phys = soc_desc.translate_coord_to(
         tt::umd::CoreCoord(drisc_translated.x, drisc_translated.y, CoreType::DRAM, CoordSystem::TRANSLATED),
