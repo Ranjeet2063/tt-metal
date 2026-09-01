@@ -192,9 +192,11 @@ void kernel_main() {
     cv_wave(core_noc, 0, num_cores, NOC_STATUS_READ_REG(kReadNoc, NIU_MST_RD_RESP_RECEIVED), num_cores);
     for (uint32_t c = 0; c < num_cores; c++) {
         const tt_l1_ptr uint32_t* tails = reinterpret_cast<const tt_l1_ptr uint32_t*>(kCvBase + c * kCvReadBytes);
+        volatile tt_l1_ptr uint32_t* scp = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(kHeadScratch + c * 32u);
         uint32_t tsum = 0;
         for (uint32_t r = 0; r < kNumRisc; r++) {
             head_mirror[c * kNumRisc + r] = tails[r];
+            scp[r] = tails[r];
             tsum += tails[r];
         }
         tails_seen[c] = tsum;
@@ -213,6 +215,9 @@ void kernel_main() {
     uint32_t quiet_streak = 0;
     constexpr uint32_t kBatchArmSweeps = 3;
     constexpr uint32_t kFlushQuietSweeps = 8;
+    // A head relief is one posted write; re-posting every core's head on this cadence bounds a
+    // lost one to a stall instead of parking the producer for the rest of the run.
+    constexpr uint32_t kHeadRefreshSweeps = 64;
     // Which staging generations may still have a ship in flight. Persists across sweeps so a
     // sweep's final ship drains under the pace gap or the next CV pass, not on its own critical
     // path.
@@ -857,6 +862,17 @@ void kernel_main() {
             scan_hi = num_cores;
         }
 
+        // Every issued batch has passed its read barrier by here, so each core's scratch is exactly
+        // the head it was last relieved to.
+        if ((sweeps & (kHeadRefreshSweeps - 1u)) == 0) {
+            for (uint32_t c = 0; c < num_cores; c++) {
+                noc_async_write_one_packet<true, true>(
+                    kHeadScratch + c * 32u,
+                    core_noc[c] + kernel_profiler::SPSC_RING_HEAD_0 * 4u,
+                    kNumRisc * 4u,
+                    kReadNoc);
+            }
+        }
         // Busy sweeps below the first band skip the post-sweep pump entirely: the spool is the
         // burst absorber, and a capture that fits in it deserves pure gather.
         if constexpr (kSpool) {
