@@ -103,7 +103,6 @@ private:
         uint32_t drisc_l1_base[kNFillers] = {};
         uint32_t stop_addr[kNFillers] = {};  // host writes 1 to quiesce, 2 to release the NIU
         uint32_t done_addr[kNFillers] = {};  // drainer publishes 0xD09E**** once its last page is out
-        uint32_t results_addr[kNFillers] = {};
         uint32_t n_drisc = kNFillers;
         // core_index -> virtual (x,y) [what the SRC lane resolves to], and virtual -> NOC0 (x,y) [Tracy view].
         std::vector<std::pair<uint32_t, uint32_t>> core_virt;
@@ -138,14 +137,8 @@ private:
         DeviceCtx& ctx,
         const distributed::MeshCoordinate& coord);
     // Read the drainer's LIVE state (done word, heartbeat, phase) mid-run and log it. Distinguishes
-    // "kernel exited" from "kernel blocked in the credit wait" from "kernel sweeping with nothing to do" --
-    // states the end-of-run results block cannot tell apart because it is only published on exit.
+    // "kernel exited" from "kernel blocked in the credit wait" from "kernel sweeping with nothing to do".
     void dump_drainer_state(DeviceCtx& ctx, uint32_t d, const char* why);
-    // COMMON-TRIGGER SYNC EVENT: park every drainer in a tight spin, release them together, and let each stamp
-    // its own clock -- so the spread in the DRISC-SYNC zones is anchor + render error only. Called from stop(),
-    // i.e. after the workload: a parked drainer is not draining, and the lazy zone-name harvest needs the
-    // workload's kernels already compiled.
-    void fire_sync_events();
     // After the drainers swept-to-empty and the receiver drained: compare every worker lane's own tail
     // against the receiver's consumed-words mirror, so a stop-path regression can never lose the capture
     // tail silently again.
@@ -159,10 +152,6 @@ private:
     std::unique_ptr<perf_debug::PerfDebugTracyConsumer> tracy_consumer_;
     std::unique_ptr<perf_debug::PerfDebugReceiver> receiver_;
     std::atomic<bool> stopped_{false};
-    // chip -> the NOC0 coords of that chip's drainer cores, when DRISC self-profiling is on. Filled during
-    // boot_device (the only place a drainer's placement is known) and consumed in start() to pre-create their
-    // Tracy contexts, which is off the drain hot path.
-    std::unordered_map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>> self_zone_cores_;
 };
 
 }  // namespace tt::tt_metal

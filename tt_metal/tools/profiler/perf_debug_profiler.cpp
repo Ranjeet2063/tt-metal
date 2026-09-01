@@ -102,26 +102,6 @@ bool no_noc_init() {
 // ABLATION: strip the drain loop to EGRESS ONLY -- no worker reads, no per-core processing; the drainer
 // re-ships pre-staged mock bytes forever. Pair with NO_DECODE=1, since the payload is mock.
 //
-// ABLATE_SPIN stands in for the sweep and MUST be ~2.3M cycles (~1.7 ms). A real run idles that long
-// between bursts, and that idle is what lets the host drain the FIFO so the next burst runs at full rate.
-// Spins of 3-30 us leave the loop permanently credit-bound, where a spin only displaces wait time and so
-// appears to do nothing at all (FINDINGS §N+12).
-uint32_t ablate() {
-    static const uint32_t v = [] {
-        const char* s = std::getenv("TT_METAL_PERF_DEBUG_ABLATE");
-        return (s == nullptr || *s == '\0') ? 0u : static_cast<uint32_t>(std::strtoul(s, nullptr, 10));
-    }();
-    return v;
-}
-
-uint32_t ablate_spin() {
-    static const uint32_t v = [] {
-        const char* s = std::getenv("TT_METAL_PERF_DEBUG_ABLATE_SPIN");
-        return (s == nullptr || *s == '\0') ? 0u : static_cast<uint32_t>(std::strtoul(s, nullptr, 10));
-    }();
-    return v;
-}
-
 // TT_METAL_PERF_DEBUG_NOC forces which NIU EVERY drainer egresses on (reads take the other); unset =
 // NOC 0 for all six.
 //
@@ -162,31 +142,6 @@ bool reserve_column_env() {
     }();
     return v;
 }
-
-// Shared truthiness for the perf-debug knobs. Tests the WHOLE value, not just the first character: the old
-// `*s != '0'` idiom made `=false`, `=off` and `=no` all evaluate to ENABLED (any word not starting with '0'),
-// while `=01` and `=0x1` evaluated to DISABLED. That is backwards for knobs whose purpose is keeping an
-// instrument out of a production run, so falsy words are honoured and numbers decide by value.
-bool env_flag(const char* name) {
-    const char* s = std::getenv(name);
-    if (s == nullptr || *s == '\0') {
-        return false;
-    }
-    std::string v(s);
-    for (char& c : v) {
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    }
-    if (v == "false" || v == "off" || v == "no" || v == "n" || v == "disable" || v == "disabled") {
-        return false;
-    }
-    char* end = nullptr;
-    const long n = std::strtol(v.c_str(), &end, 0);
-    if (end != nullptr && *end == '\0') {
-        return n != 0;  // "0"/"00"/"0x0" off; "01" on
-    }
-    return true;
-}
-
 
 
 // DRAM banks (DRAM VIEW ids) the FILLERS occupy, one per filler. Views 7 and 2 ride at the end: the N+29
@@ -235,114 +190,6 @@ const std::vector<uint32_t>& role_filler_banks() {
             out = {5u, 6u, 4u, 1u, 0u, 3u, 7u, 2u};
         }
         return out;
-    }();
-    return v;
-}
-
-// ---- DRISC SELF-PROFILING knobs -----------------------------------------------------------------------
-//
-// TT_METAL_PERF_DEBUG_DRISC_ZONES=1 makes every drainer emit its OWN device zones, framed as worker spans and
-// pushed down the path it already owns, so they land in Tracy on their own per-core row beside the workers.
-// Unset or 0 is today's path bit for bit: every compile arg below is then 0 and the kernel's `if constexpr`
-// discards all of it, including the staging slot it would otherwise reserve.
-//
-// This TRACES rather than samples. Sampling was built first and rejected on use: at ~4.5% of busy sweeps a
-// drainer's row is a few disconnected zones whose gaps read as idle time when they are really uncaptured
-// sweeps. Every sweep inside an active window is now instrumented instead.
-bool drisc_zones() {
-    static const bool v = [] {
-        // NOC_FOOTPRINT IMPLIES ZONES -- but only when the per-sweep series exists to ride the self-zone
-        // stream, i.e. with CV-first off (the kernel forces the series off under CV-first: the maximal
-        // build measured 396 B over the code region). Under CV-first the footprint is its out[] totals,
-        // which need no zones. An explicit falsy DRISC_ZONES still wins either way.
-        const char* z = std::getenv("TT_METAL_PERF_DEBUG_DRISC_ZONES");
-        const char* cf = std::getenv("TT_METAL_PERF_DEBUG_CV_FIRST");
-        const bool cv_on = (cf == nullptr || *cf == '\0') ? true : env_flag("TT_METAL_PERF_DEBUG_CV_FIRST");
-        if ((z == nullptr || *z == '\0') && env_flag("TT_METAL_PERF_DEBUG_NOC_FOOTPRINT") && !cv_on) {
-            log_info(
-                tt::LogMetal,
-                "[perf-debug profiler] NOC_FOOTPRINT implies DRISC_ZONES (the per-sweep NoC series rides the "
-                "self-zone stream) -- enabling DRISC self-profiling");
-            return true;
-        }
-        return env_flag("TT_METAL_PERF_DEBUG_DRISC_ZONES");
-    }();
-    return v;
-}
-
-// How long, in MICROSECONDS of device wall clock, the capture window stays open past the last work seen. This
-// is what makes coverage contiguous across a burst instead of restarting per busy sweep, and what keeps the
-// drainer's ~99% idle residency (hundreds of ms to seconds, against a ~2 ms workload) out of the trace.
-// Wall clock rather than sweeps, because a sweep's duration swings ~5x between idle and loaded.
-uint32_t drisc_zone_hold_cycles() {
-    static const uint32_t v = [] {
-        const char* s = std::getenv("TT_METAL_PERF_DEBUG_DRISC_ZONE_HOLD_US");
-        const uint32_t us = (s != nullptr && *s != '\0') ? static_cast<uint32_t>(std::strtoul(s, nullptr, 10)) : 500u;
-        return (us == 0 ? 500u : us) * 1350u;  // the drainer stamps with the 1.35 GHz Tensix wall clock
-    }();
-    return v;
-}
-
-// TT_METAL_PERF_DEBUG_NOC_FOOTPRINT=1 makes each drainer sample its OWN NIU master counters once per sweep
-// (8 local MMIO loads, no NoC traffic of its own) and report the NoC bytes and transactions it actually issued,
-// on both NoCs. This exists because every footprint figure we have is ARITHMETIC over frame counts; this is the
-// hardware's own tally. Off by default: the per-sweep sample is not free on a drainer that is >99% idle, and
-// N+41 measured that a mere +4% on idle-sweep cost crosses the knee at SD delay 15.
-uint32_t noc_footprint() {
-    static const uint32_t v = [] { return env_flag("TT_METAL_PERF_DEBUG_NOC_FOOTPRINT") ? 1u : 0u; }();
-    return v;
-}
-
-// DETAIL LEVEL. 0 (default) = DRISC-SWEEP + DRISC-PACE only: the two depth-0 zones that account for a
-// drainer's whole cadence with no unexplained whitespace, at ~4 markers per sweep. 1 = also the per-batch
-// child phases (read / read-wait / proc / credit-wait / write / wr-barrier), ~100 markers per sweep.
-uint32_t drisc_zone_detail() {
-    static const uint32_t v = [] {
-        const char* s = std::getenv("TT_METAL_PERF_DEBUG_DRISC_ZONE_DETAIL");
-        uint32_t d = (s != nullptr && *s != '\0') ? static_cast<uint32_t>(std::strtoul(s, nullptr, 10)) : 0u;
-        // Detail-1 phases plus the read-split read path overflow the 11,264 B DRISC code region by
-        // ~300 B (measured; every other knob combination fits). Degrade loudly rather than let the
-        // filler fail to load and produce an empty capture.
-        return d;
-    }();
-    return v;
-}
-
-// Frame budget per DRISC. With tracing this is a COVERAGE limit rather than a safety net: frames scale with
-// how long the drainer stays busy. At detail 0 a frame holds ~63 sweeps, so 256 frames is ~16,000 sweeps --
-// far more than a workload window needs. At detail 1 a frame holds ~2.5 sweeps, so the same budget is ~640.
-uint32_t drisc_zone_frames() {
-    static const uint32_t v = [] {
-        const char* s = std::getenv("TT_METAL_PERF_DEBUG_DRISC_ZONE_FRAMES");
-        const uint32_t n = (s != nullptr && *s != '\0') ? static_cast<uint32_t>(std::strtoul(s, nullptr, 10)) : 256u;
-        return n == 0 ? 256u : n;
-    }();
-    return v;
-}
-
-// ---- COMMON-TRIGGER SYNC EVENT ----------------------------------------------------------------------------
-//
-// TT_METAL_PERF_DEBUG_SYNC_EVENT = how many triggers to fire (0 = off, the default). Each one releases every
-// drainer from a rendezvous barrier at the same instant, so the spread in the resulting DRISC-SYNC zones'
-// RENDERED timestamps is anchor + render error with no genuine timing difference in it.
-//
-// FIRE MORE THAN ONE, and space them: a frequency error is a RATE error, so it shows up as the residual
-// DRIFTING across triggers rather than as a constant offset. N triggers G ms apart turn that slope into
-// something directly readable -- at ~40 ppm, 1 s of separation is ~40 us of drift, far above the floor.
-uint32_t sync_event_count() {
-    static const uint32_t v = [] {
-        const char* s = std::getenv("TT_METAL_PERF_DEBUG_SYNC_EVENT");
-        return (s != nullptr && *s != '\0') ? static_cast<uint32_t>(std::strtoul(s, nullptr, 10)) : 0u;
-    }();
-    return v;
-}
-
-// Gap between triggers, ms. Default 250: five triggers then span 1 s, which is the same order as the
-// anchor-to-workload distance the rate error is multiplied by.
-uint32_t sync_event_gap_ms() {
-    static const uint32_t v = [] {
-        const char* s = std::getenv("TT_METAL_PERF_DEBUG_SYNC_EVENT_GAP_MS");
-        return (s != nullptr && *s != '\0') ? static_cast<uint32_t>(std::strtoul(s, nullptr, 10)) : 250u;
     }();
     return v;
 }
@@ -840,12 +687,6 @@ void PerfDebugProfiler::start(const std::shared_ptr<distributed::MeshDevice>& me
         // ~110 cores typically run the workload, and pre-creating all of them litters the capture with
         // empty (count=0) contexts that read as "cores not showing up". The per-zone mutex+lookup cost is
         // identical either way; lazy creation just avoids minting dead contexts.
-        //
-        // The DRAINER cores are the exception, and pre-created: with self-profiling on they are GUARANTEED to
-        // emit zones, so none of them can turn into a dead context, and there are only a handful.
-        if (auto it = self_zone_cores_.find(ctx.chip_id); it != self_zone_cores_.end() && !it->second.empty()) {
-            tracy_->PreCreateContexts(ctx.chip_id, it->second);
-        }
         // Give each drainer's rows its ROLE, so a plot reads "DRISC 9-9 FILLER" instead of coordinates the
         // reader has to map back to a job by hand. A string literal: the role text is interned into a plot
         // name whose pointer the SERVER dereferences, so it has to outlive everything.
@@ -1277,22 +1118,9 @@ bool PerfDebugProfiler::boot_device(
 
     // ---- DRISC SELF-PROFILING: give each drainer a LANE BLOCK of its own ----------------------------------
     //
-    // A drainer's self frame is an ordinary span frame, so the host resolves it exactly like a worker's: by
-    // looking up SPSC_CORE_XY in core_of_xy and turning the answer into lane = core * NRISC + risc. That means
-    // the drainer cores need core indices, and the lane space has to be wide enough to hold them. Appending
-    // them after the worker grid keeps every worker lane id exactly where it was.
-    const uint32_t self_core0 = static_cast<uint32_t>(num_cores);
-    const bool self_zones_on = drisc_zones() && drisc_zone_frames() != 0;
-    if (self_zones_on) {
-        ctx.n_worker_cores = static_cast<uint32_t>(num_cores);
-        ctx.nl = (static_cast<uint32_t>(num_cores) + ctx.n_drisc) * kNRisc;
-        ctx.core_virt.resize(static_cast<size_t>(num_cores) + ctx.n_drisc);
-    }
-
     // Must mirror the kernel's kSlotWords: capped slots except under self-zones, whose RAW self frame
     // needs the full span.
     const uint32_t slot_bytes_all = kernel_profiler::spsc_span_slot_words(kNRisc) * sizeof(uint32_t);
-    uint32_t nstage_report = 0;  // last drainer's mapped staging-slot count, for the self-profiling log line
 
         std::vector<CoreCoord> flip_cores;
         for (uint32_t d = 0; d < ctx.n_drisc; d++) {
@@ -1384,15 +1212,6 @@ bool PerfDebugProfiler::boot_device(
     // and would hand the same region out again.
     uint32_t spool_bytes = dram_spool_mb() * (1u << 20);
     uint32_t spool_addr = 0;
-    // Self-zones + spool overflows the 11,264 B DRISC code region (measured 852 B over), so the
-    // drainer-diagnostic build runs the direct path it has always profiled.
-    if (spool_bytes != 0 && drisc_zones()) {
-        log_info(
-            tt::LogMetal,
-            "[perf-debug profiler] DRISC self-zones build does not fit alongside the GDDR spool; running "
-            "direct push for this capture");
-        spool_bytes = 0;
-    }
     if (spool_bytes != 0 && spool_buffer_ == nullptr) {
         const uint32_t nbanks_dram = ctx.device->allocator()->get_num_banks(BufferType::DRAM);
         try {
@@ -1514,18 +1333,6 @@ bool PerfDebugProfiler::boot_device(
                 lo,
                 hi,
                 num_cores);
-            // This drainer's own core, as a Tracy row: virtual coords are what its self frame carries in
-            // SPSC_CORE_XY, NOC0 is what a Tracy context is keyed on. Registered for BOTH maps here, where both
-            // are in hand -- a DRAM core is absent from metal_soc_descriptor's profiler flat-id map (TENSIX and
-            // ETH only), so nothing else would ever give it a row.
-            if (self_zones_on) {
-                ctx.core_virt[self_core0 + d] = {
-                    static_cast<uint32_t>(ctx.drisc_virtual[d].x), static_cast<uint32_t>(ctx.drisc_virtual[d].y)};
-                ctx.virt_to_noc0
-                    [(static_cast<uint64_t>(ctx.drisc_virtual[d].x) << 32) |
-                     static_cast<uint64_t>(ctx.drisc_virtual[d].y)] = {
-                    static_cast<uint32_t>(drisc_phys.x), static_cast<uint32_t>(drisc_phys.y)};
-            }
             ctx.drisc_l1_base[d] = hal.get_dev_addr(HalProgrammableCoreType::DRAM, HalL1MemAddrType::UNRESERVED);
             ctx.drisc_l1_noc[d] = hal.get_dev_noc_addr(HalProgrammableCoreType::DRAM, HalL1MemAddrType::UNRESERVED);
             region = hal.get_dev_size(HalProgrammableCoreType::DRAM, HalL1MemAddrType::UNRESERVED);
@@ -1545,36 +1352,13 @@ bool PerfDebugProfiler::boot_device(
         // ---- DRISC SELF-PROFILING takes ONE staging slot, and takes it out of nstage rather than out of L1 ----
         //
         // The self frame is a full slot (prefix + control vector + five rings), so it needs somewhere slot-sized
-        // to live. There is no room to ADD one: a DRAM core's UNRESERVED L1 is 86 KB and 7 slots of 10,560 B
-        // plus the scratch/misc/socket-config reserve already leave under 2 KB spare. So hand the kernel
-        // (nstage - 1) slots and let it use index kNStage -- one past its own array -- for the self frame. L1
-        // does not grow and the OFF build is untouched (the pipeline is bounded by kGenSlots = 3 either way).
-        const uint32_t self_frames_base = drisc_zones() ? drisc_zone_frames() : 0u;
-        const uint32_t nstage_drain = (self_frames_base != 0 && nstage >= 3) ? nstage - 1u : nstage;
-        if (self_frames_base != 0 && nstage < 3) {
-            log_warning(
-                tt::LogMetal,
-                "[perf-debug profiler] Device {}: only {} staging slots fit, too few to spare one for DRISC "
-                "self-profiling (needs >= 3 so kGenSlots stays >= 1); self zones are OFF for this run",
-                device_id,
-                nstage);
-        }
-        const uint32_t self_slot = nstage_drain;  // must match the kernel's kSelfSlot == kNStage
-        nstage_report = nstage;
+        const uint32_t nstage_drain = nstage;
         const uint32_t stage_base = ctx.drisc_l1_base[d];
         const uint32_t head_scratch = stage_base + nstage * slot_bytes;
         ctx.done_addr[d] = head_scratch + kScratchBytes;
         ctx.stop_addr[d] = ctx.done_addr[d] + 64;
-        ctx.results_addr[d] = ctx.stop_addr[d] + 64;
-        TT_FATAL(
-            self_frames_base == 0 || self_slot < nstage,
-            "perf-debug: DRISC self-profiling wants staging slot {} but only {} slots are mapped",
-            self_slot,
-            nstage);
         const uint32_t cfg_l1 = ctx.drisc_l1_base[d] + region - kCfgReserve;
-        TT_FATAL(
-            ctx.results_addr[d] + kernel_profiler::SPSC_DRAIN_RESULT_WORDS * sizeof(uint32_t) <= cfg_l1,
-            "DRISC L1 layout overlaps the socket config");
+        TT_FATAL(ctx.stop_addr[d] + 64 <= cfg_l1, "DRISC L1 layout overlaps the socket config");
 
         // Stream mode first: the socket config is written from the host and only lands in L1 once the NIU
         // stops forwarding inbound DRAM-range addresses to GDDR. The kernel restores it on the host's word.
@@ -1809,15 +1593,6 @@ bool PerfDebugProfiler::boot_device(
                 sizeof(zero4),
                 tt_cxy_pair(device_id, ctx.drisc_virtual[d]),
                 ctx.drisc_l1_noc[d] + (ctx.stop_addr[d] - ctx.drisc_l1_base[d]));
-            // Same reason, for the results block: it is published only on kernel exit, so a drainer that is
-            // still running at teardown leaves the PREVIOUS run's numbers there and they read as this run's.
-            // That is how a 42 s run reported "495.7 ms, credit-wait 0.1%" and hid its own credit timeouts.
-            const std::vector<uint32_t> zero_res(kernel_profiler::SPSC_DRAIN_RESULT_WORDS, 0);
-            cluster.write_core(
-                zero_res.data(),
-                (uint32_t)(zero_res.size() * sizeof(uint32_t)),
-                tt_cxy_pair(device_id, ctx.drisc_virtual[d]),
-                ctx.drisc_l1_noc[d] + (ctx.results_addr[d] - ctx.drisc_l1_base[d]));
             // Mirrored PCIe-tile encoding for NoC 1 (see drain_noc()). 0 => kernel uses the socket's NOC0 value.
             // Always the socket's own PCIe encoding, on both NoCs. Mirroring the tile for NoC 1 was
             // MEASURED WRONG: pages still flow (socket credits are a separate path) but decode yields ZERO
@@ -1850,76 +1625,32 @@ bool PerfDebugProfiler::boot_device(
             }
 
             ctx.drain_program[d] = std::make_unique<Program>(CreateProgram());
-            const std::vector<uint32_t> cargs = {
-                stage_base,
-                nstage_drain,  // one fewer than the slots mapped when self-profiling owns the last one
-                head_scratch,
-                ctx.results_addr[d],
-                ctx.done_addr[d],
-                ctx.stop_addr[d],
-                ctx.sockets[sk]->get_config_buffer_address(),
-                0xFFFFFFFFu,
-                128,
-                drisc_gap_cycles(),
-                0u,  // retired: SHIP_REPEAT
-                no_noc_init() ? 0u : 1u,
-                ablate(),
-                ablate_spin(),
-                nstage,
-                (my_cores + nstage - 1) / nstage,
-                pcie_enc_override,
-                0u,  // retired: FILL_PCT (the fill-driven pace controller CV-first replaced)
-                0u,  // retired: GAP_MAX (its ceiling)
-                0u,  // retired: READ_SPLIT
-                // Arg 20: write VC. With the egress NoC alternating on d&1, d&2 splits each NoC's
-                // pushers across two of the four unicast request VCs; TT_METAL_PERF_DEBUG_FILLER_VCS
-                // (comma-separated, one entry per filler) overrides the whole assignment for arbitration
-                // experiments at the shared PCIe tile. Args 21..31 retired.
-                d < filler_vcs().size() ? filler_vcs()[d] : ((d & 2u) ? 0u : 1u),
-                0u,
-                0u,
-                0u,
-                0u,
-                0u,
-                0u,
-                0u,
-                0u,
-                0u,
-                0u,
-                0u,
-                // ---- DRISC self-profiling (arg 32..35). All zero when the knob is off. ----
-                // The identity is passed in rather than read from a firmware global: SPSC_CORE_XY has to be in
-                // the SAME coordinate space the worker cores stamp (virtual), because the host resolves a frame
-                // to a lane through one map keyed on exactly that. A DRISC guessing its own coordinates would
-                // be a second, silent way to get it wrong.
-                self_frames_base != 0 ? 1u : 0u,
-                drisc_zone_hold_cycles(),
-                (static_cast<uint32_t>(ctx.drisc_virtual[d].x) & 0xFFFFu) |
-                    ((static_cast<uint32_t>(ctx.drisc_virtual[d].y) & 0xFFFFu) << 16),
-                self_frames_base,
-                drisc_zone_detail(),
-                noc_footprint(),
-                // arg 38: the sync event. Gated on zones being on as well, because it rides the self-zone ring
-                // and the kernel static_asserts that pairing -- passing 1 with zones off would not build.
-                (sync_event_count() != 0 && self_frames_base != 0) ? 1u : 0u,
-                // arg 39: ship threshold (percent of live span capacity).
-                ship_min_pct(),
-                // arg 40: per-core service-interval instrumentation (two wall-clock reads and a histogram
-                // update per shipped core). The svc lines it feeds found the rotation and staleness knees,
-                // but at the knee it is measurable sweep time, so it is opt-in.
-                perf_debug::env_u32("TT_METAL_PERF_DEBUG_DRISC_SVC", 0),  // 1 = full svc hist; 2 = phase maxima only
-                // arg 41: the BASE instrumentation tier (phase cycle counters, ~55 wall-clock reads per
-                // sweep, ~1 us of a 15 us knee sweep). Default ON -- the LIFETIME/WINDOW/WORST/read-split
-                // report lines come from it; TT_METAL_PERF_DEBUG_DRISC_INSTR=0 compiles it out for record
-                // runs, and those lines then print zeros.
-                perf_debug::env_flag("TT_METAL_PERF_DEBUG_DRISC_INSTR", true) ? 1u : 0u,
-                // args 42/43: the GDDR spool (base offset in this DRISC's own bank, ring bytes; 43 == 0
-                // selects direct push). The bounce slots cost the kernel a staging generation, so the spool
-                // needs the full slot count; a smaller L1 falls back to direct push rather than failing the
-                // kernel's geometry static_asserts.
-                spool_addr,
-                nstage_drain >= (self_frames_base != 0 ? 6u : 7u) ? spool_bytes : 0u};
-            if (spool_bytes != 0 && nstage_drain < (self_frames_base != 0 ? 6u : 7u)) {
+            // Compile-time arguments by NAME: the kernel reads them with
+            // get_named_compile_time_arg_val, so retiring one is a local edit on both sides.
+            const std::unordered_map<std::string, uint32_t> cargs = {
+                {"stage_base", stage_base},
+                {"n_stage", nstage_drain},
+                {"head_scratch", head_scratch},
+                {"done_addr", ctx.done_addr[d]},
+                {"stop_addr", ctx.stop_addr[d]},
+                {"socket_config_addr", ctx.sockets[sk]->get_config_buffer_address()},
+                {"max_sweeps", 0xFFFFFFFFu},
+                {"max_cores", 128},
+                {"gap_cycles", drisc_gap_cycles()},
+                {"noc_init", no_noc_init() ? 0u : 1u},
+                {"pcie_enc_override", pcie_enc_override},
+                // With the egress NoC alternating on d&1, d&2 splits each NoC's pushers across two of
+                // the four unicast request VCs; TT_METAL_PERF_DEBUG_FILLER_VCS (comma-separated, one
+                // entry per filler) overrides the whole assignment for arbitration experiments at the
+                // shared PCIe tile.
+                {"write_vc", d < filler_vcs().size() ? filler_vcs()[d] : ((d & 2u) ? 0u : 1u)},
+                {"ship_min_pct", ship_min_pct()},
+                // The bounce slots cost the kernel a staging generation, so the spool needs the full
+                // slot count; a smaller L1 falls back to direct push rather than failing the kernel's
+                // geometry static_asserts.
+                {"spool_base", spool_addr},
+                {"spool_bytes", nstage_drain >= 7u ? spool_bytes : 0u}};
+            if (spool_bytes != 0 && nstage_drain < 7u) {
                 log_warning(
                     tt::LogMetal,
                     "[perf-debug profiler] Device {}: only {} staging slots fit, too few for the spool's bounce "
@@ -1929,13 +1660,7 @@ bool PerfDebugProfiler::boot_device(
                     d);
             }
             TT_FATAL(
-                (drisc_zones() ? (kernel_profiler::SPSC_SPAN_PREFIX_WORDS +
-                                  kernel_profiler::PROFILER_L1_CONTROL_VECTOR_SIZE +
-                                  kernel_profiler::PROFILER_L1_VECTOR_SIZE) *
-                                     4u
-                               : 0u) +
-                        my_cores * 32u <=
-                    slot_bytes_all,
+                my_cores * 32u <= slot_bytes_all,
                 "CV-first tails staging ({} cores x 32 B) does not fit inside the slot past the pipeline",
                 my_cores);
             auto drain_id = CreateKernel(
@@ -1945,8 +1670,8 @@ bool PerfDebugProfiler::boot_device(
                 DramConfig{
                     .noc = (drain_noc_override() < 0 ? false : drain_noc_override() == 1) ? NOC::NOC_1
                                                                                                   : NOC::NOC_0,
-                    .compile_args = cargs,
-                    .defines = {{"PERF_DEBUG_DRAIN_KERNEL", "1"}}});
+                    .defines = {{"PERF_DEBUG_DRAIN_KERNEL", "1"}},
+                    .named_compile_args = cargs});
             std::vector<uint32_t> rt = {my_cores, static_cast<uint32_t>(prof_l1)};
             // Reversed: launch order follows global index, so the slice's last-launched cores (the
             // join-blind victims) land in the first-chunk slots, which are read and serviced first.
@@ -2039,10 +1764,8 @@ bool PerfDebugProfiler::boot_device(
                 device_id,
                 d,
                 elf_too_big ? " (drain kernel ELF EXCEEDS THE DRISC CODE REGION)" : "",
-                elf_too_big ? " Reduce drain-kernel code or disable a feature: "
-                              "TT_METAL_PERF_DEBUG_DRISC_ZONES=1 with DRISC_ZONE_DETAIL=1 plus "
-                              "TT_METAL_PERF_DEBUG_NOC_FOOTPRINT is the largest config (~180 B of headroom); "
-                              "a u64 division anywhere in the kernel costs a 956 B soft-div."
+                elf_too_big ? " Reduce drain-kernel code: a u64 division anywhere in the kernel costs a "
+                              "956 B soft-div."
                             : "",
                 what);
             ctx.drain_program[d].reset();
@@ -2067,47 +1790,6 @@ bool PerfDebugProfiler::boot_device(
             num_cores,
             nstage,
             slot_bytes);
-    }
-
-    // ---- DRISC SELF-PROFILING: register the drainer cores' identities ------------------------------------
-    //
-    // AFTER the bring-up loop, because a drainer's virtual coords only exist once it has been placed. A
-    // frame whose SPSC_CORE_XY is missing from the map is skipped whole -- silently.
-    if (self_zones_on) {
-        for (uint32_t d = 0; d < ctx.n_drisc; d++) {
-            const uint32_t xy = (static_cast<uint32_t>(ctx.drisc_virtual[d].x) & 0xFFFFu) |
-                                ((static_cast<uint32_t>(ctx.drisc_virtual[d].y) & 0xFFFFu) << 16);
-            ctx.core_of_xy[xy] = self_core0 + d;
-        }
-        // Mint the drainers' Tracy contexts up front. Only these six -- pre-creating the worker grid litters a
-        // capture with empty contexts (see start()), but a drainer core is guaranteed to produce zones when this
-        // knob is on, and creating a context costs a GpuNewContext+Populate+name that has no business happening
-        // on the drain path.
-        std::vector<std::pair<uint32_t, uint32_t>> drisc_noc0;
-        for (uint32_t d = 0; d < ctx.n_drisc; d++) {
-            const auto it = ctx.virt_to_noc0.find(
-                (static_cast<uint64_t>(ctx.drisc_virtual[d].x) << 32) | static_cast<uint64_t>(ctx.drisc_virtual[d].y));
-            if (it != ctx.virt_to_noc0.end()) {
-                drisc_noc0.push_back(it->second);
-            }
-        }
-        self_zone_cores_[ctx.chip_id] = std::move(drisc_noc0);
-        log_info(
-            tt::LogMetal,
-            "[perf-debug profiler] Device {}: DRISC SELF-PROFILING on -- {} drainer cores get lanes [{},{}) "
-            "and their own Tracy rows | TRACING every sweep in a work-armed window (hold {} us past the last "
-            "work), detail {} | budget {} frames/DRISC ({:.0f} KB) | a drainer's staging slot count drops "
-            "{} -> {} to make room",
-            device_id,
-            ctx.n_drisc,
-            self_core0 * kNRisc,
-            ctx.nl,
-            drisc_zone_hold_cycles() / 1350u,
-            drisc_zone_detail() == 0 ? "0 (SWEEP + PACE only)" : "1 (full per-batch phases)",
-            drisc_zone_frames(),
-            drisc_zone_frames() * slot_bytes_all / 1024.0,
-            nstage_report,
-            nstage_report > 0 ? nstage_report - 1 : 0);
     }
 
     return true;
@@ -2169,106 +1851,12 @@ void PerfDebugProfiler::dump_drainer_state(DeviceCtx& ctx, uint32_t d, const cha
     }
 }
 
-// COMMON-TRIGGER SYNC EVENT: release every drainer from a rendezvous barrier (req | ack | go in the pad behind
-// `stop`) so all six mark the SAME instant, leaving anchor + render error as the only thing the spread contains.
-// Waiting for every `ack` is load-bearing -- it guarantees no core is still mid-sweep (~157 us of phase error).
-// The release is 6 sequential writes (scattered DRAM cores are not a multicast rectangle), so the ORDER IS
-// ROTATED per generation: that turns the write skew from an unknown into a measurable, separable term (N+48).
-void PerfDebugProfiler::fire_sync_events() {
-    const uint32_t n = sync_event_count();
-    if (n == 0 || devices_.empty()) {
-        return;
-    }
-    auto& cluster = MetalContext::instance().get_cluster();
-    for (auto& ctx : devices_) {
-        // Collect the participants once: a drainer with no program never parks, and waiting on its ack would
-        // time out every trigger.
-        std::vector<uint32_t> live;
-        for (uint32_t d = 0; d < ctx.n_drisc; d++) {
-            if (ctx.drain_program[d] != nullptr) {
-                live.push_back(d);
-            }
-        }
-        if (live.empty()) {
-            continue;
-        }
-        auto word = [&](uint32_t d, uint32_t off) {
-            return ctx.drisc_l1_noc[d] + (ctx.stop_addr[d] - ctx.drisc_l1_base[d]) + off;
-        };
-        for (uint32_t gen = 1; gen <= n; gen++) {
-            // 1. ask everyone to park.
-            for (uint32_t d : live) {
-                cluster.write_core(&gen, sizeof(gen), tt_cxy_pair(ctx.chip_id, ctx.drisc_virtual[d]), word(d, 4));
-            }
-            // 2. wait for every ack. A drainer notices `req` at the top of its next sweep, so the wait is one
-            // sweep at worst (~157 us on a filler, ~1.3 us on a mover); 2 s is 4 orders of magnitude of slack
-            // and only expires if a drainer is genuinely not looping.
-            bool all_parked = true;
-            const auto dl = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-            for (uint32_t d : live) {
-                uint32_t ack = 0;
-                while (std::chrono::steady_clock::now() < dl) {
-                    cluster.read_core(&ack, sizeof(ack), tt_cxy_pair(ctx.chip_id, ctx.drisc_virtual[d]), word(d, 8));
-                    if (ack == gen) {
-                        break;
-                    }
-                }
-                if (ack != gen) {
-                    log_warning(
-                        tt::LogMetal,
-                        "[perf-debug profiler] sync event gen {}: DRISC {} never parked (ack={}); this trigger is "
-                        "INCOMPLETE and its spread must not be quoted -- a missing participant makes the spread "
-                        "over the cores that did answer look artificially tight",
-                        gen,
-                        d,
-                        ack);
-                    all_parked = false;
-                }
-            }
-            // 3. release. Rotated start, and the host clock is read either side so the skew is BOUNDED BY
-            // MEASUREMENT rather than by the 170 ns estimate.
-            const size_t rot = (gen - 1) % live.size();
-            const int64_t h0 = tracy::Profiler::GetTime();
-            for (size_t i = 0; i < live.size(); i++) {
-                const uint32_t d = live[(rot + i) % live.size()];
-                cluster.write_core(&gen, sizeof(gen), tt_cxy_pair(ctx.chip_id, ctx.drisc_virtual[d]), word(d, 12));
-            }
-            const int64_t h1 = tracy::Profiler::GetTime();
-            std::string order;
-            for (size_t i = 0; i < live.size(); i++) {
-                order += fmt::format("{}{}", i ? "," : "", live[(rot + i) % live.size()]);
-            }
-            log_info(
-                tt::LogMetal,
-                "[perf-debug profiler] SYNC EVENT gen {} fired on device {}: release order [{}], host-measured "
-                "write span {} ns over {} drainers ({:.0f} ns/write){}",
-                gen,
-                ctx.chip_id,
-                order,
-                h1 - h0,
-                live.size(),
-                live.empty() ? 0.0 : static_cast<double>(h1 - h0) / static_cast<double>(live.size()),
-                all_parked ? "" : " -- INCOMPLETE, see warning above");
-            if (gen < n) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(sync_event_gap_ms()));
-            }
-        }
-    }
-    // The frames carrying these zones are already in flight; give the reader/decoder/consumer chain a moment
-    // to pull them through before stop() starts quiescing, so a sync marker cannot be lost to teardown.
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-}
-
 void PerfDebugProfiler::stop() {
     if (stopped_.exchange(true)) {
         return;
     }
 
     // BEFORE any quiesce: the drainers must still be looping to answer a rendezvous, and firing here rather
-    // than at bring-up keeps the measurement out of the workload's way (a parked drainer is not draining) and
-    // lets the zone-name harvest run against already-compiled kernels.
-    fire_sync_events();
-
     // Producers before consumers: let the rings empty while the fillers are still draining them, so no
     // producer ever meets a stopped consumer.
     for (auto& ctx : devices_) {
@@ -2321,526 +1909,6 @@ void PerfDebugProfiler::stop() {
                 // byte this socket will ever carry -- the stream can retire itself on one final empty check.
                 receiver_->notify_producers_done(static_cast<uint32_t>(&ctx - devices_.data()), d);
             }
-            // The drainer's own view of the run. Host-side page and marker counts cannot distinguish a
-            // bandwidth wall from a latency one; sweeps/frames/cycles can.
-            std::vector<uint32_t> res(kernel_profiler::SPSC_DRAIN_RESULT_WORDS, 0);
-            cluster.read_core(
-                res.data(),
-                res.size() * sizeof(uint32_t),
-                drisc,
-                ctx.drisc_l1_noc[d] + (ctx.results_addr[d] - ctx.drisc_l1_base[d]));
-            auto u64 = [&res](size_t i) { return (static_cast<uint64_t>(res[i + 1]) << 32) | res[i]; };
-            const uint64_t cyc = u64(0);
-            const uint64_t dw = u64(2);
-            const double kCycPerUs = ctx.freq_ghz > 0.0 ? ctx.freq_ghz * 1000.0 : 1350.0;
-            log_info(
-                tt::LogMetal,
-                "[perf-debug profiler] DRISC: {} sweeps ({} idle), {} frames, {} pushes, {} words, {} pages, "
-                "max occ {}/{}, overflows {}, pace-gap {} cyc",
-                res[4],
-                res[20],
-                res[6],
-                res[9],
-                dw,
-                res[5],
-                res[7],
-                kernel_profiler::PROFILER_L1_VECTOR_SIZE,
-                res[8],
-                res[42]);
-            log_info(
-                tt::LogMetal,
-                "[perf-debug profiler] NoC check: runtime noc_index before Noc{{}} = {}, after = {}; "
-                "compile-time NOC_INDEX = {}, read NoC = {}{}",
-                res[36],
-                res[37],
-                res[38],
-                res[39],
-                res[37] != res[38] ? "  <<< MISMATCH: the default-arg write barrier watches the WRONG NoC"
-                                   : "  (agree -- default-arg barrier is correct)");
-            // A bounded credit wait means a wedged consumer costs FRAMES, not the workload. Never let that
-            // trade happen quietly: without this line a dropped frame is indistinguishable from a clean run.
-            if (res[33] != 0 || res[34] != 0) {
-                log_warning(
-                    tt::LogMetal,
-                    "[perf-debug profiler] CREDIT WAIT TIMED OUT {}x -- dropped {} frames to keep the "
-                    "workload running. The host consumer stopped acking (see the writer WALL TIMEOUT above); "
-                    "capture for those frames is lost but the producers were never blocked.{}",
-                    res[33],
-                    res[34],
-                    res[35] != 0 ? " EGRESS DECLARED DEAD: a write barrier expired, so the drainer stopped "
-                                   "shipping and left its loop rather than reuse staging with writes still in "
-                                   "flight."
-                                 : "");
-            }
-            // Per-phase, so a lifetime average can never again hide that empty and loaded sweeps differ by
-            // orders of magnitude. `reserve` is the host FIFO credit wait: if that dominates, the DRISC is not
-            // the bottleneck at all -- the host consumer is.
-            const uint64_t c_read = u64(10), c_proc = u64(12), c_res = u64(14), c_wr = u64(16), c_bar = u64(18);
-            const uint64_t c_idle = u64(21), c_busy = u64(23);
-            const uint64_t c_pace = u64(136);
-            // u64(138) is the drain pump's off-gap time (its in-gap passes are already inside c_pace).
-            const uint64_t acct = c_read + c_proc + c_res + c_wr + c_bar + c_pace + u64(138);
-            auto pct = [cyc](uint64_t v) {
-                return cyc ? (100.0 * static_cast<double>(v) / static_cast<double>(cyc)) : 0.0;
-            };
-            // A phase cannot exceed the residency it is a phase OF. When one does, the counter word is not a
-            // duration -- a drainer that never reached its results write leaves stale L1 there, and the
-            // percentage then prints as nonsense (observed: "reserve(credit-wait) 1653073683357.0%", and
-            // "proc 18727729111430.1%" before that). Say which counter is unusable instead of formatting it.
-            {
-                const std::pair<const char*, uint64_t> phases[] = {{"read", c_read},
-                                                                   {"proc", c_proc},
-                                                                   {"reserve", c_res},
-                                                                   {"write", c_wr},
-                                                                   {"wr-barrier", c_bar},
-                                                                   {"pace", c_pace}};
-                std::string bad;
-                for (const auto& [name, v] : phases) {
-                    if (v > cyc) {
-                        bad += fmt::format("{}={} ", name, v);
-                    }
-                }
-                if (!bad.empty()) {
-                    log_warning(
-                        tt::LogMetal,
-                        "[perf-debug profiler] DRISC {}: phase counters exceed the {:.1f} ms residency, so they "
-                        "are not durations -- treat the phase line below as unusable for this drainer. Raw: {}",
-                        d,
-                        cyc / kCycPerUs / 1000.0,
-                        bad);
-                }
-            }
-            if (res[193] != 0) {
-                // 8192 cycles is the first bucket's ceiling; each later bucket doubles.
-                std::string h;
-                double lo = 8192.0 / kCycPerUs;
-                for (uint32_t i = 0; i < 8; i++) {
-                    h += fmt::format("{}<{:.0f}us={} ", i == 7 ? ">=" : "", lo, res[194 + i]);
-                    lo *= 2.0;
-                }
-                log_info(
-                    tt::LogMetal,
-                    "[perf-debug profiler] DRISC service interval per core: max {:.1f} us | {}",
-                    res[193] / kCycPerUs,
-                    h);
-            }
-            if (res[206] + res[208] + res[210] + res[212] != 0) {
-                log_info(
-                    tt::LogMetal,
-                    "[perf-debug profiler] DRISC phase maxima: bar {:.2f} us @{} | read-wait {:.2f} us @{} | "
-                    "cv {:.2f} us @{} | pump {:.2f} us @{}",
-                    res[206] / kCycPerUs,
-                    res[207],
-                    res[208] / kCycPerUs,
-                    res[209],
-                    res[210] / kCycPerUs,
-                    res[211],
-                    res[212] / kCycPerUs,
-                    res[213]);
-            }
-
-            if (res[191] != 0) {
-                // The line that answers "is the drainer actually idle while producers stall". Scoped to
-                // first-ship..last-ship, so it excludes the residency the lifetime line is swamped by.
-                const double wcyc = static_cast<double>(res[181]) + 4294967296.0 * res[182];
-                const double wbusy = static_cast<double>(res[183]) + 4294967296.0 * res[184];
-                const double widle = static_cast<double>(res[185]) + 4294967296.0 * res[186];
-                const double wpace = static_cast<double>(res[187]) + 4294967296.0 * res[188];
-                const double wms = wcyc / kCycPerUs / 1000.0;
-                const auto wp = [&](double v) { return wcyc > 0 ? 100.0 * v / wcyc : 0.0; };
-                log_info(
-                    tt::LogMetal,
-                    "[perf-debug profiler] DRISC WINDOW (data flowing) {:.1f} ms: busy-sweeps {:.1f}% | "
-                    "idle-sweeps {:.1f}% | pace {:.1f}% || {} frames over {} sweeps on {} cores -> a core is "
-                    "shipped every {:.1f} us",
-                    wms,
-                    wp(wbusy),
-                    wp(widle),
-                    wp(wpace),
-                    res[189],
-                    res[190],
-                    res[192],
-                    res[189] != 0 ? (wcyc / kCycPerUs) * res[192] / res[189] : 0.0);
-            }
-            log_info(
-                tt::LogMetal,
-                "[perf-debug profiler] DRISC LIFETIME phases of {:.1f} ms (residency, NOT the capture -- see "
-                "the WINDOW line): read {:.1f}% | proc {:.1f}% | "
-                "reserve(credit-wait) {:.1f}% | write {:.1f}% | wr-barrier {:.1f}% | pace {:.1f}% | "
-                "unaccounted {:.1f}%",
-                cyc / kCycPerUs / 1000.0,
-                pct(c_read),
-                pct(c_proc),
-                pct(c_res),
-                pct(c_wr),
-                pct(c_bar),
-                pct(c_pace),
-                pct(cyc > acct ? cyc - acct : 0));
-            if (res[170] != 0 || res[171] != 0) {
-                log_info(
-                    tt::LogMetal,
-                    "[perf-debug profiler] DRISC ship threshold: {} core visits deferred, {} ships forced by age",
-                    res[170],
-                    res[171]);
-            }
-            if (spool_buffer_ != nullptr) {
-                const uint64_t spooled = u64(140);
-                const uint64_t drain_cyc = u64(138);
-                log_info(
-                    tt::LogMetal,
-                    "[perf-debug profiler] DRISC GDDR spool: {:.1f} MiB spooled, peak occ {} KiB of {} MiB, "
-                    "{} refills, {} host pushes ({} credit-starved passes), pump {:.1f} ms off-gap",
-                    spooled / 1048576.0,
-                    res[51] >> 10,
-                    dram_spool_mb(),
-                    res[49],
-                    res[52],
-                    res[50],
-                    drain_cyc / kCycPerUs / 1000.0);
-            }
-            // A full spool is back-pressure (deferred cores, stalled producers), never loss -- this fires
-            // only when the pump made no progress for the dead-consumer bound, the same contract as the
-            // direct path's credit timeout.
-            if (res[48] != 0 || res[135] != 0 || res[142] != 0 || res[144] != 0) {
-                log_warning(
-                    tt::LogMetal,
-                    "[perf-debug profiler] GDDR SPOOL LOSS: {} frames dropped{}{}{} -- the host consumer "
-                    "stopped draining (dead or wedged); capture is lost but the workload was never blocked",
-                    res[48],
-                    res[144] != 0 ? " after the spool egress made no progress for the dead-consumer bound" : "",
-                    res[135] != 0 ? ", exit drain DEADLINE EXPIRED" : "",
-                    res[142] != 0 ? fmt::format(", {} bytes stranded in the spool", res[142]) : "");
-            }
-            // Distribution of each busy sweep's PEAK unconsumed lane, in eighths of the ring.
-            log_info(
-                tt::LogMetal,
-                "[perf-debug profiler] DRISC busy-sweep peak-lane/8ths [{} {} {} {} {} {} {} {}]",
-                res[53],
-                res[54],
-                res[55],
-                res[56],
-                res[57],
-                res[58],
-                res[59],
-                res[60]);
-            if (res[63] != 0) {
-                const uint64_t scan_cyc = (static_cast<uint64_t>(res[62]) << 32) | res[61];
-                log_info(
-                    tt::LogMetal,
-                    "[perf-debug profiler] DRISC control scan: {:.0f} ns/core over {} core-visits",
-                    static_cast<double>(scan_cyc) / kCycPerUs * 1000.0 / static_cast<double>(res[63]),
-                    res[63]);
-            }
-            // read sub-split, WORKLOAD-WINDOW scoped (the lifetime counters are dominated by idle CV
-            // polling): the CV pass and the gather issue are DRISC-serial whatever the NoC does; only
-            // the residual wait shrinks with overlap. Which dominates picks the next lever (kill the
-            // CV pass vs cheaper issue vs more overlap).
-            if (res[191] != 0 && res[190] != 0) {
-                const double sweeps_w = static_cast<double>(res[190]);
-                const uint64_t w_cv = (static_cast<uint64_t>(res[203]) << 32) | res[202];
-                const uint64_t w_issue = (static_cast<uint64_t>(res[205]) << 32) | res[204];
-                const uint64_t w_busy = (static_cast<uint64_t>(res[184]) << 32) | res[183];
-                log_info(
-                    tt::LogMetal,
-                    "[perf-debug profiler] DRISC read split (workload window): cv-pass {:.2f} us/sweep | "
-                    "gather-issue {:.2f} us/sweep | busy {:.2f} us/sweep",
-                    w_cv / kCycPerUs / sweeps_w,
-                    w_issue / kCycPerUs / sweeps_w,
-                    w_busy / kCycPerUs / sweeps_w);
-            }
-            if (res[214] != 0) {
-                const uint64_t cva = (static_cast<uint64_t>(res[216]) << 32) | res[215];
-                log_info(
-                    tt::LogMetal,
-                    "[perf-debug profiler] DRISC cv-age at head-relief: avg {:.2f} us | max {:.2f} us over {} "
-                    "reliefs -- ring words produced inside this window are invisible to the relief",
-                    cva / kCycPerUs / res[214],
-                    res[217] / kCycPerUs,
-                    res[214]);
-            }
-            // proc sub-split. `proc` is the biggest busy-sweep phase, and it is two unrelated things:
-            // a LOCAL scan of the staged control vectors, and a per-live-core 20 B NoC head write-back
-            // (up to one issue per core per sweep). This drainer is issue-bound, so which half dominates
-            // decides the optimization: batch/rate-limit the write-back, or tighten the per-RISC loops.
-            const uint64_t c_ph_head = (static_cast<uint64_t>(res[41]) << 32) | res[40];
-            log_info(
-                tt::LogMetal,
-                "[perf-debug profiler] DRISC proc split: head-write-back {:.1f}% of busy ({:.1f}% of proc) | "
-                "scan {:.1f}% of busy -- head-write-back is {} NoC issues/sweep, scan is local L1",
-                pct(c_ph_head),
-                c_proc ? (100.0 * static_cast<double>(c_ph_head) / static_cast<double>(c_proc)) : 0.0,
-                pct(c_proc > c_ph_head ? c_proc - c_ph_head : 0),
-                // WORKER cores. With self-profiling on, core_virt also holds the drainers, and the head
-                // write-back is issued to producers only -- reporting 126 issues/sweep on a 120-core grid.
-                ctx.n_worker_cores != 0 ? ctx.n_worker_cores : ctx.core_virt.size());
-            // WORST-SWEEP breakdown. The knee is decided by the worst sweep, not the mean, and the worst
-            // has been running ~2.5x the mean with no explanation. These are that one sweep's phases.
-            {
-                const double ws_tot = static_cast<double>(res[43] + res[44] + res[45] + res[46] + res[47]);
-                log_info(
-                    tt::LogMetal,
-                    "[perf-debug profiler] WORST sweep {:.1f} us = read {:.1f} + proc {:.1f} + credit-wait "
-                    "{:.1f} + write {:.1f} + wr-barrier {:.1f} us (accounted {:.1f} us, {:.0f}%)",
-                    res[25] / kCycPerUs,
-                    res[43] / kCycPerUs,
-                    res[44] / kCycPerUs,
-                    res[45] / kCycPerUs,
-                    res[46] / kCycPerUs,
-                    res[47] / kCycPerUs,
-                    ws_tot / kCycPerUs,
-                    res[25] ? 100.0 * ws_tot / static_cast<double>(res[25]) : 0.0);
-            }
-            // ---- DRISC SELF-PROFILING counters (only printed when the knob is on) ----
-            //
-            // Everything needed to tell "captured the right 0.5% of the run" from "captured the idle loop and
-            // looked healthy doing it": how many captured sweeps DID WORK (the ones that matter -- a mover's
-            // credit wait only exists on those), how many were discarded, how many were refused for budget, and
-            // the bytes. A summary frame count alone cannot distinguish those cases, which is the failure mode
-            // this whole block exists to make impossible.
-            if (res[64] != 0 || res[66] != 0 || res[69] != 0) {
-                const uint64_t c_self_cyc = (static_cast<uint64_t>(res[72]) << 32) | res[71];
-                // Packed wire cost: shipped words plus each frame's 320 B prefix+control (pads ignorable).
-                const uint32_t self_bytes = res[87] * 4u + res[64] * 320u;
-                log_info(
-                    tt::LogMetal,
-                    "[perf-debug profiler] DRISC {} SELF-ZONES ({}, detail {}): TRACED {} of {} sweeps "
-                    "({:.1f}% of ALL sweeps, {} of them did work) across {} work window(s) | {} frames of a {} "
-                    "budget ({:.0f} KB, {:.2f}% of this drainer's {:.1f} MB egress) | {} markers, {} words, "
-                    "{:.1f} markers/sweep | publish cost {:.2f} ms ({:.2f}% of the run){}{}",
-                    d,
-                    "FILLER",
-                    res[86],
-                    res[66],
-                    res[4],
-                    res[4] ? 100.0 * res[66] / static_cast<double>(res[4]) : 0.0,
-                    res[67],
-                    res[68],
-                    res[64],
-                    res[85],
-                    self_bytes / 1024.0,
-                    res[5] ? 100.0 * self_bytes / (static_cast<double>(res[5]) * 64.0) : 0.0,
-                    (static_cast<double>(res[5]) * 64.0) / (1024.0 * 1024.0),
-                    res[65],
-                    res[73],
-                    res[66] ? static_cast<double>(res[65]) / res[66] : 0.0,
-                    (static_cast<double>(c_self_cyc) / kCycPerUs) / 1000.0,
-                    cyc ? 100.0 * static_cast<double>(c_self_cyc) / static_cast<double>(cyc) : 0.0,
-                    // The budget is a COVERAGE limit now, so say when it bound: the row just ends, and a short
-                    // row is otherwise indistinguishable from a drainer that stopped having work to do.
-                    res[69] != 0 ? fmt::format(
-                                       "  <<< BUDGET EXHAUSTED after {} frames: {} later sweeps went untraced, "
-                                       "so this row ENDS EARLY rather than the drainer going idle. Raise "
-                                       "TT_METAL_PERF_DEBUG_DRISC_ZONE_FRAMES.",
-                                       res[64],
-                                       res[69])
-                                 : std::string(),
-                    res[70] != 0 ? fmt::format(" | {} markers LOST (a publish could not free the ring)", res[70])
-                                 : std::string());
-                // COMMON-TRIGGER SYNC EVENT. Reported per drainer because the measurement is only valid if
-                // EVERY participant answered EVERY trigger: a drainer that timed out at the barrier contributed
-                // no marker, and the spread over the cores that did answer would then read artificially tight.
-                // So state the counts and warn on any timeout rather than leaving it to be inferred from a
-                // missing row in the CSV.
-                if (res[130] != 0 || res[131] != 0) {
-                    log_info(
-                        tt::LogMetal,
-                        "[perf-debug profiler] DRISC {} SYNC EVENTS: {} marked, {} timed out | last barrier park "
-                        "{:.1f} us",
-                        d,
-                        res[130],
-                        res[131],
-                        res[132] / kCycPerUs);
-                }
-                if (res[131] != 0) {
-                    log_warning(
-                        tt::LogMetal,
-                        "[perf-debug profiler] DRISC {} SYNC EVENTS: {} barrier(s) were NEVER RELEASED. Those "
-                        "triggers are incomplete and their spread is not a valid alignment measurement.",
-                        d,
-                        res[131]);
-                }
-                // Trace COMPLETENESS: every word written into the self ring must have been shipped. A shortfall
-                // is trace stranded in the ring at teardown, which no other counter reveals -- it just makes the
-                // Tracy row end early, indistinguishable from the drainer going quiet.
-                if (res[87] != res[73]) {
-                    log_warning(
-                        tt::LogMetal,
-                        "[perf-debug profiler] DRISC {} SELF-ZONES: {} of {} words shipped -- {} words ({} "
-                        "markers) of this drainer's own trace were STRANDED IN THE RING at teardown, so its "
-                        "Tracy row ends early.",
-                        d,
-                        res[87],
-                        res[73],
-                        res[73] - res[87],
-                        (res[73] - res[87]) / 2);
-                }
-                // A capture whose sweeps all turned out idle is a FAILED capture even though every count above
-                // looks healthy -- on a mover especially, since the credit wait that sets the knee only happens
-                // on a busy visit. Say so rather than let a plausible frame count stand in for coverage.
-                if (res[66] != 0 && res[67] == 0) {
-                    log_warning(
-                        tt::LogMetal,
-                        "[perf-debug profiler] DRISC {} SELF-ZONES: all {} traced sweeps were IDLE -- the window "
-                        "opened but nothing of consequence happened inside it. Treat this row as cadence only.",
-                        d,
-                        res[66]);
-                }
-            }
-            // ---- NoC FOOTPRINT (out[88..129], TT_METAL_PERF_DEBUG_NOC_FOOTPRINT=1) ----
-            //
-            // The hardware's own tally of what this drainer put on the mesh, replacing arithmetic over
-            // frame counts. TWO BLOCKS, NEVER BLENDED: the workload window (first busy sweep -> last busy
-            // sweep) and the resident lifetime (device open -> teardown). A resident drainer polls from
-            // device open, so the lifetime figure is dominated by traffic no workload asked for, and one
-            // number for both is the wrong-population trap this file has been burned by twice.
-            if (res[128] != 0) {
-                const uint32_t wbytes = res[129];  // NOC_WORD_BYTES, from the device header -- never hardcoded
-                // The Tracy PLOT path cannot afford a per-sample lookup, so it carries kNocWordBytes = 64 as a
-                // constant -- the one assumed input in an otherwise measured chain. Cross-check it against the
-                // device's own value here and say so loudly on a mismatch, otherwise every NoC GB/s plot would
-                // be silently mis-scaled while this block stayed correct.
-                if (wbytes != 64u) {
-                    log_error(
-                        tt::LogMetal,
-                        "[perf-debug profiler] NOC_WORD_BYTES is {} on device but the Tracy plot path assumes 64 "
-                        "-- every NoC GB/s plot is scaled by {}x. Fix kNocWordBytes in "
-                        "perf_debug_profiler_tracy_handler.cpp.",
-                        wbytes,
-                        wbytes / 64.0);
-                }
-                auto q = [&](uint32_t base, uint32_t noc, uint32_t k) {
-                    const uint32_t o = base + (noc * 4u + k) * 2u;
-                    return (static_cast<uint64_t>(res[o + 1]) << 32) | res[o];
-                };
-                // A posted write is acked without the data words being counted where we read them, so a
-                // res[125]/[126] are retired zeros: the kernel's write totals now sum posted +
-                // non-posted words (the DMA mover's PCIe pushes are posted by design).
-                const bool posted_ok = true;
-                const bool win_ok = (res[127] != 0);
-                for (uint32_t blk = 0; blk < 2; blk++) {
-                    const uint32_t base = (blk == 0) ? 104u : 88u;
-                    if (blk == 0 && !win_ok) {
-                        log_warning(
-                            tt::LogMetal,
-                            "[perf-debug profiler] DRISC {} NoC FOOTPRINT -- WORKLOAD WINDOW: no sweep ever "
-                            "did work, so there is no window to report. Lifetime block follows.",
-                            d);
-                        continue;
-                    }
-                    uint64_t rw = 0, rt = 0, ww = 0, wt = 0;
-                    for (uint32_t n = 0; n < 2; n++) {
-                        rw += q(base, n, 0);
-                        rt += q(base, n, 1);
-                        ww += q(base, n, 2);
-                        wt += q(base, n, 3);
-                    }
-                    const uint64_t bytes = (rw + ww) * wbytes;
-                    const uint64_t txns = rt + wt;
-                    log_info(
-                        tt::LogMetal,
-                        "[perf-debug profiler] DRISC {} NoC FOOTPRINT -- {}: {:.2f} MB in {} txns "
-                        "[NoC0 rd {:.2f} MB/{} txn, wr {:.2f} MB/{} txn | NoC1 rd {:.2f} MB/{} txn, wr "
-                        "{:.2f} MB/{} txn] | mean {} B/txn{}",
-                        d,
-                        blk == 0 ? "WORKLOAD WINDOW" : "RESIDENT LIFETIME",
-                        bytes / (1024.0 * 1024.0),
-                        txns,
-                        q(base, 0, 0) * wbytes / (1024.0 * 1024.0),
-                        q(base, 0, 1),
-                        q(base, 0, 2) * wbytes / (1024.0 * 1024.0),
-                        q(base, 0, 3),
-                        q(base, 1, 0) * wbytes / (1024.0 * 1024.0),
-                        q(base, 1, 1),
-                        q(base, 1, 2) * wbytes / (1024.0 * 1024.0),
-                        q(base, 1, 3),
-                        txns != 0 ? bytes / txns : 0,
-                        posted_ok ? "" : "  <<< POSTED WRITES SEEN: byte totals are UNDER-reported");
-                    if (blk == 0) {
-                        const uint64_t wcyc = (static_cast<uint64_t>(res[122]) << 32) | res[121];
-                        log_info(
-                            tt::LogMetal,
-                            "[perf-debug profiler] DRISC {}   window = {} sweeps / {} cycles. Amplification "
-                            "is NOT printed here: the frame payload is on the role-split line above, and a "
-                            "ratio belongs in FINDINGS with its derivation shown rather than asserted here",
-                            d,
-                            res[120],
-                            wcyc);
-                    }
-                }
-                // The instrument's own cost, as a share of the run. If this is not small the footprint
-                // numbers describe a perturbed drainer, and N+41 measured that +4% on idle-sweep cost is
-                // enough to cross the knee at SD delay 15.
-                const uint64_t nfc = (static_cast<uint64_t>(res[124]) << 32) | res[123];
-                log_info(
-                    tt::LogMetal,
-                    "[perf-debug profiler] DRISC {}   instrument cost {} cycles over {} sweeps "
-                    "({} cyc/sweep) -- compare against the sweep durations above before trusting the "
-                    "footprint at the knee",
-                    d,
-                    nfc,
-                    res[4],
-                    res[4] != 0 ? nfc / res[4] : 0);
-                log_info(
-                    tt::LogMetal,
-                    "[perf-debug profiler] DRISC {}   NO workload-relative percentage is quoted: the "
-                    "workload's own NoC traffic was not measured. That needs victim-side NIU_SLV deltas "
-                    "against a drainers-off baseline.",
-                    d);
-            }
-            // The cross-check side: phase totals over EXACTLY the sweeps the zones describe, so summing
-            // zone durations per name out of the Tracy capture must reproduce these. See the kernel.
-            auto u64r = [&res](size_t i) { return (static_cast<uint64_t>(res[i + 1]) << 32) | res[i]; };
-            if (res[86] != 0) {
-                log_info(
-                    tt::LogMetal,
-                    "[perf-debug profiler] DRISC {} SELF-ZONES cross-check over {} fully-instrumented sweeps: "
-                    "read {:.1f} us | proc {:.1f} us | credit-wait {:.1f} us | write {:.1f} us | wr-barrier "
-                    "{:.1f} us -- sum(DRISC-READ)+sum(DRISC-READ-WAIT), sum(DRISC-PROC)-sum(DRISC-CREDIT-WAIT)"
-                    "-sum(DRISC-WRITE), sum(DRISC-CREDIT-WAIT), sum(DRISC-WRITE), sum(DRISC-WR-BARRIER) from "
-                    "the capture must match these",
-                    d,
-                    res[74],
-                    u64r(75) / kCycPerUs,
-                    u64r(77) / kCycPerUs,
-                    u64r(79) / kCycPerUs,
-                    u64r(81) / kCycPerUs,
-                    u64r(83) / kCycPerUs);
-            }
-            const uint32_t sweeps_busy = res[4] > res[20] ? res[4] - res[20] : 0;
-            log_info(
-                tt::LogMetal,
-                "[perf-debug profiler] DRISC sweeps: idle {} @ {:.1f} us | busy {} @ {:.1f} us | worst sweep "
-                "{:.1f} us | worst credit-wait {:.1f} us",
-                res[20],
-                res[20] ? (static_cast<double>(c_idle) / kCycPerUs) / res[20] : 0.0,
-                sweeps_busy,
-                sweeps_busy ? (static_cast<double>(c_busy) / kCycPerUs) / sweeps_busy : 0.0,
-                res[25] / kCycPerUs,
-                res[26] / kCycPerUs);
-            if (res[133] != 0) {
-                log_info(
-                    tt::LogMetal,
-                    "[perf-debug profiler] DRISC {} stop-path drain: {} sweeps after stop, {} words recovered",
-                    d,
-                    res[133],
-                    res[134]);
-            }
-            // write sub-split. Exact per busy sweep: emit_run only executes when a frame is being sent.
-            const uint64_t c_chunk = u64(27), c_push = u64(29), c_notify = u64(31);
-            const double pu = res[9] ? static_cast<double>(res[9]) : 1.0;  // pushes
-            log_info(
-                tt::LogMetal,
-                "[perf-debug profiler] DRISC write split over {} pushes: "
-                "noc-chunk {:.2f} us/push ({:.1f} ms) | "
-                "push_pages {:.2f} us/push ({:.1f} ms) | notify {:.2f} us/push ({:.1f} ms)",
-                res[9],
-                (c_chunk / kCycPerUs) / pu,
-                c_chunk / kCycPerUs / 1000.0,
-                (c_push / kCycPerUs) / pu,
-                c_push / kCycPerUs / 1000.0,
-                (c_notify / kCycPerUs) / pu,
-                c_notify / kCycPerUs / 1000.0);
-
             // Release it to restore the NIU. It cannot do that until we say so: NOC2AXI forwards inbound
             // DRAM-range addresses to GDDR, so the flip takes this L1 out of the host's view.
             uint32_t two = 2;
