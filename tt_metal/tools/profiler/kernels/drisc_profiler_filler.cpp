@@ -83,11 +83,14 @@ constexpr uint32_t kLaneShipWords = (kRingWords * kShipMinPct) / 100u;
 // the filler exactly when it is needed.
 constexpr uint32_t kLaneTrigger = kRingWords / 2u;
 constexpr uint32_t kCvBusyPeak = kLaneTrigger / 2u;
-// Idle backoff ceiling, ~5 us. 20 us exceeded a lane's fill time at high rates.
-constexpr uint32_t kCvIdleGapMax = 6750;
-// ~50 ms: the worst-case host staleness for a workload too light to reach the occupancy bands.
-constexpr uint64_t kSpoolFreshCycles = 67500000ull;
-constexpr uint64_t kStopDrainCycles = 1350000000;
+constexpr uint64_t kCyclesPerUs = 1350;  // DRISC wall clock at the 1.35 GHz AICLK
+// Idle backoff ceiling. 20 us exceeded a lane's fill time at high rates.
+constexpr uint32_t kCvIdleGapMax = 5 * kCyclesPerUs;
+// Worst-case host staleness for a workload too light to reach the occupancy bands.
+constexpr uint64_t kSpoolFreshCycles = 50'000 * kCyclesPerUs;
+constexpr uint64_t kStopDrainCycles = 1'000'000 * kCyclesPerUs;
+// How long the exit waits for the host's NIU-restore word before restoring anyway.
+constexpr uint64_t kNiuRestoreWaitCycles = 10'000'000 * kCyclesPerUs;
 
 static_assert(kSpanWords * 4u <= NOC_MAX_BURST_SIZE, "a span read must fit one NoC burst");
 static_assert(kRingWords * 4u <= NOC_MAX_BURST_SIZE, "a whole-ring gather must fit one NoC burst");
@@ -951,7 +954,7 @@ void kernel_main() {
     }
     // The posted head write-backs are outside that barrier's predicate; drain their sent counter
     // (small packets stream out in nanoseconds) so no unstreamed head is left behind.
-    const uint64_t t_ps = get_timestamp() + 1350000u;
+    const uint64_t t_ps = get_timestamp() + 1000 * kCyclesPerUs;
     while (!(ncrisc_noc_posted_writes_sent(NOC_INDEX) && ncrisc_noc_posted_writes_sent(kReadNoc)) &&
            get_timestamp() < t_ps) {
     }
@@ -970,7 +973,7 @@ void kernel_main() {
     // NIU restore, on the host's word. NIU_CFG_0 persists until chip reset, so whoever set stream
     // mode owns putting it back -- and last, because the flip to NOC2AXI takes this L1 (`done`,
     // the results, bytes_acked) out of the host's view.
-    for (uint32_t spins = 0; spins < 200000000u && *stop != 2u; spins++) {
+    for (const uint64_t t_end = get_timestamp() + kNiuRestoreWaitCycles; *stop != 2u && get_timestamp() < t_end;) {
         invalidate_l1_cache();
     }
     experimental::drisc_set_noc2axi_mode_all();
