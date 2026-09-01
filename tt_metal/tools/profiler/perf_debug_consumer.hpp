@@ -6,17 +6,19 @@
 // table consumers resolve identity against, and the batch-callback types.
 //
 // Stream contracts:
-//  - A zone arrives as ONE record: `Zone`, carrying its start timestamp and duration. Worker
-//    zones ship from the device already whole (one ZONE_ATOMIC packet at scope close); the few
-//    remaining start/end pairs (stall zone, >3.2s fallback) are paired by the
-//    receiver BEFORE delivery -- consumers never see an unpaired half.
+//  - A zone arrives as ONE record: `Zone`, carrying its start timestamp and duration. The
+//    receiver pairs the device's raw start/end markers per lane (they are RAII scopes on the
+//    device, so per lane they obey strict stack discipline) BEFORE delivery -- consumers never
+//    see an unpaired half.
 //  - A Zone is emitted when it CLOSES, so per lane, Zones arrive in END order: with nested
 //    zones the child precedes its parent and data.zone.start is NOT monotonic. start+duration
 //    is complete information; sort on start if your analysis needs open order.
 //  - Cross-lane and cross-socket interleaving is arbitrary; demux by meta.lane / meta.dev.
-//  - A Data/Event head is followed immediately by one Ext record (data.ext = id<<32 | payload
-//    word count) and then Cont records (one payload uint64 each, hi word first), with no
-//    other records interleaved.
+//  - A Data head is followed immediately by one Ext record (id = payload word count, data.ext =
+//    payload words 1-2 as (hi << 32) | lo, zero-filled) and then Cont records for words 3 and up
+//    (one payload uint64 each, hi word first), with no other records interleaved. An Event is
+//    payload-less and arrives as ONE complete record -- nothing follows it.
+//  - ZoneTotal carries an accumulated duration sum (data.sum), not a timestamp.
 //  - Every id is the FULL 27-bit structural zone id (hostdevcommon/profiler_zone_id.h) and
 //    resolves to a name from the emitting binary's own ELF via ZoneNameMirror below --
 //    zones, Data and Event alike. (Event used to carry a runtime value here; that value now
@@ -39,12 +41,12 @@
 namespace tt::tt_metal::perf_debug {
 
 enum class PerfDebugRecType : uint32_t {
-    Zone = 1,  // a complete zone: data.zone = {start, duration}
-    // 2 retired (was ZoneTotal -- the SUM/accumulate zone, feature removed)
-    Data = 3,   // point marker with payload: data.ts; payload follows via Ext + Cont
-    Event = 4,  // point marker, no payload: data.ts
-    Ext = 5,    // Data/Event continuation header: data.ext = (id << 32) | payload word count
-    Cont = 6,   // one uint64 of Data payload: data.payload
+    Zone = 1,       // a complete zone: data.zone = {start, duration}
+    ZoneTotal = 2,  // accumulated-duration zone: data.sum
+    Data = 3,       // point marker with payload: data.ts; payload follows via Ext (+ Cont)
+    Event = 4,      // point marker, no payload: data.ts; complete in itself
+    Ext = 5,        // Data continuation: id = payload word count, data.ext = payload words 1-2
+    Cont = 6,       // one uint64 of Data payload (words 3 and up): data.payload
 };
 
 struct PerfDebugRecMeta {
@@ -59,7 +61,8 @@ struct PerfDebugRec {
     // The active member is decided by meta.type -- see the enum above.
     union DataField {
         uint64_t ts;       // Data / Event: head timestamp
-        uint64_t ext;      // Ext: (id << 32) | payload word count
+        uint64_t sum;      // ZoneTotal: accumulated duration
+        uint64_t ext;      // Ext: payload words 1-2, (hi << 32) | lo, zero-filled
         uint64_t payload;  // Cont: one payload uint64 (hi word first on the wire)
         struct {
             uint64_t start;     // device timestamp of the zone open
@@ -76,7 +79,7 @@ static_assert(std::is_trivially_copyable_v<PerfDebugRec>);
 inline constexpr uint32_t kPerfDebugMaxLanes = 1u << 10;
 inline constexpr uint32_t kPerfDebugMaxDevices = 1u << 3;
 
-enum class PerfDebugLaneRole : uint8_t { Worker = 0, Filler = 1, Mover = 2, Full = 3 };
+enum class PerfDebugLaneRole : uint8_t { Worker = 0, Filler = 1 };
 
 struct PerfDebugLaneInfo {
     uint32_t chip_id = 0;
@@ -140,6 +143,10 @@ struct PerfDebugRecordBatch {
     std::span<const PerfDebugRec> records;  // oldest first; valid only for the duration of the call
     uint64_t dropped_delta = 0;             // records THIS consumer lost to ring lag since its last batch
     const PerfDebugCaptureContext* context = nullptr;
+    // PRODUCER-STALL zones in this batch (matched by ELF-resolved name): each is one time a producer
+    // RISC blocked on a full L1 ring. Same delivery lag as the records themselves -- "stalls among
+    // what you are being handed", not wall-clock-recent.
+    uint64_t stall_delta = 0;
 };
 
 using PerfDebugRecordCallback = std::function<void(const PerfDebugRecordBatch&)>;

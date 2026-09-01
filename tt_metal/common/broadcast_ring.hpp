@@ -71,8 +71,39 @@ public:
      */
     explicit BroadcastRing(size_t capacity) :
         capacity_(capacity ? std::bit_ceil(capacity) : 1),
-        storage_(allocate_slots(capacity_)),
+        storage_(allocate_slots(capacity_, /*construct_slots=*/true)),
         writer_(&shared_state_, view()) {}
+
+    /**
+     * @brief Constructs the ring but leaves its slots UNTOUCHED, for a caller that will call
+     *        construct_slots() from the thread that is going to write them.
+     *
+     * First touch decides a page's NUMA node for the life of the mapping. Constructing the slots here binds
+     * every page to whichever thread happened to build the ring -- for a multi-GB ring written by a
+     * different thread at tens of GB/s, that is an interconnect crossing on every store. Deferring lets the
+     * writing thread fault its own pages, so the memory follows the thread rather than the constructor, with
+     * no affinity policy required.
+     */
+    struct DeferSlotInit {};
+    BroadcastRing(size_t capacity, DeferSlotInit) :
+        capacity_(capacity ? std::bit_ceil(capacity) : 1),
+        storage_(allocate_slots(capacity_, /*construct_slots=*/false)),
+        writer_(&shared_state_, view()) {}
+
+    /**
+     * @brief The anonymous mapping backing the slots, or {nullptr, 0} when the slots are heap-backed.
+     *
+     * Exposed so a caller can set a NUMA policy on the pages BEFORE construct_slots() faults them, which
+     * makes placement independent of which thread touches them first.
+     */
+    std::pair<void*, size_t> raw_mapping() const noexcept { return {storage_.map_base, storage_.map_bytes}; }
+
+    /** @brief Constructs the deferred slots. Call ONCE, before any reader or writer runs. */
+    void construct_slots() noexcept {
+        for (size_t i = 0; i < capacity_; i++) {
+            new (storage_.slots + i) Slot();
+        }
+    }
 
     ~BroadcastRing() {
         TT_FATAL(
@@ -478,30 +509,37 @@ private:
         size_t map_bytes = 0;
     };
 
-    // Large slot arrays are walked far beyond TLB reach, so back them with 2 MiB pages. THP is
-    // madvise-opt-in on typical deployments, hence the explicit mmap + MADV_HUGEPAGE (over-mapped by one
-    // huge page to guarantee an aligned start, which the huge-page fault path requires).
-    static SlotStorage allocate_slots(size_t n) {
+    // mmap-backed at EVERY size, not just the huge-page tier: a page-aligned base is what guarantees the
+    // cache-line alignment that direct emitters stream 64 B non-temporal stores against (via
+    // emit_slot_ptr) -- the new[] fallback's 16 B alignment general-protection-faulted such a store, which
+    // presents as a SIGSEGV at a nil address, on any ring small enough to have skipped the mmap. Large
+    // slot arrays are additionally walked far beyond TLB reach, so they get 2 MiB pages; THP is
+    // madvise-opt-in on typical deployments, hence the explicit MADV_HUGEPAGE (over-mapped by one huge
+    // page to guarantee an aligned start, which the huge-page fault path requires).
+    static SlotStorage allocate_slots(size_t n, bool construct_slots) {
         SlotStorage storage;
 #if defined(__linux__)
         static constexpr size_t kHugePageSize = size_t{2} << 20;
         static constexpr size_t kHugePageMinBytes = size_t{64} << 20;
         const size_t bytes = n * sizeof(Slot);
-        if (bytes >= kHugePageMinBytes) {
-            const size_t map_bytes = bytes + kHugePageSize;
-            void* base = ::mmap(nullptr, map_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-            if (base != MAP_FAILED) {
-                storage.map_base = base;
-                storage.map_bytes = map_bytes;
-                const uintptr_t aligned =
-                    (reinterpret_cast<uintptr_t>(base) + kHugePageSize - 1) & ~(kHugePageSize - 1);
+        const bool huge = bytes >= kHugePageMinBytes;
+        const size_t map_bytes = huge ? bytes + kHugePageSize : bytes;
+        void* base = ::mmap(nullptr, map_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (base != MAP_FAILED) {
+            storage.map_base = base;
+            storage.map_bytes = map_bytes;
+            uintptr_t aligned = reinterpret_cast<uintptr_t>(base);
+            if (huge) {
+                aligned = (aligned + kHugePageSize - 1) & ~(kHugePageSize - 1);
                 ::madvise(reinterpret_cast<void*>(aligned), bytes, MADV_HUGEPAGE);
-                storage.slots = reinterpret_cast<Slot*>(aligned);
+            }
+            storage.slots = reinterpret_cast<Slot*>(aligned);
+            if (construct_slots) {
                 for (size_t i = 0; i < n; i++) {
                     new (storage.slots + i) Slot();
                 }
-                return storage;
             }
+            return storage;
         }
 #endif
         storage.owned = std::make_unique<Slot[]>(n);

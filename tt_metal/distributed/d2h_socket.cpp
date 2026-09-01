@@ -22,6 +22,7 @@
 #include <tt-metalium/tt_align.hpp>
 #include <tt-logger/tt-logger.hpp>
 #include "impl/dispatch/system_memory_manager.hpp"
+#include "impl/threading/thread_pool.hpp"
 #include <umd/device/chip_helpers/tlb_manager.hpp>
 #include <algorithm>
 #include <cstdlib>
@@ -97,6 +98,15 @@ D2HSocket::PinnedBufferInfo D2HSocket::init_host_buffer(
             "Anonymous mmap failed for D2H socket buffer ({} B): {}",
             alloc_size,
             std::strerror(errno));
+        // Placed on the DEVICE's node before pinning (pages are immovable once gup holds them): the
+        // receiver binds its ingest thread to that node, and a FIFO left on the allocating thread's
+        // node makes every cold read cross the socket interconnect -- measured at ~half the local-node
+        // copy bandwidth.
+        bind_memory_to_numa_node(
+            p,
+            alloc_size,
+            static_cast<int>(MetalContext::instance().get_cluster().get_numa_node_for_device(
+                mesh_device->get_device(sender_core_.device_coord)->id())));
         aligned_ptr = p;
         host_buffer_ = std::shared_ptr<uint32_t[]>(
             static_cast<uint32_t*>(p), [alloc_size](uint32_t* ptr) { munmap(ptr, alloc_size); });
