@@ -192,6 +192,9 @@ static_assert(
 #define I_BATCH_BEGIN() const uint64_t t_batch0 = kInstr != 0 ? instr_now() : 0                                 //
 #define I_ZONE_ISSUE() ZoneRead z_issue(self_mark_phase)                                                        //
 #define I_BATCH_CVS() instr_add32(n_cv_rd, nn)                                                                  //
+#define I_CVAGE_WAVE() cvage_stamp(t_cv_cur)                                                                    //
+#define I_CVAGE_PREF() cvage_stamp(t_cv_next)                                                                   //
+#define I_CVAGE_RELIEF() cvage_relief()                                                                         //
 #define I_ISSUE_MARK() const uint64_t t_issue = kInstr != 0 ? instr_now() : 0                                   //
 #define I_PROC_MARK() const uint64_t t_after_proc = kInstr != 0 ? instr_now() : 0                               //
 #define I_WAIT_BEGIN() const uint64_t t_rw0 = kSvcInstr != 0 ? instr_now() : 0                                  //
@@ -379,6 +382,8 @@ void kernel_main() {
     uint64_t c_idle = 0, c_busy = 0, c_pace = 0, c_drain = 0;              //
     uint32_t n_gather_rd = 0, n_cv_rd = 0;                                 //
     uint32_t ship_deferred = 0, max_occ = 0;                               //
+    uint64_t cvage_sum = 0, t_cv_cur = 0, t_cv_next = 0;                   //
+    uint32_t cvage_n = 0, cvage_max = 0;                                   //
     uint32_t sweeps_idle = 0, max_sweep = 0, max_reserve = 0;              //
     uint32_t ws_read = 0, ws_proc = 0, ws_rsv = 0, ws_wr = 0, ws_bar = 0;  // worst sweep's phase split //
     uint32_t fill_hist[8] = {};                                            //
@@ -580,6 +585,26 @@ void kernel_main() {
             (void)c, (void)v;                         //
         }                                             //
     };                                                //
+    auto cvage_stamp = [&](uint64_t& t) {  //
+        if constexpr (kInstr != 0) {       //
+            t = instr_now();               //
+        } else {                           //
+            (void)t;                       //
+        }                                  //
+    };                                     //
+    // Age of the tails snapshot backing this generation at the moment its heads go out -- the
+    // ring words produced inside this window are invisible to the relief.
+    auto cvage_relief = [&]() {                             //
+        if constexpr (kInstr != 0) {                        //
+            const uint64_t a = instr_now() - t_cv_cur;      //
+            cvage_sum += a;                                 //
+            cvage_n++;                                      //
+            if (a > cvage_max) {                            //
+                cvage_max = static_cast<uint32_t>(a);       //
+            }                                               //
+            t_cv_cur = t_cv_next;                           //
+        }                                                   //
+    };                                                      //
     auto instr_max32 = [](uint32_t& mx, uint32_t v) {  //
         if constexpr (kInstr != 0) {                   //
             if (v > mx) {                              //
@@ -928,6 +953,9 @@ void kernel_main() {
             const uint64_t wis = win2_open ? w1_issue - w0_issue : 0u;                                    //
             out64(204, wis);  //
         }                                                                                                 //
+        out[214] = cvage_n;                                                                               //
+        out64(215, cvage_sum);  //
+        out[217] = cvage_max;                                                                             //
         }  // kInstr != 0 //
         if constexpr (kSvcInstr == 1) {  //
         out[193] = svc_max;                                                                               //
@@ -946,7 +974,7 @@ void kernel_main() {
         out[213] = max_pump_at;                                                                           //
         }  // kSvcInstr != 0 //
         static_assert(                                                                                    //
-            kernel_profiler::SPSC_DRAIN_RESULT_WORDS >= 202,                                              //
+            kernel_profiler::SPSC_DRAIN_RESULT_WORDS >= 218,                                              //
             "the results block must hold the self-profiling, NoC-footprint and histogram counters");      //
     };  //
     // ==== end instrumentation ====================================================================
@@ -1459,6 +1487,7 @@ void kernel_main() {
                     }
                     invalidate_l1_cache();
                     I_CV_WAITED();
+                    I_CVAGE_WAVE();
                 }
                 I_CV_END();
             }
@@ -1740,6 +1769,7 @@ void kernel_main() {
                                 kCvReadBytes);
                         }
                         I_BATCH_CVS();
+                        I_CVAGE_PREF();
                     }
                     I_ISSUE_MARK();
 
@@ -1774,6 +1804,7 @@ void kernel_main() {
                     I_WAIT_END();
                     I_BATCH_END();
                     advance_heads(n, gen);
+                    I_CVAGE_RELIEF();
 
                     pend_n = n;
                     have_pend = true;
@@ -1802,6 +1833,7 @@ void kernel_main() {
                 while (NOC_STATUS_READ_REG(kReadNoc, NIU_MST_RD_RESP_RECEIVED) - rd0 < num_cores) {
                 }
                 invalidate_l1_cache();
+                I_CVAGE_WAVE();
                 scan_hi = num_cores;
             }
 

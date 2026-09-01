@@ -2548,6 +2548,16 @@ void PerfDebugProfiler::stop() {
                     w_issue / kCycPerUs / sweeps_w,
                     w_busy / kCycPerUs / sweeps_w);
             }
+            if (res[214] != 0) {
+                const uint64_t cva = (static_cast<uint64_t>(res[216]) << 32) | res[215];
+                log_info(
+                    tt::LogMetal,
+                    "[perf-debug profiler] DRISC cv-age at head-relief: avg {:.2f} us | max {:.2f} us over {} "
+                    "reliefs -- ring words produced inside this window are invisible to the relief",
+                    cva / kCycPerUs / res[214],
+                    res[217] / kCycPerUs,
+                    res[214]);
+            }
             // proc sub-split. `proc` is the biggest busy-sweep phase, and it is two unrelated things:
             // a LOCAL scan of the staged control vectors, and a per-live-core 20 B NoC head write-back
             // (up to one issue per core per sweep). This drainer is issue-bound, so which half dominates
