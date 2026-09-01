@@ -155,6 +155,8 @@ enum ControlBuffer {
 // Sized for the widest processor count -- including Quasar's 24 -- so the layout is arch-uniform and the
 // host indexes it identically everywhere, whatever the DRAM side later does with its own count.
 static constexpr std::uint32_t PROFILER_SPSC_MAX_RISC = 24;
+// Tensix RISCs whose rings the drainer sweeps and the host decodes (BRISC, NCRISC, TRISC0-2).
+static constexpr std::uint32_t PROFILER_SPSC_TENSIX_RISC = 5;
 
 enum SpscControlBuffer {
     // [0, PROFILER_SPSC_MAX_RISC): ring HEAD per RISC -- consumer-written (drainer), monotonic word count.

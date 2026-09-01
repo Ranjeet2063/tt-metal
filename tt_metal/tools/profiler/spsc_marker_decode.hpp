@@ -58,11 +58,9 @@ static_assert(PP_DATA_SIZE_SHIFT == kernel_profiler::SPSC_DATA_SIZE_SHIFT, "PP_D
 
 namespace tt::tt_metal::profiler {
 
-// Worker per-RISC SPSC ring depth (words) and RISC count -- MUST match the producer (kernel_profiler.hpp
-// RING_CAPACITY, = kernel_profiler::PROFILER_L1_VECTOR_SIZE) so run clamps agree with the drainer's.
-inline constexpr uint32_t kSpscRingCap = 512;
+inline constexpr uint32_t kSpscRingCap = kernel_profiler::PROFILER_L1_VECTOR_SIZE;
 inline constexpr uint32_t kSpscRingMask = kSpscRingCap - 1;
-inline constexpr uint32_t kSpscNRiscDecode = 5;
+inline constexpr uint32_t kSpscNRiscDecode = kernel_profiler::PROFILER_SPSC_TENSIX_RISC;
 
 // Largest PP_DATA payload the 7-bit size field can express; bounds the raw-layout unwrap scratch.
 inline constexpr uint32_t kSpscMaxDataWords = 127;

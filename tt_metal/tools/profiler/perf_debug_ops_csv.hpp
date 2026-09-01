@@ -27,6 +27,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "hostdevcommon/profiler_common.h"
 #include "tools/profiler/perf_debug_consumer.hpp"
 
 namespace tt::tt_metal::perf_debug {
@@ -39,7 +40,7 @@ public:
     void write_csv(const std::string& path) const;
 
 private:
-    static constexpr uint32_t kNumRisc = 5;
+    static constexpr uint32_t kNumRisc = kernel_profiler::PROFILER_SPSC_TENSIX_RISC;
 
     struct OpAgg {
         uint64_t k_start = UINT64_MAX, k_start_last = 0, k_end = 0;

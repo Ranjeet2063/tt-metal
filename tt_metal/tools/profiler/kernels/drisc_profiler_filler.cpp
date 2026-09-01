@@ -39,7 +39,7 @@ constexpr uint32_t kShipMinPct = get_named_compile_time_arg_val("ship_min_pct");
 constexpr uint32_t kSpoolBase = get_named_compile_time_arg_val("spool_base");
 constexpr uint32_t kSpoolBytes = get_named_compile_time_arg_val("spool_bytes");
 
-constexpr uint32_t kNumRisc = 5;
+constexpr uint32_t kNumRisc = kernel_profiler::PROFILER_SPSC_TENSIX_RISC;
 static_assert(kNumRisc == 5, "the control scans are unrolled for exactly five RISCs");
 constexpr uint32_t kRingWords = kernel_profiler::PROFILER_L1_VECTOR_SIZE;
 constexpr uint32_t kCtrlWords = kernel_profiler::PROFILER_L1_CONTROL_VECTOR_SIZE;
