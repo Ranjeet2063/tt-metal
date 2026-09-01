@@ -164,8 +164,17 @@ void PerfDebugZoneCsvConsumer::operator()(const PerfDebugRecordBatch& batch) {
             }
             case PerfDebugRecType::Ext: {
                 Pending& p = pending_[(dev << 16) | lane];
-                if (p.active) {
-                    p.words_expected = static_cast<uint32_t>(rec.data.ext & 0xffffffffu);
+                if (!p.active) {
+                    break;
+                }
+                // This wire's Ext carries the payload WORD count in id and payload words 1-2 packed
+                // ((hi << 32) | lo) in data.ext -- the common short Data needs no Cont at all. Every
+                // sync macro passes exactly one datum, so the event completes here; the Cont arm below
+                // only exists for a defensive >2-word payload.
+                p.words_expected = rec.id;
+                p.payload.push_back(rec.data.ext);
+                if (p.words_expected <= 2) {
+                    flush_pending(dev, lane, ctx);
                 }
                 break;
             }
@@ -175,11 +184,9 @@ void PerfDebugZoneCsvConsumer::operator()(const PerfDebugRecordBatch& batch) {
                     break;  // continuation of a marker we are not collecting
                 }
                 p.payload.push_back(rec.data.payload);
-                // One uint64 per Cont (the receiver packs (hi << 32) | lo), and every
-                // sync macro passes exactly one datum, so the event is complete here.
-                // Waiting for words_expected instead would strand the row when a
-                // payload spans an unexpected number of words.
-                flush_pending(dev, lane, ctx);
+                if (p.payload.size() * 2 >= p.words_expected) {
+                    flush_pending(dev, lane, ctx);
+                }
                 break;
             }
             default: break;  // Event carries nothing the classic reader consumes

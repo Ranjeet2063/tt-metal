@@ -14,10 +14,8 @@ namespace tt::tt_metal::perf_debug {
 
 PerfDebugTracyConsumer::PerfDebugTracyConsumer(PerfDebugTracyHandler* handler) : handler_(handler) {
     // The SWEEP/PACE alternation is what a drainer row is read by, so those two must contrast; PACE is
-    // deliberate idleness and gets a recessive grey. Mover rows use their own hues because the two roles'
-    // same-named phases have different meanings and scales (a filler's CREDIT-WAIT is DRAM ring room, a
-    // mover's is host FIFO credit). Keys are the zone NAMES the drain kernel declares (TT_ZONE_DEFINE_ID
-    // in drisc_profiler_drain.cpp) -- names are the only stable handle on a structural zone id.
+    // deliberate idleness and gets a recessive grey. Keys are the zone NAMES the drain kernel declares
+    // (TT_ZONE_DEFINE_ID) -- names are the only stable handle on a structural zone id.
     zone_colors_["DRISC-SWEEP"] = 0x2E86C1;
     zone_colors_["DRISC-PACE"] = 0x707B7C;
     zone_colors_["DRISC-READ"] = 0x27AE60;
@@ -28,12 +26,6 @@ PerfDebugTracyConsumer::PerfDebugTracyConsumer(PerfDebugTracyHandler* handler) :
     zone_colors_["DRISC-WR-BARRIER"] = 0xF1C40F;
     // White, and the same on both roles: the sync marker is a fiducial, not a phase.
     zone_colors_["DRISC-SYNC"] = 0xFFFFFF;
-    zone_colors_mover_["DRISC-SYNC"] = 0xFFFFFF;
-    zone_colors_mover_["DRISC-SWEEP"] = 0x16A085;
-    zone_colors_mover_["DRISC-READ"] = 0x52BE80;
-    zone_colors_mover_["DRISC-CREDIT-WAIT"] = 0xE74C3C;
-    zone_colors_mover_["DRISC-WRITE"] = 0xE67E22;
-    zone_colors_mover_["DRISC-WR-BARRIER"] = 0xF7DC6F;
 }
 
 PerfDebugTracyConsumer::~PerfDebugTracyConsumer() { log_unnamed_ids("tracy", names_); }
@@ -131,14 +123,8 @@ void PerfDebugTracyConsumer::operator()(const PerfDebugRecordBatch& batch) {
         pkt.risc = li.risc;
         pkt.timer_id = r.id;
         pkt.name = names_.lookup(r.id);
-        {
-            // Colour by zone NAME and by role -- see zone_colors_ in the header.
-            const auto& tbl = li.role == PerfDebugLaneRole::Mover ? zone_colors_mover_ : zone_colors_;
-            if (auto cit = tbl.find(pkt.name); cit != tbl.end()) {
-                pkt.color = cit->second;
-            } else if (auto cit2 = zone_colors_.find(pkt.name); cit2 != zone_colors_.end()) {
-                pkt.color = cit2->second;  // mover table has no override for this zone
-            }
+        if (auto cit = zone_colors_.find(pkt.name); cit != zone_colors_.end()) {
+            pkt.color = cit->second;
         }
         const uint64_t base = clock_synced_[r.meta.dev] ? 0 : ts_base_[r.meta.dev];
         const uint64_t start = r.data.zone.start;
