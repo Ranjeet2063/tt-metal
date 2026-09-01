@@ -12,6 +12,8 @@
 #include "impl/context/metal_context.hpp"
 #include "tt_metal/hw/inc/hostdev/socket.h"
 
+#include <unordered_set>
+
 namespace tt::tt_metal::distributed {
 
 struct SocketSenderSize {
@@ -41,6 +43,23 @@ struct SocketPeerDescriptor {
     // peer did not supply it; callers then fall back to the coordinate derivation.
     std::vector<uint32_t> local_chip_ids;
 };
+
+// True when `mesh_device` covers devices this rank does not drive -- a submesh CO-OWNED by several
+// ranks (a JOINT stage), where a lockstep buffer lands in L1 that peers must also account for.
+bool mesh_is_coowned(const MeshDevice& mesh_device);
+
+// The distinct (device, core) pairs this endpoint occupies.
+std::unordered_set<MeshCoreCoord> socket_endpoint_cores(const SocketConfig& config, SocketEndpoint socket_endpoint);
+
+// Whether this endpoint's config buffer is allocated per-core rather than lockstep. Requires
+// per_core_allocation, L1 storage, and a single (device, core) for this endpoint -- the peer
+// descriptor carries one address per buffer, which only a single core makes well defined.
+bool socket_endpoint_uses_per_core_allocation(const SocketConfig& config, SocketEndpoint socket_endpoint);
+
+// Whether every buffer of this socket is per-core, i.e. it occupies L1 only on its two endpoint
+// cores. Such a socket needs no reservation on a co-owning rank, which is what lets a submesh
+// shared by several ranks carry sockets at all.
+bool socket_is_fully_per_core(const SocketConfig& config);
 
 // Create send/receive socket config buffers
 std::shared_ptr<MeshBuffer> create_socket_config_buffer(

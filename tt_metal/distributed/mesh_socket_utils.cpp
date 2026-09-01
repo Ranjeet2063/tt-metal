@@ -208,6 +208,56 @@ Tag generate_rank_scoped_exchange_tag(
 }
 }  // namespace
 
+bool mesh_is_coowned(const MeshDevice& mesh_device) {
+    const auto& view = mesh_device.get_view();
+    return view.num_devices() != view.get_devices().size();
+}
+
+std::unordered_set<MeshCoreCoord> socket_endpoint_cores(const SocketConfig& config, SocketEndpoint socket_endpoint) {
+    const bool is_sender = socket_endpoint == SocketEndpoint::SENDER;
+    std::unordered_set<MeshCoreCoord> cores;
+    for (const auto& connection : config.socket_connection_config) {
+        cores.insert(is_sender ? connection.sender_core : connection.receiver_core);
+    }
+    return cores;
+}
+
+bool socket_endpoint_uses_per_core_allocation(const SocketConfig& config, SocketEndpoint socket_endpoint) {
+    const auto& mem_config = config.socket_mem_config;
+    if (!mem_config.per_core_allocation || mem_config.socket_storage_type != BufferType::L1) {
+        return false;
+    }
+    // A per-core buffer holds a different address on every core, while the peer descriptor carries
+    // ONE address per buffer. That is well defined only when this endpoint resolves to a single
+    // (device, core) -- the same restriction create_socket_data_buffer places on receivers. A
+    // fan-out sender keeps its lockstep config buffer.
+    return socket_endpoint_cores(config, socket_endpoint).size() == 1;
+}
+
+bool socket_is_fully_per_core(const SocketConfig& config) {
+    return socket_endpoint_uses_per_core_allocation(config, SocketEndpoint::SENDER) &&
+           socket_endpoint_uses_per_core_allocation(config, SocketEndpoint::RECEIVER);
+}
+
+// Logical core -> page index within a device's shard of the config buffer, which is how
+// write_socket_configs finds the entry to fill in for a given socket core.
+//
+// A lockstep config buffer reads this off its backing buffer's page mapping. A PER-CORE config
+// buffer has no backing buffer -- MeshBuffer::create's per-core branch gives each device its own
+// independently allocated Buffer and never builds one -- so get_backing_buffer() returns nullptr
+// there. It does not need one: per-core requires a single (device, core) for the endpoint (see
+// socket_endpoint_uses_per_core_allocation), so the shard is one page belonging to that one core.
+std::unordered_map<CoreCoord, uint32_t> config_buffer_core_to_id(
+    const std::shared_ptr<MeshBuffer>& config_buffer, const SocketConfig& config, SocketEndpoint socket_endpoint) {
+    if (socket_endpoint_uses_per_core_allocation(config, socket_endpoint)) {
+        const auto cores = socket_endpoint_cores(config, socket_endpoint);
+        return {{cores.begin()->core_coord, 0}};
+    }
+    auto* backing_buffer = config_buffer->get_backing_buffer();
+    TT_FATAL(backing_buffer, "Lockstep socket config buffer has no backing buffer to derive its page mapping from.");
+    return backing_buffer->get_buffer_page_mapping()->core_to_core_id;
+}
+
 std::shared_ptr<MeshBuffer> create_socket_config_buffer(
     const std::shared_ptr<MeshDevice>& device, const SocketConfig& config, SocketEndpoint socket_endpoint) {
     const auto& socket_connections = config.socket_connection_config;
@@ -241,10 +291,23 @@ std::shared_ptr<MeshBuffer> create_socket_config_buffer(
     auto shard_params =
         ShardSpecBuffer(all_cores, {1, 1}, ShardOrientation::ROW_MAJOR, {1, 1}, {static_cast<uint32_t>(num_cores), 1});
 
+    // A lockstep config buffer stays legal here: it is replicated across the mesh, which is
+    // correct whenever every co-owner allocates it (create_socket_pair, a mesh-scoped socket).
+    // Only the rank-scoped path skips co-owners, and that precondition is enforced once in the
+    // MeshSocket constructor rather than per buffer.
+    auto sharding_args = BufferShardingArgs(shard_params, TensorMemoryLayout::HEIGHT_SHARDED);
+    if (socket_endpoint_uses_per_core_allocation(config, socket_endpoint)) {
+        TT_FATAL(
+            tt::tt_metal::MetalContext::instance().rtoptions().get_allocator_mode_hybrid(),
+            "Per-core socket allocation requires the device to be opened with AllocatorMode::HYBRID "
+            "(set TT_METAL_ALLOCATOR_MODE_HYBRID=1 before opening the device).");
+        experimental::per_core_allocation::set_per_core_allocation(sharding_args, true);
+    }
+
     DeviceLocalBufferConfig buffer_specs = {
         .page_size = config_buffer_size,
         .buffer_type = BufferType::L1,
-        .sharding_args = BufferShardingArgs(shard_params, TensorMemoryLayout::HEIGHT_SHARDED),
+        .sharding_args = sharding_args,
         .bottom_up = std::nullopt,
         .sub_device_id = is_sender ? socket_mem_config.sender_sub_device : socket_mem_config.receiver_sub_device,
     };
@@ -335,13 +398,13 @@ void write_socket_configs(
     SocketEndpoint socket_endpoint,
     const std::shared_ptr<MeshDevice>& peer_device) {
     auto* mesh_device = config_buffer->device();
-    const auto& core_to_core_id = config_buffer->get_backing_buffer()->get_buffer_page_mapping()->core_to_core_id;
     bool is_sender = socket_endpoint == SocketEndpoint::SENDER;
     // The peer descriptor has already been validated to use the same socket
     // config. Keep using the local descriptor's config here so rank-scoped
     // metadata generated from the local MeshSocket stays available even though
     // the serialized peer descriptor does not carry that extra context.
     const auto& config = local_descriptor.config;
+    const auto core_to_core_id = config_buffer_core_to_id(config_buffer, config, socket_endpoint);
     auto grouped_connections = group_socket_connections(config, socket_endpoint);
     auto peer_config_buf_addr = peer_descriptor.config_buffer_address;
     const SocketSenderSize sender_size;
@@ -501,6 +564,21 @@ void write_socket_configs(
     }
 }
 
+// The address the peer must target for this endpoint's config buffer. A per-core buffer holds one
+// address per core, so resolve it at this endpoint's single core (socket_endpoint_uses_per_core_
+// allocation guarantees there is exactly one); a lockstep buffer has one address for the mesh.
+DeviceAddr get_config_buffer_address(const MeshSocket& socket_endpoint) {
+    const auto& config = socket_endpoint.get_config();
+    const auto endpoint = socket_endpoint.get_socket_endpoint_type();
+    const auto& config_buffer = *socket_endpoint.get_config_buffer();
+    if (!socket_endpoint_uses_per_core_allocation(config, endpoint)) {
+        return config_buffer.address();
+    }
+    const auto cores = socket_endpoint_cores(config, endpoint);
+    const auto& core = *cores.begin();
+    return experimental::per_core_allocation::get_per_core_address(config_buffer, core.device_coord, core.core_coord);
+}
+
 DeviceAddr get_receiver_data_buffer_address(const MeshSocket& receiver_socket) {
     const auto& config = receiver_socket.get_config();
     const auto& data_buffer = *receiver_socket.get_data_buffer();
@@ -542,7 +620,7 @@ SocketPeerDescriptor generate_local_endpoint_descriptor(
 
     SocketPeerDescriptor local_endpoint_desc = {
         .config = config,
-        .config_buffer_address = socket_endpoint.get_config_buffer()->address(),
+        .config_buffer_address = get_config_buffer_address(socket_endpoint),
         .data_buffer_address = is_sender ? 0 : get_receiver_data_buffer_address(socket_endpoint),
         .exchange_tag = tag,
         .local_chip_ids = std::move(local_chip_ids)};

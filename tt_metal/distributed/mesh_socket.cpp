@@ -248,6 +248,32 @@ MeshSocket::MeshSocket(const std::shared_ptr<MeshDevice>& device, const SocketCo
         is_sender = local_mesh_binding[0] == config_.sender_mesh_id.value();
     }
 
+    // Every rank that is neither endpoint took the early return above and allocates nothing --
+    // including a rank that CO-OWNS this submesh. That is only safe when the socket's buffers stay
+    // on the endpoint cores, i.e. when all of them are per-core. A lockstep buffer is replicated
+    // across the whole submesh, so it would occupy L1 on co-owners that never reserved it and
+    // whose next allocation would land on top of it; that is what create_mirror used to paper
+    // over. Reject it here, before anything is allocated, rather than corrupting a peer's L1.
+    //
+    // Only this path needs the check: create_socket_pair and mesh-scoped sockets are built by
+    // every co-owner, so lockstep buffers stay correct there.
+    if ((rank_scoped_socket_ || same_mesh) && mesh_is_coowned(*device)) {
+        const auto sender_cores = socket_endpoint_cores(config_, SocketEndpoint::SENDER).size();
+        const auto receiver_cores = socket_endpoint_cores(config_, SocketEndpoint::RECEIVER).size();
+        TT_FATAL(
+            socket_is_fully_per_core(config_),
+            "A rank-scoped socket on a submesh co-owned by several ranks requires every socket buffer to be "
+            "per-core, so that it occupies L1 only on its two endpoint cores and the co-owners -- which build "
+            "nothing for this socket -- have nothing to reserve. Got per_core_allocation={} (needs "
+            "TT_METAL_ALLOCATOR_MODE_HYBRID=1 before the device is opened), storage={}, {} distinct sender "
+            "(device, core) pair(s) and {} receiver (needs exactly 1 each). Fix whichever of those is wrong, "
+            "or place the stage on a submesh a single rank drives.",
+            config_.socket_mem_config.per_core_allocation,
+            config_.socket_mem_config.socket_storage_type,
+            sender_cores,
+            receiver_cores);
+    }
+
     if (is_sender) {
         socket_endpoint_type_ = SocketEndpoint::SENDER;
         config_buffer_ = create_socket_config_buffer(device, config_, socket_endpoint_type_);
@@ -339,40 +365,6 @@ void MeshSocket::connect_with_peer(const std::shared_ptr<multihost::DistributedC
     }
 }
 
-MeshSocket MeshSocket::create_mirror(
-    const std::shared_ptr<MeshDevice>& device, const SocketConfig& config, SocketEndpoint endpoint) {
-    TT_FATAL(!config.socket_connection_config.empty(), "Socket connection config cannot be empty.");
-    TT_FATAL(
-        socket_uses_rank_scoped_semantics(config),
-        "create_mirror is only meaningful for a rank-scoped socket (one built from explicit "
-        "sender/receiver ranks); a mesh-scoped socket already allocates on every rank bound to the "
-        "endpoint mesh, so its co-owners are never skipped.");
-    // Same context the constructor resolves the local rank against.
-    const auto& context =
-        config.distributed_context ? config.distributed_context : DistributedContext::get_current_world();
-    const auto current_rank = *context->rank();
-    TT_FATAL(
-        current_rank != *config.sender_rank && current_rank != *config.receiver_rank,
-        "Rank {} is the socket's own {} -- it must construct the real MeshSocket, not a mirror.",
-        current_rank,
-        (current_rank == *config.sender_rank) ? "sender" : "receiver");
-
-    // The same buffers, in the same order, as the endpoint rank allocates in the constructor above:
-    // the config buffer for either endpoint, plus the data buffer for a receiver. Both are sized
-    // from the connection config, the endpoint type and the device's core grid -- never from the
-    // mesh ids -- so a mirror needs no mesh-id resolution to match the endpoint byte for byte.
-    auto config_buffer = create_socket_config_buffer(device, config, endpoint);
-    std::shared_ptr<MeshBuffer> data_buffer =
-        (endpoint == SocketEndpoint::RECEIVER) ? create_socket_data_buffer(device, config) : nullptr;
-
-    auto socket = MeshSocket(std::move(data_buffer), std::move(config_buffer), config, endpoint);
-    socket.rank_scoped_socket_ = true;
-    socket.is_mirror_ = true;
-    // No connect_with_peer: the descriptor exchange and its barrier run strictly between
-    // sender_rank and receiver_rank, and this rank is neither.
-    return socket;
-}
-
 std::pair<MeshSocket, MeshSocket> MeshSocket::create_socket_pair(
     const std::shared_ptr<MeshDevice>& sender,
     const std::shared_ptr<MeshDevice>& receiver,
@@ -409,10 +401,6 @@ std::pair<MeshSocket, MeshSocket> MeshSocket::create_socket_pair(
 
 std::shared_ptr<MeshBuffer> MeshSocket::get_data_buffer() const {
     TT_FATAL(data_buffer_, "Cannot access the data buffer for a sender socket.");
-    TT_FATAL(
-        !is_mirror_,
-        "Cannot access the data buffer of a mirror socket: its buffers only hold an allocation for a co-owning "
-        "rank and were never handshaked with a peer.");
     return data_buffer_;
 };
 

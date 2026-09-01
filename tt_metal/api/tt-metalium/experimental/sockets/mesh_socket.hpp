@@ -152,29 +152,14 @@ enum class SocketEndpoint : uint8_t { SENDER, RECEIVER };
 // through the socket_config object.
 class MeshSocket {
 public:
+    // A rank-scoped socket is a point-to-point link between two ranks, so this returns early on
+    // every other rank (a "null socket") and allocates nothing -- including on a rank that
+    // CO-OWNS the endpoint's mesh. That is safe because a socket on a co-owned mesh is required
+    // to be fully per-core (see socket_is_fully_per_core), so its buffers occupy L1 on the two
+    // endpoint cores only and there is nothing for a co-owner to reserve. Sockets that would need
+    // lockstep buffers are rejected at buffer creation rather than reserved on the co-owners; the
+    // create_mirror path that used to do that reservation is gone.
     MeshSocket(const std::shared_ptr<MeshDevice>& device, const SocketConfig& config);
-    // Reserve a socket's buffers on a rank that CO-OWNS the endpoint's mesh without being the
-    // socket's sender or receiver.
-    //
-    // A rank-scoped socket is a point-to-point link between two ranks, so the normal constructor
-    // returns early on every other rank (a "null socket") and allocates nothing. That is correct
-    // when the mesh belongs to one rank, but a mesh whose view spans SEVERAL ranks gives each of
-    // them its own MeshDevice handle and its own allocator, while the socket's buffers are
-    // REPLICATED across the whole mesh -- including the co-owners' devices. Only the endpoint rank
-    // reserves the address, so a co-owner's allocator hands the same address to the next buffer it
-    // allocates and the two land on top of each other on the co-owner's devices.
-    //
-    // This allocates exactly what the endpoint rank allocates (config buffer, plus the data buffer
-    // for a RECEIVER), in the same order, so the co-owner's allocator stays in step. It performs NO
-    // handshake: the peer descriptor exchange and its barrier are strictly between sender_rank and
-    // receiver_rank, and a mirror joins neither. The result is inert -- keep it alive for as long as
-    // the real socket lives, and do not use it to move data.
-    //
-    // `endpoint` is the endpoint that lives on THIS mesh (RECEIVER if the mesh holds the socket's
-    // receiver core, SENDER if it holds the sender's), which the caller knows from its own stage
-    // topology and cannot be derived from the config alone.
-    static MeshSocket create_mirror(
-        const std::shared_ptr<MeshDevice>& device, const SocketConfig& config, SocketEndpoint endpoint);
     // Sockets can only be created in sender/receiver pairs.
     static std::pair<MeshSocket, MeshSocket> create_socket_pair(
         const std::shared_ptr<MeshDevice>& sender,
@@ -192,9 +177,6 @@ public:
     // Returns true when this socket was constructed from explicit sender/receiver
     // ranks and therefore uses pairwise rank-scoped handshake semantics.
     bool is_rank_scoped_socket() const { return rank_scoped_socket_; }
-    // True for a socket made by create_mirror: buffers reserved to keep a co-owning rank's
-    // allocator in step, never handshaked, not usable for data movement.
-    bool is_mirror() const { return is_mirror_; }
 
     tt::tt_fabric::FabricNodeId get_fabric_node_id(SocketEndpoint endpoint, const MeshCoordinate& coord) const;
 
@@ -228,7 +210,6 @@ private:
     SocketConfig config_;
     SocketEndpoint socket_endpoint_type_;
     bool rank_scoped_socket_ = false;
-    bool is_mirror_ = false;
     std::unordered_map<multihost::Rank, multihost::Rank> rank_translation_table_;
     // TODO: replace with enchantum::array
     std::array<std::unordered_map<MeshCoordinate, tt::tt_fabric::FabricNodeId>, enchantum::count<SocketEndpoint>>

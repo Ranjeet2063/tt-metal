@@ -178,39 +178,6 @@ void py_module_types(nb::module_& mod) {
                     Sockets should typically be created in pairs using create_socket_pair()
                     rather than using this constructor directly.
             )doc")
-        .def_static(
-            "create_mirror",
-            &tt::tt_metal::distributed::MeshSocket::create_mirror,
-            nb::arg("device"),
-            nb::arg("config"),
-            nb::arg("endpoint"),
-            R"doc(
-                Reserve a socket's buffers on a rank that co-owns the endpoint's mesh without being
-                the socket's sender or receiver.
-
-                A rank-scoped socket links two ranks, so the normal constructor allocates nothing on
-                any other rank. When a mesh is shared by several ranks (each holding its own handle
-                and allocator) while the socket's buffers are replicated across the whole mesh, the
-                co-owners never reserve those addresses and will hand them out again -- overwriting
-                the socket on their own devices. This allocates the same buffers, in the same order,
-                so their allocators stay in step. It performs no handshake and the result cannot be
-                used to move data; keep it alive as long as the real socket lives.
-
-                Args:
-                    device (MeshDevice): The shared mesh device this rank co-owns.
-                    config (SocketConfig): The same config the endpoint rank used.
-                    endpoint (SocketEndpoint): The endpoint that lives on THIS mesh -- RECEIVER if the
-                        mesh holds the socket's receiver core, SENDER if it holds the sender's.
-
-                Returns:
-                    MeshSocket: An inert socket holding the reservation (``is_mirror()`` is True).
-            )doc")
-        .def(
-            "is_mirror",
-            &tt::tt_metal::distributed::MeshSocket::is_mirror,
-            R"doc(
-                True if this socket only holds a co-owning rank's allocation (see create_mirror).
-            )doc")
         .def(
             "get_config_buffer_address",
             [](const tt::tt_metal::distributed::MeshSocket& socket) {
