@@ -348,7 +348,7 @@ def build_param_id(parameters, value_tuple):
     return "-".join(parts)
 
 
-def parametrize(**kwargs: any):
+def parametrize(*, marks=None, **kwargs: any):
     compile_key_fn = None
     _rt_names = set()
     _combo_rt_indices = {}
@@ -396,6 +396,26 @@ def parametrize(**kwargs: any):
     parameter_values = _params_solve_dependencies(**unwrapped)
 
     ids = [build_param_id(parameters, values) for values in parameter_values]
+    if marks is not None:
+        mark_dependencies = _param_dependencies("marks", marks)
+        missing = set(mark_dependencies) - set(parameters)
+        if missing:
+            raise UnknownDependenciesError({"marks": missing})
+        parameter_indices = {
+            parameter: index for index, parameter in enumerate(parameters)
+        }
+        parameter_values = [
+            pytest.param(
+                *values,
+                marks=marks(
+                    *[
+                        values[parameter_indices[dependency]]
+                        for dependency in mark_dependencies
+                    ]
+                ),
+            )
+            for values in parameter_values
+        ]
 
     def decorator(test_function):
         if compile_key_fn is not None:

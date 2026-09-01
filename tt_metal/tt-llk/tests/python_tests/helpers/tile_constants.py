@@ -83,12 +83,8 @@ SRCS_SLICE_32B_ELEMENT_COUNT = SRCS_SLICE_32B_ROW_DIM * SRCS_SLICE_COL_DIM  # 64
 # Supported Tile Sizes
 # =============================================================================
 
-# All supported tile dimensions as (rows, cols) tuples
+# Tile dimensions used by shared operation sweeps
 SUPPORTED_TILE_SIZES = [
-    (1, 16),
-    (2, 16),
-    (4, 16),
-    (8, 16),
     (16, 16),
     (1, 32),
     (2, 32),
@@ -97,6 +93,15 @@ SUPPORTED_TILE_SIZES = [
     (16, 32),
     (32, 32),
     (32, 16),
+]
+
+# Tile dimensions that individual tests can construct without adding them to shared sweeps
+CONSTRUCTIBLE_TILE_SIZES = [
+    *SUPPORTED_TILE_SIZES,
+    (1, 16),
+    (2, 16),
+    (4, 16),
+    (8, 16),
 ]
 
 # Supported tile dimensions for MX format for FPU ops
@@ -114,13 +119,13 @@ def validate_tile_dimensions(tile_dimensions):
         tile_dimensions: List or tuple of [rows, cols]
 
     Raises:
-        ValueError: If tile dimensions are not in SUPPORTED_TILE_SIZES
+        ValueError: If tile dimensions are not in CONSTRUCTIBLE_TILE_SIZES
     """
     tile_tuple = tuple(tile_dimensions)
-    if tile_tuple not in SUPPORTED_TILE_SIZES:
+    if tile_tuple not in CONSTRUCTIBLE_TILE_SIZES:
         raise ValueError(
             f"Unsupported tile dimensions: {tile_dimensions}. "
-            f"Supported sizes are: {SUPPORTED_TILE_SIZES}"
+            f"Supported sizes are: {CONSTRUCTIBLE_TILE_SIZES}"
         )
 
 
