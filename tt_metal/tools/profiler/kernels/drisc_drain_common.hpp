@@ -39,11 +39,10 @@ inline void write_to_host_chunked(uint32_t pcie_xy_enc, uint32_t src_l1, uint64_
     }
 }
 
-// Stop-interruptible replacement for socket_reserve_pages (socket_api.h), which spins on
-// `bytes_free < num_bytes` with no escape. Waits on host credit, so it answers the host's stop word:
-// lifecycle is the close path's job, not a deadline's. Returning false means "ship nothing"; the caller
-// drops the frame -- the heads were already written back, so producers keep running and only capture is
-// lost.
+// Replacement for socket_reserve_pages (socket_api.h), which spins on `bytes_free < num_bytes` with no
+// escape. Keeps waiting through quiesce (stop=1): the receiver is still acking then, and returning would
+// lose frames whose heads were already relieved. Only the host's kill switch (stop=2, written after its
+// own teardown timeout) returns false.
 inline bool reserve_pages(const SocketSenderInterface& socket, uint32_t num_pages, volatile tt_l1_ptr uint32_t* stop) {
     const uint32_t num_bytes = num_pages * socket.page_size;
     volatile tt_l1_ptr uint32_t* acked = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(socket.bytes_acked_base_addr);
@@ -56,7 +55,7 @@ inline bool reserve_pages(const SocketSenderInterface& socket, uint32_t num_page
             if (bytes_free >= num_bytes) {
                 break;
             }
-            if (*stop != 0) {
+            if (*stop == 2u) {
                 return false;
             }
         }

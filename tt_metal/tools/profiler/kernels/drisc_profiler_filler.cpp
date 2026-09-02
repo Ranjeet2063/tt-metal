@@ -20,7 +20,7 @@ constexpr uint32_t kStageBase = get_named_compile_time_arg_val("stage_base");
 constexpr uint32_t kNStage = get_named_compile_time_arg_val("n_stage");
 constexpr uint32_t kHeadScratch = get_named_compile_time_arg_val("head_scratch");
 constexpr uint32_t kDoneAddr = get_named_compile_time_arg_val("done_addr");
-// Host writes 1 = quiesce, 2 = free the NIU.
+// Host writes 1 = quiesce (drain everything, every wait holds), 2 = kill switch (abandon waits, free the NIU).
 constexpr uint32_t kStopAddr = get_named_compile_time_arg_val("stop_addr");
 constexpr uint32_t kSocketConfigAddr = get_named_compile_time_arg_val("socket_config_addr");
 constexpr uint32_t kMaxCores = get_named_compile_time_arg_val("max_cores");
@@ -217,8 +217,7 @@ void kernel_main() {
 
     uint32_t gen_dma_mark[kNGens] = {};
     SpoolPump<kSpoolBase, kSpoolBytes, kBounceBase0, kBounceBytes, kPageBytes, kDmaShip, kDmaDrain> pump;
-    bool drain_dead = false;       // teardown escalated (stop=2) with bytes stranded in the spool
-    bool stopped_blocked = false;  // the stop word broke a credit wait with frames still staged
+    bool killed = false;  // the kill switch (stop=2) broke a wait: the consumer is gone, bytes are stranded
 
     // Write `len` bytes at FIFO offset `dst`, splitting a piece that crosses the FIFO wrap --
     // socket_push_pages only wraps the pointer. fifo_size is a whole number of pages, so the split
@@ -265,9 +264,10 @@ void kernel_main() {
             }
             // Full spool: pump until there is room. This wait, not a drop, is the spool's
             // back-pressure -- frames stay safe in staging, the sweep slows, producers stall.
-            // Interruptible only by the host's stop: lifecycle lives in the close path.
+            // It holds through quiesce; only the kill switch breaks it.
             while (!pump.has_room(bytes)) {
-                if (*stop != 0) {
+                if (*stop == 2u) {
+                    killed = true;
                     return;
                 }
                 invalidate_l1_cache();
@@ -302,10 +302,7 @@ void kernel_main() {
         }
         asm volatile("fence" ::: "memory");
         if (!reserve_pages(sender, npages, stop)) {
-            // Drop rather than block: the heads for these slots were already written back, so the
-            // producers stay unblocked and the workload completes. Capture is best-effort; the
-            // workload is not.
-            stopped_blocked = true;
+            killed = true;
             return;
         }
         const uint32_t fifo_size = sender.downstream_fifo_curr_size;
@@ -712,8 +709,7 @@ void kernel_main() {
     }
 
     // Exit. Everything the run spooled must reach the host FIFO before the socket barrier can
-    // pass; bounded, so a consumer that stopped acking strands bytes (counted) instead of wedging
-    // teardown.
+    // pass; bounded, so a consumer that stopped acking strands bytes instead of wedging teardown.
     if constexpr (kSpool) {
         while (experimental::dma_get_writes_outstanding(kDmaShip) != 0) {
         }
@@ -726,7 +722,7 @@ void kernel_main() {
             // kill switch for a drain whose consumer will never finish it.
             invalidate_l1_cache();
             if (*stop == 2u) {
-                drain_dead = true;
+                killed = true;
                 break;
             }
         }
@@ -734,8 +730,7 @@ void kernel_main() {
     }
 
     // socket_barrier waits for the host to ack everything, so it would hang on a dead consumer.
-    const bool consumer_gone = stopped_blocked || drain_dead;
-    if (!consumer_gone) {
+    if (!killed) {
         socket_barrier(sender);
     }
     while (!ncrisc_noc_nonposted_writes_flushed(NOC_INDEX)) {
@@ -746,9 +741,9 @@ void kernel_main() {
     while (!(ncrisc_noc_posted_writes_sent(NOC_INDEX) && ncrisc_noc_posted_writes_sent(kReadNoc)) &&
            get_timestamp() < t_ps) {
     }
-    // Written back only for a live consumer: after dropped frames the socket's view of bytes_sent
+    // Written back only for a live consumer: after an abandoned batch the socket's view of bytes_sent
     // is already out of sync with the host's, and the socket is being torn down either way.
-    if (!consumer_gone) {
+    if (!killed) {
         update_socket_config(sender);
     }
 
