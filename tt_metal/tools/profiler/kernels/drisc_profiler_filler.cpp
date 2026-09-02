@@ -166,7 +166,6 @@ void kernel_main() {
 
     // Statics persist across launches on this core, so everything the loop trusts is re-initialised
     // explicitly.
-    static uint32_t head_mirror[kMaxCores * kNumRisc];
     // Sum of a core's five tails at its last scan. Tails are monotonic, so the delta is exactly the
     // words produced in one service interval -- the growth term the ship deferral needs.
     static uint32_t tails_seen[kMaxCores];
@@ -179,16 +178,16 @@ void kernel_main() {
     for (uint32_t i = 0; i < num_cores; i++) {
         hot[i] = 0;
     }
-    // Seed the head mirrors from the tails as they stand now: everything published before this
-    // launch predates the capture.
+    // Seed the heads from the tails as they stand now: everything published before this launch
+    // predates the capture. The scratch is the only copy of the heads: the scan reads it, the
+    // issue advances it, and the posted head write ships it.
     cv_wave(core_noc, 0, num_cores, NOC_STATUS_READ_REG(kReadNoc, NIU_MST_RD_RESP_RECEIVED), num_cores);
     for (uint32_t c = 0; c < num_cores; c++) {
         const tt_l1_ptr uint32_t* tails = reinterpret_cast<const tt_l1_ptr uint32_t*>(kCvBase + c * kCvReadBytes);
-        volatile tt_l1_ptr uint32_t* scp = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(kHeadScratch + c * 32u);
+        volatile tt_l1_ptr uint32_t* heads = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(kHeadScratch + c * 32u);
         uint32_t tsum = 0;
         for (uint32_t r = 0; r < kNumRisc; r++) {
-            head_mirror[c * kNumRisc + r] = tails[r];
-            scp[r] = tails[r];
+            heads[r] = tails[r];
             tsum += tails[r];
         }
         tails_seen[c] = tsum;
@@ -369,7 +368,8 @@ void kernel_main() {
             for (uint32_t c = scan_lo; c < scan_hi; c++) {
                 const tt_l1_ptr uint32_t* __restrict tails =
                     reinterpret_cast<const tt_l1_ptr uint32_t*>(kCvBase + c * kCvReadBytes);
-                uint32_t* __restrict mine = &head_mirror[c * kNumRisc];
+                const tt_l1_ptr uint32_t* __restrict mine =
+                    reinterpret_cast<const tt_l1_ptr uint32_t*>(kHeadScratch + c * 32u);
                 // The scan is unrolled into registers on purpose: a loop over indexed arrays
                 // spills on this core, and each spilled word is an L1 round trip per core per
                 // sweep.
@@ -445,14 +445,13 @@ void kernel_main() {
                 const uint32_t xy = coords[c];
                 const tt_l1_ptr uint32_t* __restrict tails =
                     reinterpret_cast<const tt_l1_ptr uint32_t*>(kCvBase + c * kCvReadBytes);
-                uint32_t* __restrict mine = &head_mirror[c * kNumRisc];
                 volatile tt_l1_ptr uint32_t* __restrict cv =
                     reinterpret_cast<volatile tt_l1_ptr uint32_t*>(slot + kPrefix * 4u);
-                // The head payload and mirror advance are staged here, hidden behind the NIU's
-                // acceptance of the same lane's gather read; after the batch barrier only the
-                // posted head write remains on the release path. Safe because nothing reads the
-                // mirror between issue and that barrier.
-                volatile tt_l1_ptr uint32_t* __restrict scp =
+                // The head advance is staged here, hidden behind the NIU's acceptance of the same
+                // lane's gather read; after the batch barrier only the posted head write remains on
+                // the release path. Safe because nothing reads the scratch between issue and that
+                // barrier.
+                volatile tt_l1_ptr uint32_t* __restrict heads =
                     reinterpret_cast<volatile tt_l1_ptr uint32_t*>(kHeadScratch + c * 32u);
                 uint32_t live = 0;
                 uint32_t off = kPrefix + kWireCtrl;
@@ -462,7 +461,8 @@ void kernel_main() {
                 // issue and measurably regressed.
                 for (uint32_t r = 0; r < kNumRisc; r++) {
                     const uint32_t tail = tails[r];
-                    uint32_t run = tail - mine[r];
+                    const uint32_t head = heads[r];
+                    uint32_t run = tail - head;
                     if (run > kRingWords) {
                         run = kRingWords;
                     }
@@ -485,9 +485,7 @@ void kernel_main() {
                             pad = 0;
                         }
                     }
-                    const uint32_t nh = mine[r] + take;
-                    mine[r] = nh;
-                    scp[r] = nh;
+                    heads[r] = head + take;
                     live += take;
                     cv[kernel_profiler::SPSC_WIRE_HEAD_0 + r] = start;
                     cv[kernel_profiler::SPSC_WIRE_TAIL_0 + r] = start + take;
