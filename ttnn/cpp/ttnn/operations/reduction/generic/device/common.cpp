@@ -64,11 +64,8 @@ RmPlan make_rm_plan(
         plan.ht_tiles_per_chunk = std::clamp(plan.Ht_rm, 1u, k_rm_max_tiles_per_chunk);
     }
 
-    // Block-float has no per-datum size: a shared exponent covers each 16-datum block. Neither
-    // side needs one when the format reaches here, and validate_on_program_cache_miss proves it:
-    // the src size feeds the RM staging CB, which only a ROW_MAJOR input builds and which is gated
-    // to BF16/FP32; the dst size feeds the writer's datum stride, which only a ROW_MAJOR output
-    // uses, and block-float output is TILE-only.
+    // Block-float has no per-datum size. RM staging and the writer stride never see it here:
+    // RM input is BF16/FP32, and block-float output is TILE-only.
     plan.src_datum_size = block_float_format(src_cb_data_format) ? 0 : tt::datum_size(src_cb_data_format);
     plan.dst_datum_size = block_float_format(dst_cb_data_format) ? 0 : tt::datum_size(dst_cb_data_format);
     plan.chunk_row_bytes = plan.wt_tiles_per_chunk * tile_width * plan.src_datum_size;

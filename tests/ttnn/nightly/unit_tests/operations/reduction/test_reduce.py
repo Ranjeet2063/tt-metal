@@ -222,8 +222,7 @@ def test_rm_reduce_h_axis_split(device, reduce_op, dtype, keepdim, shape):
     ],
 )
 def test_tile_reduce_h_axis_split(device, reduce_op, dtype, keepdim, shape):
-    """H reduce on tall TILE input — stage 1 keeps the tiled reader/compute and emits ROW_MAJOR FP32
-    partials; stage 2 is the dense RM H collapse."""
+    """H reduce on tall TILE input — tiled stage 1, RM stage 2."""
     if dtype == ttnn.bfloat16 and shape[2] >= 12544:
         pytest.skip("bf16 accumulation-limited at this H; covered by the FP32 variant")
     torch.manual_seed(0)
@@ -235,8 +234,8 @@ def test_tile_reduce_h_axis_split(device, reduce_op, dtype, keepdim, shape):
     tt_input = ttnn.from_torch(torch_input, dtype=dtype, layout=ttnn.TILE_LAYOUT, device=device)
     ttnn_op = ttnn.mean if reduce_op == "mean" else ttnn.sum
     tt_output = ttnn_op(tt_input, dim=-2, keepdim=keepdim)
-    # A TILE input keeps TILE output: stage 1's ROW_MAJOR partials must not leak out as the op's
-    # natural layout the way they do on the RM path.
+    # No output_layout: TILE in must still produce TILE. Stage 1 writes ROW_MAJOR partials so
+    # each core can own a slice-row; that layout is intermediate and must not become the result.
     assert tt_output.layout == ttnn.TILE_LAYOUT
 
     if dtype == ttnn.float32:
@@ -258,9 +257,8 @@ def test_tile_reduce_h_axis_split(device, reduce_op, dtype, keepdim, shape):
     )
 
 
-# Block-float takes the same split: the input crosses the reader as whole tiles and stage 2 packs
-# the result whole, so neither end needs the per-datum size that block-float cannot supply. The
-# per-column scale keeps the reduced row from collapsing to a constant, which PCC cannot score.
+# Block-float takes the same split (whole-tile I/O). Per-column scale keeps the reduced row from
+# collapsing to a constant that PCC cannot score.
 @pytest.mark.parametrize("reduce_op", ["mean", "sum"])
 @pytest.mark.parametrize("keepdim", [False, True])
 @pytest.mark.parametrize(

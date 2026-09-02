@@ -793,8 +793,7 @@ _TILE_H_SPLIT_SHAPES = [
 )
 @pytest.mark.parametrize("shape", _TILE_H_SPLIT_SHAPES)
 def test_tile_reduce_h_axis_split(device, reduce_op, dtype, fast_and_approximate_mode, output_layout, shape):
-    """H reduce on tall TILE input — stage 1 keeps the tiled reader/compute but emits ROW_MAJOR FP32
-    partials, stage 2 is the dense RM H collapse."""
+    """H reduce on tall TILE input — tiled stage 1, RM stage 2. TILE input defaults to TILE output."""
     if fast_and_approximate_mode and reduce_op != "mean":
         pytest.skip("fast_and_approximate_mode only affects mean")
     torch.manual_seed(0)
@@ -821,11 +820,8 @@ def test_tile_reduce_h_axis_split(device, reduce_op, dtype, fast_and_approximate
 @pytest.mark.parametrize("dtype", [ttnn.bfloat16, ttnn.float32])
 @pytest.mark.parametrize("shape", _TILE_H_SPLIT_SHAPES)
 def test_tile_reduce_h_axis_split_padding_poisoned(device, reduce_op, dtype, shape):
-    """Same shapes with the implicit tile padding pre-filled with a large negative value.
-
-    The reduce re-zeroes implicit padding itself (fill_implicit_tile_padding in
-    generic_reductions.cpp), so what this pins down is that the split path does not bypass that
-    fill — not the reader's past-the-end slices, which are covered by the shapes themselves.
+    """Same shapes with implicit tile padding pre-filled with a large negative value.
+    Pins that the split path still runs fill_implicit_tile_padding.
     """
     torch.manual_seed(0)
     torch_input = torch.rand(shape, dtype=_torch_dtype(dtype))
@@ -852,13 +848,10 @@ def test_tile_reduce_h_axis_split_padding_poisoned(device, reduce_op, dtype, sha
     ],
 )
 def test_tile_reduce_h_no_split_unchanged(device, reduce_op, dtype, shape_or_grid_width):
-    """Shapes the TILE H-axis split must decline. Regression cover for the un-split reader branch,
-    whose compile-time arg layout shifted when the split slots were added."""
+    """Shapes the TILE H-axis split must decline, covering the un-split reader branch."""
     if shape_or_grid_width == "grid_wide":
         grid = device.compute_with_storage_grid_size()
-        # W = 32 * grid_cores makes Wt == grid_cores, so col_groups >= grid_cores whatever the part
-        # is harvested down to. Do not hardcode a width: a literal that starves a 64-core Wormhole
-        # still splits on a 130-core Blackhole.
+        # W = 32 * grid_cores so col_groups fills the grid on any harvested chip.
         shape = (1, 1, 1024, 32 * grid.x * grid.y)
         if dtype == ttnn.float32:
             pytest.skip("grid-wide shape is only run in bfloat16 to keep the tensor small")
