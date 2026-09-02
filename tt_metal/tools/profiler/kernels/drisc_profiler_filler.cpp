@@ -388,11 +388,8 @@ void kernel_main() {
             for (uint32_t r = 0; r < kNumRisc; r++) {
                 const uint32_t tail = tails[r];
                 const uint32_t head = heads[r];
-                uint32_t take = tail - head;
-                if (take > kRingWords) {
-                    take = kRingWords;
-                }
-                const uint32_t start = tail - take;
+                const uint32_t take = tail - head;
+                const uint32_t start = head;
                 heads[r] = head + take;
                 if (take > peak) {
                     peak = take;
@@ -507,34 +504,34 @@ void kernel_main() {
                 const uint32_t d2 = tails[2] - mine[2];
                 const uint32_t d3 = tails[3] - mine[3];
                 const uint32_t d4 = tails[4] - mine[4];
-                const uint32_t c0 = d0 > kRingWords ? kRingWords : d0;  // overflow is counted at issue
-                const uint32_t c1 = d1 > kRingWords ? kRingWords : d1;
-                const uint32_t c2 = d2 > kRingWords ? kRingWords : d2;
-                const uint32_t c3 = d3 > kRingWords ? kRingWords : d3;
-                const uint32_t c4 = d4 > kRingWords ? kRingWords : d4;
-                const uint32_t live = c0 + c1 + c2 + c3 + c4;
+                // No clamp: a producer blocks 506 words past the head it sees, and the mirror is
+                // never behind that head, so no lane's diff can exceed the ring.
+                const uint32_t live = d0 | d1 | d2 | d3 | d4;
                 uint32_t grew = 0;
+                uint32_t peak = 0;
+                // With the ship gate open every live core ships, so nothing downstream reads the
+                // peak or the growth.
                 if constexpr (kLaneShipWords != 0) {
                     const uint32_t tsum = tails[0] + tails[1] + tails[2] + tails[3] + tails[4];
                     grew = tsum - tails_seen[c];
                     tails_seen[c] = tsum;
                     sweep_grew |= grew != 0;
-                }
-                uint32_t peak = c0;
-                if (c1 > peak) {
-                    peak = c1;
-                }
-                if (c2 > peak) {
-                    peak = c2;
-                }
-                if (c3 > peak) {
-                    peak = c3;
-                }
-                if (c4 > peak) {
-                    peak = c4;
-                }
-                if (peak > sweep_peak) {
-                    sweep_peak = peak;
+                    peak = d0;
+                    if (d1 > peak) {
+                        peak = d1;
+                    }
+                    if (d2 > peak) {
+                        peak = d2;
+                    }
+                    if (d3 > peak) {
+                        peak = d3;
+                    }
+                    if (d4 > peak) {
+                        peak = d4;
+                    }
+                    if (peak > sweep_peak) {
+                        sweep_peak = peak;
+                    }
                 }
                 if (live == 0) {
                     // A hot core scanning empty is almost always the producer's 64-word batched
