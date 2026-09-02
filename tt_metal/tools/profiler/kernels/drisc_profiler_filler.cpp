@@ -229,15 +229,18 @@ void kernel_main() {
     // Bounce buffers: at most one READING and one SHIPPING at a time, so every pump pass is a poll
     // and the drain can never stall the sweep.
     constexpr uint32_t kBounceEmpty = 0, kBounceReading = 1, kBounceReady = 2, kBounceShipping = 3;
-    uint32_t b_state[2] = {kBounceEmpty, kBounceEmpty};
-    uint32_t b_bytes[2] = {};       // spool bytes held
-    uint32_t b_off[2] = {};         // bytes already pushed to the host (partial ships under credit)
-    uint32_t b_ack_target[2] = {};  // write-ack mirror at ship: this bounce's flush line
-    uint32_t b_seq[2] = {};         // refill order, so a both-ready pass ships the older bytes first
-    uint32_t b_rd_mark[2] = {};     // stream-1 issue count at refill: this bounce's completion line
-    uint64_t b_rd_end[2] = {};      // what spool_rd advances to when this bounce turns READY
-    uint32_t dma_rd_issued = 0;     // cumulative stream-1 reads
-    bool notify_pending = false;    // pump ships owe the host a bytes_sent notify (batched per sweep)
+    struct Bounce {
+        uint32_t state;
+        uint32_t bytes;       // spool bytes held
+        uint32_t off;         // bytes already pushed to the host (partial ships under credit)
+        uint32_t ack_target;  // write-ack mirror at ship: this bounce's flush line
+        uint32_t seq;         // refill order, so a both-ready pass ships the older bytes first
+        uint32_t rd_mark;     // stream-1 issue count at refill: this bounce's completion line
+        uint64_t rd_end;      // what spool_rd advances to when this bounce turns READY
+    };
+    Bounce b[2] = {};
+    uint32_t dma_rd_issued = 0;   // cumulative stream-1 reads
+    bool notify_pending = false;  // pump ships owe the host a bytes_sent notify (batched per sweep)
     // Pump effort, a pure function of spool occupancy. 0: idle sweeps and the pace gap only.
     // 1: one post-sweep pass every other sweep. 2: post-sweep every sweep. 3: also inline per-batch
     // and in the read-wait spin. Graduated, not bang-bang: one step is well under a microsecond,
@@ -251,7 +254,7 @@ void kernel_main() {
     uint32_t fresh_tick = 0;
     bool drain_dead = false;       // teardown escalated (stop=2) with bytes stranded in the spool
     bool stopped_blocked = false;  // the stop word broke a credit wait with frames still staged
-    uint32_t drain_chunks = 0;     // also the refill sequence number: b_seq ordering reads it
+    uint32_t drain_chunks = 0;     // also the refill sequence number the oldest-first ship compares
 
     // Write `len` bytes at FIFO offset `dst`, splitting a piece that crosses the FIFO wrap --
     // socket_push_pages only wraps the pointer. fifo_size is a whole number of pages, so the split
@@ -300,7 +303,7 @@ void kernel_main() {
             return false;
         } else {
             // L1-only early-out so idle passes cost no DMA or NIU register reads.
-            if (spool_wr == spool_rd && b_state[0] == kBounceEmpty && b_state[1] == kBounceEmpty) {
+            if (spool_wr == spool_rd && b[0].state == kBounceEmpty && b[1].state == kBounceEmpty) {
                 return false;
             }
             bool did = false;
@@ -308,24 +311,24 @@ void kernel_main() {
             // bounce's next writer is the DMA engine, which a sent-only gate does not fence. Most
             // passes make no progress, so every NIU register poll below is gated on the L1 state
             // that could consume it -- an idle pass costs loads the core already has in hand.
-            if (b_state[0] == kBounceShipping || b_state[1] == kBounceShipping) {
+            if (b[0].state == kBounceShipping || b[1].state == kBounceShipping) {
                 const uint32_t acked = NOC_STATUS_READ_REG(NOC_INDEX, NIU_MST_WR_ACK_RECEIVED);
                 for (uint32_t i = 0; i < 2; i++) {
-                    if (b_state[i] == kBounceShipping && static_cast<int32_t>(acked - b_ack_target[i]) >= 0) {
-                        b_state[i] = kBounceEmpty;
+                    if (b[i].state == kBounceShipping && static_cast<int32_t>(acked - b[i].ack_target) >= 0) {
+                        b[i].state = kBounceEmpty;
                         did = true;
                     }
                 }
             }
             // READING -> READY when a bounce's stream-1 reads retire. Stream completion is FIFO, so
             // one outstanding count gives each bounce its own line and both can fill at once.
-            if (b_state[0] == kBounceReading || b_state[1] == kBounceReading) {
+            if (b[0].state == kBounceReading || b[1].state == kBounceReading) {
                 const uint32_t rd_out = experimental::dma_get_reads_outstanding(kDmaDrain);
                 for (uint32_t i = 0; i < 2; i++) {
-                    if (b_state[i] == kBounceReading && rd_out <= dma_rd_issued - b_rd_mark[i]) {
-                        b_state[i] = kBounceReady;
-                        if (b_rd_end[i] > spool_rd) {
-                            spool_rd = b_rd_end[i];
+                    if (b[i].state == kBounceReading && rd_out <= dma_rd_issued - b[i].rd_mark) {
+                        b[i].state = kBounceReady;
+                        if (b[i].rd_end > spool_rd) {
+                            spool_rd = b[i].rd_end;
                         }
                         did = true;
                     }
@@ -334,8 +337,8 @@ void kernel_main() {
             // Refill an empty bounce before shipping the ready one, so the read runs under the
             // ship's NoC issue. The second concurrent refill only at full pressure: at a burst the
             // extra in-flight GDDR read deepens the bank queue exactly when the ship DMA needs it.
-            const uint32_t emp = b_state[0] == kBounceEmpty ? 0u : (b_state[1] == kBounceEmpty ? 1u : 2u);
-            const bool want_refill = emp != 2u && (pump_level >= 3u || b_state[emp ^ 1u] != kBounceReading);
+            const uint32_t emp = b[0].state == kBounceEmpty ? 0u : (b[1].state == kBounceEmpty ? 1u : 2u);
+            const bool want_refill = emp != 2u && (pump_level >= 3u || b[emp ^ 1u].state != kBounceReading);
             // Only ship-completed bytes are readable: nothing short of a stream-0 write's
             // completion orders a stream-1 read of the same address behind it. Advanced lazily:
             // polled only when a refill could consume more than the window it already sees.
@@ -358,12 +361,12 @@ void kernel_main() {
                 if (spool_rd_iss_off == kSpoolBytes) {
                     spool_rd_iss_off = 0;
                 }
-                b_rd_mark[emp] = ++dma_rd_issued;
-                b_rd_end[emp] = spool_rd_iss;
-                b_bytes[emp] = len;
-                b_off[emp] = 0;
-                b_seq[emp] = drain_chunks;
-                b_state[emp] = kBounceReading;
+                b[emp].rd_mark = ++dma_rd_issued;
+                b[emp].rd_end = spool_rd_iss;
+                b[emp].bytes = len;
+                b[emp].off = 0;
+                b[emp].seq = drain_chunks;
+                b[emp].state = kBounceReading;
                 drain_chunks++;
                 did = true;
             }
@@ -372,30 +375,30 @@ void kernel_main() {
             // is a byte stream and the younger bounce would reorder the wire. No per-ship command
             // init and no per-ship notify -- together most of a shipping pass's cost.
             uint32_t rdy = 2u;
-            if (b_state[0] == kBounceReady && b_state[1] == kBounceReady) {
-                rdy = static_cast<int32_t>(b_seq[0] - b_seq[1]) < 0 ? 0u : 1u;
-            } else if (b_state[0] == kBounceReady) {
+            if (b[0].state == kBounceReady && b[1].state == kBounceReady) {
+                rdy = static_cast<int32_t>(b[0].seq - b[1].seq) < 0 ? 0u : 1u;
+            } else if (b[0].state == kBounceReady) {
                 rdy = 0u;
-            } else if (b_state[1] == kBounceReady) {
+            } else if (b[1].state == kBounceReady) {
                 rdy = 1u;
             }
             if (rdy != 2u) {
                 invalidate_l1_cache();
                 const uint32_t bytes_free = sender.downstream_fifo_total_size - (sender.bytes_sent - *acked0);
-                uint32_t nb = b_bytes[rdy] - b_off[rdy];
+                uint32_t nb = b[rdy].bytes - b[rdy].off;
                 if (bytes_free < nb) {
                     nb = bytes_free & ~(kPageBytes - 1u);
                 }
                 if (nb != 0) {
-                    push_fifo(kBounceBase0 + rdy * kBounceBytes + b_off[rdy], sender.write_ptr, nb);
+                    push_fifo(kBounceBase0 + rdy * kBounceBytes + b[rdy].off, sender.write_ptr, nb);
                     socket_push_pages(sender, nb / kPageBytes);
                     notify_pending = true;
-                    b_off[rdy] += nb;
-                    if (b_off[rdy] == b_bytes[rdy]) {
-                        b_state[rdy] = kBounceShipping;
-                        b_off[rdy] = 0;
+                    b[rdy].off += nb;
+                    if (b[rdy].off == b[rdy].bytes) {
+                        b[rdy].state = kBounceShipping;
+                        b[rdy].off = 0;
                         // The ack mirror is cumulative, so this also covers earlier partial ships.
-                        b_ack_target[rdy] = noc_nonposted_writes_acked[NOC_INDEX];
+                        b[rdy].ack_target = noc_nonposted_writes_acked[NOC_INDEX];
                     }
                     did = true;
                 }
@@ -913,7 +916,7 @@ void kernel_main() {
     if constexpr (kSpool) {
         while (experimental::dma_get_writes_outstanding(kDmaShip) != 0) {
         }
-        while (spool_rd_iss != spool_wr || b_state[0] != kBounceEmpty || b_state[1] != kBounceEmpty) {
+        while (spool_rd_iss != spool_wr || b[0].state != kBounceEmpty || b[1].state != kBounceEmpty) {
             drain_pump();
             // Notify per pass, not per sweep: with a host FIFO smaller than the backlog, the
             // acks that free credit only come after the host has seen the bytes.
