@@ -231,9 +231,9 @@ void kernel_main() {
     // defer only after kBatchArmSweeps consecutive growing sweeps, flush after kFlushQuietSweeps
     // dead ones.
     bool grid_busy = false;
-    // Saturation shortcut (ship gate open only): once a sweep shipped real words from every core, the
-    // scan is pure overhead and the first batch's tails age through it, so the whole grid is taken
-    // straight from the wave until a frame comes back empty.
+    // Saturation shortcut: once a sweep shipped every core with real words above the ship threshold,
+    // the scan is pure overhead and the first batch's tails age through it, so the whole grid is
+    // taken straight from the wave until a core comes back empty or under the threshold.
     bool all_live = false;
     uint32_t grow_streak = 0;
     uint32_t quiet_streak = 0;
@@ -353,7 +353,7 @@ void kernel_main() {
         uint32_t pend_n = 0;
         bool have_pend = false;
         uint32_t n_ship = 0;
-        bool any_empty = false;
+        uint32_t min_peak = ~0u;
 
         const uint32_t rd0 = NOC_STATUS_READ_REG(kReadNoc, NIU_MST_RD_RESP_RECEIVED);
         // Every core's tails are read up front. Responses can arrive out of order, so a counted
@@ -380,6 +380,7 @@ void kernel_main() {
             volatile tt_l1_ptr uint32_t* __restrict heads =
                 reinterpret_cast<volatile tt_l1_ptr uint32_t*>(head_scratch(c));
             uint32_t off = kPrefix + kWireCtrl;
+            uint32_t peak = 0;
             ncrisc_noc_read_set_state<DM_DEDICATED_NOC, false, false>(kReadNoc, read_cmd_buf, core_noc[c]);
             // The per-lane walk stays a loop, unlike the scan: lane r's bookkeeping hides
             // behind lane r-1's NIU acceptance, and unrolling front-loaded it against every
@@ -393,6 +394,9 @@ void kernel_main() {
                 }
                 const uint32_t start = tail - take;
                 heads[r] = head + take;
+                if (take > peak) {
+                    peak = take;
+                }
                 cv[kernel_profiler::SPSC_WIRE_HEAD_0 + r] = start;
                 cv[kernel_profiler::SPSC_WIRE_TAIL_0 + r] = tail;
                 if (take == 0) {
@@ -432,7 +436,7 @@ void kernel_main() {
             pfx[1] = off - kPrefix;
             slot_bytes[sl] = off * 4u;
             slot_core[sl] = static_cast<uint8_t>(c);
-            return off == kPrefix + kWireCtrl;
+            return peak;
         };
 
         // Heads go out the moment the batch's read barrier passes, not with the frame
@@ -486,6 +490,9 @@ void kernel_main() {
         cv_wait(rd0, num_cores);
         if (all_live) {
             n_ship = num_cores;
+            if constexpr (kLaneShipWords != 0) {
+                sweep_grew = true;
+            }
         } else {
             for (uint32_t c = 0; c < num_cores; c++) {
                 const tt_l1_ptr uint32_t* __restrict tails =
@@ -563,7 +570,10 @@ void kernel_main() {
             uint32_t n = 0;
             uint32_t slots = 0;
             while (slots < kGenSlots && cur < n_ship) {
-                any_empty |= issue_core(ship_list[cur], gen * kGenSlots + slots);
+                const uint32_t pk = issue_core(ship_list[cur], gen * kGenSlots + slots);
+                if (pk < min_peak) {
+                    min_peak = pk;
+                }
                 cur++;
                 n++;
                 slots++;
@@ -613,16 +623,15 @@ void kernel_main() {
             ship_frames(pend_n, prev_gen(gen));
             have_pend = false;
         }
-        if constexpr (kLaneShipWords == 0) {
-            const bool next = n_ship == num_cores && !any_empty;
-            if (next && !all_live) {
-                for (uint32_t c = 0; c < num_cores; c++) {
-                    ship_list[c] = static_cast<uint8_t>(c);
-                    hot[c] = 1;
-                }
+        // Enter only when the scan would have shipped every core anyway: all on the list, none empty,
+        // none under the ship threshold. A core dropping below either leaves the mode.
+        const bool next = n_ship == num_cores && min_peak != 0 && min_peak >= kLaneShipWords;
+        if (next && !all_live) {
+            for (uint32_t c = 0; c < num_cores; c++) {
+                ship_list[c] = static_cast<uint8_t>(c);
             }
-            all_live = next;
         }
+        all_live = next;
 
         // Every issued batch has passed its read barrier by here, so each core's scratch is exactly
         // the head it was last relieved to.
@@ -670,7 +679,7 @@ void kernel_main() {
             const uint64_t until = get_timestamp() + gap;
             while (get_timestamp() < until) {
                 if constexpr (kSpool) {
-                    pump.pass();  // idle time is drain time
+                    pump.pass_cold();  // idle time is drain time
                 }
             }
         }
@@ -680,7 +689,7 @@ void kernel_main() {
     // pass; bounded, so a consumer that stopped acking strands bytes instead of wedging teardown.
     if constexpr (kSpool) {
         while (!pump.drained()) {
-            pump.pass();
+            pump.pass_cold();
             // Notify per pass, not per sweep: with a host FIFO smaller than the backlog, the
             // acks that free credit only come after the host has seen the bytes.
             pump.notify();
