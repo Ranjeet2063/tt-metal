@@ -150,14 +150,97 @@ __attribute__((always_inline)) inline uint32_t page_round(uint32_t bytes) {
     return (bytes + kPageBytes - 1u) & ~(kPageBytes - 1u);
 }
 
+// Per-core NoC address of the profiler control block, computed once: get_noc_addr's coordinate
+// arithmetic would otherwise run at every issue site of a sweep that is instruction-stream bound.
+static uint64_t core_noc[kMaxCores];
+// Per-slot frame geometry, written at gather issue and consumed a whole batch later by the ship.
+// Stored rather than recomputed so the two phases cannot diverge.
+static uint8_t slot_core[kNStage];
+static uint32_t slot_bytes[kNStage];  // wire bytes per staged frame, prefix included
+
+// Stage one core's frame: write the prefix and control words locally, then
+// gather-read each live run straight to its packed wire offset. The pads bring each
+// destination to its ring phase, so read src == dst (mod 16 B) holds for every
+// piece, including a wrap split, whose continuation is congruent because the ring
+// capacity is a multiple of the alignment.
+__attribute__((noinline)) uint32_t
+issue_core(volatile tt_l1_ptr uint32_t* coords, uint32_t cv_src, uint32_t c, uint32_t sl) {
+    const uint32_t slot = kStageBase + sl * kSlotBytes;
+    const uint32_t xy = coords[c];
+    const tt_l1_ptr uint32_t* __restrict tails =
+        reinterpret_cast<const tt_l1_ptr uint32_t*>(kCvBase + c * kCvReadBytes);
+    volatile tt_l1_ptr uint32_t* __restrict cv = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(slot + kPrefix * 4u);
+    // The head advance is staged here, hidden behind the NIU's acceptance of the same
+    // lane's gather read; after the batch barrier only the posted head write remains on
+    // the release path. Safe because nothing reads the scratch between issue and that
+    // barrier.
+    volatile tt_l1_ptr uint32_t* __restrict heads = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(head_scratch(c));
+    uint32_t off = kPrefix + kWireCtrl;
+    uint32_t peak = 0;
+    uint32_t reads = 0;
+    ncrisc_noc_read_set_state<DM_DEDICATED_NOC, false, false>(kReadNoc, read_cmd_buf, core_noc[c]);
+    // The per-lane walk stays a loop, unlike the scan: lane r's bookkeeping hides
+    // behind lane r-1's NIU acceptance, and unrolling front-loaded it against every
+    // issue and measurably regressed.
+    for (uint32_t r = 0; r < kNumRisc; r++) {
+        const uint32_t tail = tails[r];
+        const uint32_t head = heads[r];
+        const uint32_t take = tail - head;
+        const uint32_t start = head;
+        heads[r] = head + take;
+        if (take > peak) {
+            peak = take;
+        }
+        cv[kernel_profiler::SPSC_WIRE_HEAD_0 + r] = start;
+        cv[kernel_profiler::SPSC_WIRE_TAIL_0 + r] = tail;
+        if (take == 0) {
+            continue;
+        }
+        const bool img = kernel_profiler::spsc_span_wrap_image(start, take, kRingWords);
+        off += kernel_profiler::spsc_span_pack_pad(img ? 0u : start, off);
+        const uint32_t ring_src = cv_src + (kCtrlWords + r * kRingWords) * 4u;
+        const uint32_t hm = start & (kRingWords - 1u);
+        if (img) {
+            // A near-full wrapping run ships as its whole ring image in one read
+            // (the decoder linearises by head with the same predicate). Never coalesce
+            // adjacent ring images into one read: it starves the producer's L1 port,
+            // up to ~70x the stall floor at five rings per read.
+            ncrisc_noc_read_with_state<DM_DEDICATED_NOC, false, false>(
+                kReadNoc, read_cmd_buf, ring_src, slot + off * 4u, kRingWords * 4u);
+            off += kRingWords;
+            reads++;
+        } else if (hm + take > kRingWords) {
+            // A small wrapping run ships as the two-piece split, byte-exact: at
+            // sustained rates the image's dead remainder is most of the ring, and
+            // there the drain, not the sweep, is the binding resource.
+            const uint32_t first = kRingWords - hm;
+            ncrisc_noc_read_with_state<DM_DEDICATED_NOC, false, false>(
+                kReadNoc, read_cmd_buf, ring_src + hm * 4u, slot + off * 4u, first * 4u);
+            ncrisc_noc_read_with_state<DM_DEDICATED_NOC, false, false>(
+                kReadNoc, read_cmd_buf, ring_src, slot + (off + first) * 4u, (take - first) * 4u);
+            off += take;
+            reads += 2;
+        } else {
+            ncrisc_noc_read_with_state<DM_DEDICATED_NOC, false, false>(
+                kReadNoc, read_cmd_buf, ring_src + hm * 4u, slot + off * 4u, take * 4u);
+            off += take;
+            reads++;
+        }
+    }
+    cv[kernel_profiler::SPSC_WIRE_XY] = xy;
+    // pfx[0] is constant and staged once at init; only the payload word varies.
+    volatile tt_l1_ptr uint32_t* pfx = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(slot);
+    pfx[1] = off - kPrefix;
+    slot_bytes[sl] = off * 4u;
+    slot_core[sl] = static_cast<uint8_t>(c);
+    noc_reads_num_issued[kReadNoc] += reads;
+    return peak;
+}
+
 void kernel_main() {
     const uint32_t num_cores = get_arg_val<uint32_t>(0);
     const uint32_t cv_src = get_arg_val<uint32_t>(1);  // profiler_msg_t base on every worker
     volatile tt_l1_ptr uint32_t* coords = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_arg_addr(2));
-    // Per-core NoC address of the profiler control block, computed once: get_noc_addr's coordinate
-    // arithmetic would otherwise run at every issue site of a sweep that is instruction-stream
-    // bound.
-    static uint64_t core_noc[kMaxCores];
     for (uint32_t i = 0; i < num_cores; i++) {
         const uint32_t xy = coords[i];
         core_noc[i] = get_noc_addr(xy & 0xFFFFu, xy >> 16, cv_src);
@@ -198,10 +281,6 @@ void kernel_main() {
     static uint32_t tails_seen[kMaxCores];
     static uint8_t hot[kMaxCores];        // shipped real words last scan; hot + empty scan = publish lag
     static uint8_t ship_list[kMaxCores];  // this sweep's ship set, dense core indices
-    // Per-slot frame geometry, written at gather issue and consumed a whole batch later by the
-    // ship. Stored rather than recomputed so the two phases cannot diverge.
-    static uint8_t slot_core[kNStage];
-    static uint32_t slot_bytes[kNStage];  // wire bytes per staged frame, prefix included
     for (uint32_t i = 0; i < num_cores; i++) {
         hot[i] = 0;
     }
@@ -361,81 +440,6 @@ void kernel_main() {
         // stale but valid (tails are monotonic): it under-ships and catches up next visit.
         cv_issue(core_noc, 0, num_cores);
 
-        // Stage one core's frame: write the prefix and control words locally, then
-        // gather-read each live run straight to its packed wire offset. The pads bring each
-        // destination to its ring phase, so read src == dst (mod 16 B) holds for every
-        // piece, including a wrap split, whose continuation is congruent because the ring
-        // capacity is a multiple of the alignment.
-        auto issue_core = [&](uint32_t c, uint32_t sl) {
-            const uint32_t slot = kStageBase + sl * kSlotBytes;
-            const uint32_t xy = coords[c];
-            const tt_l1_ptr uint32_t* __restrict tails =
-                reinterpret_cast<const tt_l1_ptr uint32_t*>(kCvBase + c * kCvReadBytes);
-            volatile tt_l1_ptr uint32_t* __restrict cv =
-                reinterpret_cast<volatile tt_l1_ptr uint32_t*>(slot + kPrefix * 4u);
-            // The head advance is staged here, hidden behind the NIU's acceptance of the same
-            // lane's gather read; after the batch barrier only the posted head write remains on
-            // the release path. Safe because nothing reads the scratch between issue and that
-            // barrier.
-            volatile tt_l1_ptr uint32_t* __restrict heads =
-                reinterpret_cast<volatile tt_l1_ptr uint32_t*>(head_scratch(c));
-            uint32_t off = kPrefix + kWireCtrl;
-            uint32_t peak = 0;
-            ncrisc_noc_read_set_state<DM_DEDICATED_NOC, false, false>(kReadNoc, read_cmd_buf, core_noc[c]);
-            // The per-lane walk stays a loop, unlike the scan: lane r's bookkeeping hides
-            // behind lane r-1's NIU acceptance, and unrolling front-loaded it against every
-            // issue and measurably regressed.
-            for (uint32_t r = 0; r < kNumRisc; r++) {
-                const uint32_t tail = tails[r];
-                const uint32_t head = heads[r];
-                const uint32_t take = tail - head;
-                const uint32_t start = head;
-                heads[r] = head + take;
-                if (take > peak) {
-                    peak = take;
-                }
-                cv[kernel_profiler::SPSC_WIRE_HEAD_0 + r] = start;
-                cv[kernel_profiler::SPSC_WIRE_TAIL_0 + r] = tail;
-                if (take == 0) {
-                    continue;
-                }
-                const bool img = kernel_profiler::spsc_span_wrap_image(start, take, kRingWords);
-                off += kernel_profiler::spsc_span_pack_pad(img ? 0u : start, off);
-                const uint32_t ring_src = cv_src + (kCtrlWords + r * kRingWords) * 4u;
-                const uint32_t hm = start & (kRingWords - 1u);
-                if (img) {
-                    // A near-full wrapping run ships as its whole ring image in one read
-                    // (the decoder linearises by head with the same predicate). Never coalesce
-                    // adjacent ring images into one read: it starves the producer's L1 port,
-                    // up to ~70x the stall floor at five rings per read.
-                    ncrisc_noc_read_with_state<DM_DEDICATED_NOC, true, false>(
-                        kReadNoc, read_cmd_buf, ring_src, slot + off * 4u, kRingWords * 4u);
-                    off += kRingWords;
-                } else if (hm + take > kRingWords) {
-                    // A small wrapping run ships as the two-piece split, byte-exact: at
-                    // sustained rates the image's dead remainder is most of the ring, and
-                    // there the drain, not the sweep, is the binding resource.
-                    const uint32_t first = kRingWords - hm;
-                    ncrisc_noc_read_with_state<DM_DEDICATED_NOC, true, false>(
-                        kReadNoc, read_cmd_buf, ring_src + hm * 4u, slot + off * 4u, first * 4u);
-                    ncrisc_noc_read_with_state<DM_DEDICATED_NOC, true, false>(
-                        kReadNoc, read_cmd_buf, ring_src, slot + (off + first) * 4u, (take - first) * 4u);
-                    off += take;
-                } else {
-                    ncrisc_noc_read_with_state<DM_DEDICATED_NOC, true, false>(
-                        kReadNoc, read_cmd_buf, ring_src + hm * 4u, slot + off * 4u, take * 4u);
-                    off += take;
-                }
-            }
-            cv[kernel_profiler::SPSC_WIRE_XY] = xy;
-            // pfx[0] is constant and staged once at init; only the payload word varies.
-            volatile tt_l1_ptr uint32_t* pfx = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(slot);
-            pfx[1] = off - kPrefix;
-            slot_bytes[sl] = off * 4u;
-            slot_core[sl] = static_cast<uint8_t>(c);
-            return peak;
-        };
-
         // Heads go out the moment the batch's read barrier passes, not with the frame
         // emit: the payload is resident in staging once the reads land, so the producer's
         // ring slots are free regardless of when the frame reaches the host.
@@ -567,7 +571,7 @@ void kernel_main() {
             uint32_t n = 0;
             uint32_t slots = 0;
             while (slots < kGenSlots && cur < n_ship) {
-                const uint32_t pk = issue_core(ship_list[cur], gen * kGenSlots + slots);
+                const uint32_t pk = issue_core(coords, cv_src, ship_list[cur], gen * kGenSlots + slots);
                 if (pk < min_peak) {
                     min_peak = pk;
                 }
