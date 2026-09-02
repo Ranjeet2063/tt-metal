@@ -250,16 +250,15 @@ void kernel_main() {
         if (count == 0) {
             return;
         }
+        // Frames occupy whole pages on the wire, dead tail bytes included, so the FIFO write pointer
+        // and the spool offset advance in lockstep and the drain needs no frame geometry at all.
+        uint32_t len[kGenSlots];
+        uint32_t bytes = 0;
+        for (uint32_t f = 0; f < count; f++) {
+            len[f] = page_round(slot_bytes[start + f]);
+            bytes += len[f];
+        }
         if constexpr (kSpool) {
-            // Whole page-rounded frames, dead tail bytes included: the spool offset then advances
-            // in lockstep with the FIFO write pointer, so the spool is a byte-exact image of the
-            // wire and the drain needs no frame geometry at all.
-            uint32_t len[kGenSlots];
-            uint32_t bytes = 0;
-            for (uint32_t f = 0; f < count; f++) {
-                len[f] = page_round(slot_bytes[start + f]);
-                bytes += len[f];
-            }
             // Full spool: pump until there is room. This wait, not a drop, is the spool's
             // back-pressure -- frames stay safe in staging, the sweep slows, producers stall.
             // It holds through quiesce; only the kill switch breaks it.
@@ -288,30 +287,25 @@ void kernel_main() {
                 pump.append(fsrc, piece);
             }
             pump.rebalance();
-            return;
-        }
-        // Direct push: reserve host FIFO credit, then write the frames straight to the host.
-        uint32_t npages = 0;
-        for (uint32_t f = 0; f < count; f++) {
-            npages += page_round(slot_bytes[start + f]) / kPageBytes;
-        }
-        asm volatile("fence" ::: "memory");
-        if (!reserve_pages(sender, npages, stop)) {
-            killed = true;
-            return;
-        }
-        const uint32_t fifo_size = sender.downstream_fifo_curr_size;
-        uint32_t wr = sender.write_ptr;
-        for (uint32_t f = 0; f < count; f++) {
-            const uint32_t bytes = slot_bytes[start + f];
-            push_fifo(sender, kStageBase + (start + f) * kSlotBytes, wr, bytes);
-            wr += page_round(bytes);
-            if (wr >= fifo_size) {
-                wr -= fifo_size;
+        } else {
+            // Direct push: reserve host FIFO credit, then write the frames straight to the host.
+            asm volatile("fence" ::: "memory");
+            if (!reserve_pages(sender, bytes / kPageBytes, stop)) {
+                killed = true;
+                return;
             }
+            const uint32_t fifo_size = sender.downstream_fifo_curr_size;
+            uint32_t wr = sender.write_ptr;
+            for (uint32_t f = 0; f < count; f++) {
+                push_fifo(sender, kStageBase + (start + f) * kSlotBytes, wr, slot_bytes[start + f]);
+                wr += len[f];
+                if (wr >= fifo_size) {
+                    wr -= fifo_size;
+                }
+            }
+            socket_push_pages(sender, bytes / kPageBytes);
+            notify_bytes_sent(sender);
         }
-        socket_push_pages(sender, npages);
-        notify_bytes_sent(sender);
     };
 
     // Main loop. On stop=1, keep sweeping until one whole sweep moves nothing, so markers still in
