@@ -88,8 +88,10 @@ constexpr uint32_t kLaneShipWords = (kRingWords * kShipMinPct) / 100u;
 constexpr uint32_t kLaneTrigger = kRingWords / 2u;
 constexpr uint32_t kCvBusyPeak = kLaneTrigger / 2u;
 constexpr uint64_t kCyclesPerUs = 1350;  // DRISC wall clock at the 1.35 GHz AICLK
-// Idle backoff ceiling. 20 us exceeded a lane's fill time at high rates.
-constexpr uint32_t kCvIdleGapMax = 5 * kCyclesPerUs;
+// Idle backoff ceiling. A burst can start anywhere inside it, and at delay 1 a lane fills in ~13.6 us
+// against an ~11 us first sweep, so the ceiling is what the last core of a slice has left; 5 us
+// put that core's onset stalls at 4-35 per run.
+constexpr uint32_t kCvIdleGapMax = 1 * kCyclesPerUs;
 // Worst-case host staleness for a workload too light to reach the occupancy bands.
 constexpr uint64_t kSpoolFreshCycles = 50'000 * kCyclesPerUs;
 constexpr uint64_t kStopDrainCycles = 1'000'000 * kCyclesPerUs;
