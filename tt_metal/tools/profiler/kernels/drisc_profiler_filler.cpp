@@ -311,8 +311,8 @@ void kernel_main() {
     // dead ones.
     bool grid_busy = false;
     // Saturation shortcut: once a sweep shipped every core with real words above the ship threshold,
-    // the scan is pure overhead and the first batch's tails age through it, so the whole grid is
-    // taken straight from the wave until a core comes back empty or under the threshold.
+    // the scan is pure overhead and the first batch's tails age through it, so the whole grid ships
+    // in list order off the per-batch refreshes until a core comes back empty or under the threshold.
     bool all_live = false;
     uint32_t grow_streak = 0;
     uint32_t quiet_streak = 0;
@@ -434,12 +434,6 @@ void kernel_main() {
         uint32_t n_ship = 0;
         uint32_t min_peak = ~0u;
 
-        const uint32_t rd0 = NOC_STATUS_READ_REG(kReadNoc, NIU_MST_RD_RESP_RECEIVED);
-        // Every core's tails are read up front. Responses can arrive out of order, so a counted
-        // response may belong to a later core -- that core then scans last sweep's tails, which are
-        // stale but valid (tails are monotonic): it under-ships and catches up next visit.
-        cv_issue(core_noc, 0, num_cores);
-
         // Heads go out the moment the batch's read barrier passes, not with the frame
         // emit: the payload is resident in staging once the reads land, so the producer's
         // ring slots are free regardless of when the frame reaches the host.
@@ -483,18 +477,23 @@ void kernel_main() {
             }
         };
 
-        // The previous sweep's last ship is still retiring out of the generation this sweep's
-        // first batch refills. Its wait rides under the tail reads' round trip here, not between
-        // those tails landing and the first batch's issue: the batch whose tails age the most is
-        // the batch whose producers stall.
-        retire_gen(gen);
-        cv_wait(rd0, num_cores);
         if (all_live) {
             n_ship = num_cores;
             if constexpr (kLaneShipWords != 0) {
                 sweep_grew = true;
             }
         } else {
+            const uint32_t rd0 = NOC_STATUS_READ_REG(kReadNoc, NIU_MST_RD_RESP_RECEIVED);
+            // Every core's tails are read up front. Responses can arrive out of order, so a counted
+            // response may belong to a later core -- that core then scans last sweep's tails, which
+            // are stale but valid (tails are monotonic): it under-ships and catches up next visit.
+            cv_issue(core_noc, 0, num_cores);
+            // The previous sweep's last ship is still retiring out of the generation this sweep's
+            // first batch refills. Its wait rides under the tail reads' round trip here, not between
+            // those tails landing and the first batch's issue: the batch whose tails age the most is
+            // the batch whose producers stall.
+            retire_gen(gen);
+            cv_wait(rd0, num_cores);
             for (uint32_t c = 0; c < num_cores; c++) {
                 const tt_l1_ptr uint32_t* __restrict tails =
                     reinterpret_cast<const tt_l1_ptr uint32_t*>(kCvBase + c * kCvReadBytes);
@@ -582,10 +581,18 @@ void kernel_main() {
             // Refresh the next batch's tails in the same flight: on the sweep-start
             // snapshot alone the last cores would be served a sweep stale, and the
             // scan-order-last core took all the stalls. This generation's read barrier
-            // covers these reads too.
-            const uint32_t nn = (n_ship - cur) < kGenSlots ? (n_ship - cur) : kGenSlots;
+            // covers these reads too. A full list's last batch refreshes the next sweep's first
+            // batch instead, so a saturated sweep opens on the issue with no wave of its own.
+            uint32_t nn = n_ship - cur;
+            uint32_t ri = cur;
+            if (nn > kGenSlots) {
+                nn = kGenSlots;
+            } else if (nn == 0 && n_ship == num_cores) {
+                nn = num_cores < kGenSlots ? num_cores : kGenSlots;
+                ri = 0;
+            }
             for (uint32_t i = 0; i < nn; i++) {
-                const uint32_t c = ship_list[cur + i];
+                const uint32_t c = ship_list[ri + i];
                 ncrisc_noc_read_set_state<DM_DEDICATED_NOC, false, false>(kReadNoc, read_cmd_buf, core_noc[c]);
                 ncrisc_noc_read_with_state<DM_DEDICATED_NOC, true, false>(
                     kReadNoc, read_cmd_buf, cv_src + kCvReadSrcOff, kCvBase + c * kCvReadBytes, kCvReadBytes);
