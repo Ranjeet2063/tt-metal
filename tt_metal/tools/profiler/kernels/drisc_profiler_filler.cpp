@@ -215,46 +215,10 @@ void kernel_main() {
     // path.
     bool gen_shipped[kNGens] = {};
 
-    // GDDR spool state (dead code when kSpool == 0). Byte counters are monotonic 64-bit (long
-    // captures exceed 4 GiB); ring offsets are kept incrementally so the hot path never takes a
-    // runtime modulo.
-    uint64_t spool_wr = 0;          // bytes appended by the ship DMA
-    uint64_t spool_done = 0;        // bytes whose DMA writes completed (safe for stream-1 to read)
-    uint64_t spool_rd_iss = 0;      // bytes a bounce refill has been issued for
-    uint64_t spool_rd = 0;          // bytes whose refill reads completed (safe to overwrite)
-    uint32_t spool_wr_off = 0;      // spool_wr % kSpoolBytes
-    uint32_t spool_rd_iss_off = 0;  // spool_rd_iss % kSpoolBytes
-    uint32_t dma_issued = 0;        // cumulative stream-0 writes, for the per-generation completion gate
     uint32_t gen_dma_mark[kNGens] = {};
-    // Bounce buffers: at most one READING and one SHIPPING at a time, so every pump pass is a poll
-    // and the drain can never stall the sweep.
-    constexpr uint32_t kBounceEmpty = 0, kBounceReading = 1, kBounceReady = 2, kBounceShipping = 3;
-    struct Bounce {
-        uint32_t state;
-        uint32_t bytes;       // spool bytes held
-        uint32_t off;         // bytes already pushed to the host (partial ships under credit)
-        uint32_t ack_target;  // write-ack mirror at ship: this bounce's flush line
-        uint32_t seq;         // refill order, so a both-ready pass ships the older bytes first
-        uint32_t rd_mark;     // stream-1 issue count at refill: this bounce's completion line
-        uint64_t rd_end;      // what spool_rd advances to when this bounce turns READY
-    };
-    Bounce b[2] = {};
-    uint32_t dma_rd_issued = 0;   // cumulative stream-1 reads
-    bool notify_pending = false;  // pump ships owe the host a bytes_sent notify (batched per sweep)
-    // Pump effort, a pure function of spool occupancy. 0: idle sweeps and the pace gap only.
-    // 1: one post-sweep pass every other sweep. 2: post-sweep every sweep. 3: also inline per-batch
-    // and in the read-wait spin. Graduated, not bang-bang: one step is well under a microsecond,
-    // where a single engage/release threshold added +2.4 us to sweeps already near ring-full.
-    uint32_t pump_level = 0;
-    // The freshness deadline wants at least a per-sweep trickle. Latched: a light workload that
-    // never reaches the occupancy bands degrades into a permanent trickle after the first deadline,
-    // which is the "reasonably real-time" host stream; cleared when the spool empties.
-    bool fresh_boost = false;
-    uint64_t spool_oldest = 0;  // when the spool last went non-empty; 0 = empty
-    uint32_t fresh_tick = 0;
+    SpoolPump<kSpoolBase, kSpoolBytes, kBounceBase0, kBounceBytes, kPageBytes, kDmaShip, kDmaDrain> pump;
     bool drain_dead = false;       // teardown escalated (stop=2) with bytes stranded in the spool
     bool stopped_blocked = false;  // the stop word broke a credit wait with frames still staged
-    uint32_t drain_chunks = 0;     // also the refill sequence number the oldest-first ship compares
 
     // Write `len` bytes at FIFO offset `dst`, splitting a piece that crosses the FIFO wrap --
     // socket_push_pages only wraps the pointer. fifo_size is a whole number of pages, so the split
@@ -287,129 +251,6 @@ void kernel_main() {
             4u);
     };
 
-    // Occupancy changes only where spool_wr or spool_rd advance (emit and the pump), so the pump
-    // level is maintained at those two sites instead of being recomputed from two u64s per batch.
-    auto pump_band = [](uint32_t occ) -> uint32_t {
-        return occ >= kSpoolBytes / 2u + kSpoolBytes / 8u   ? 3u
-               : occ >= kSpoolBytes / 2u                    ? 2u
-               : occ >= kSpoolBytes / 4u + kSpoolBytes / 8u ? 1u
-                                                            : 0u;
-    };
-
-    // One pump pass: never a spin -- every wait this stage could have is a state a later pass
-    // observes, so the pump can delay host delivery but never the sweep.
-    auto drain_pump = [&]() -> bool {
-        if constexpr (!kSpool) {
-            return false;
-        } else {
-            // L1-only early-out so idle passes cost no DMA or NIU register reads.
-            if (spool_wr == spool_rd && b[0].state == kBounceEmpty && b[1].state == kBounceEmpty) {
-                return false;
-            }
-            bool did = false;
-            // SHIPPING -> EMPTY once the egress writes are acked. Full flush, not "sent": the
-            // bounce's next writer is the DMA engine, which a sent-only gate does not fence. Most
-            // passes make no progress, so every NIU register poll below is gated on the L1 state
-            // that could consume it -- an idle pass costs loads the core already has in hand.
-            if (b[0].state == kBounceShipping || b[1].state == kBounceShipping) {
-                const uint32_t acked = NOC_STATUS_READ_REG(NOC_INDEX, NIU_MST_WR_ACK_RECEIVED);
-                for (uint32_t i = 0; i < 2; i++) {
-                    if (b[i].state == kBounceShipping && static_cast<int32_t>(acked - b[i].ack_target) >= 0) {
-                        b[i].state = kBounceEmpty;
-                        did = true;
-                    }
-                }
-            }
-            // READING -> READY when a bounce's stream-1 reads retire. Stream completion is FIFO, so
-            // one outstanding count gives each bounce its own line and both can fill at once.
-            if (b[0].state == kBounceReading || b[1].state == kBounceReading) {
-                const uint32_t rd_out = experimental::dma_get_reads_outstanding(kDmaDrain);
-                for (uint32_t i = 0; i < 2; i++) {
-                    if (b[i].state == kBounceReading && rd_out <= dma_rd_issued - b[i].rd_mark) {
-                        b[i].state = kBounceReady;
-                        if (b[i].rd_end > spool_rd) {
-                            spool_rd = b[i].rd_end;
-                        }
-                        did = true;
-                    }
-                }
-            }
-            // Refill an empty bounce before shipping the ready one, so the read runs under the
-            // ship's NoC issue. The second concurrent refill only at full pressure: at a burst the
-            // extra in-flight GDDR read deepens the bank queue exactly when the ship DMA needs it.
-            const uint32_t emp = b[0].state == kBounceEmpty ? 0u : (b[1].state == kBounceEmpty ? 1u : 2u);
-            const bool want_refill = emp != 2u && (pump_level >= 3u || b[emp ^ 1u].state != kBounceReading);
-            // Only ship-completed bytes are readable: nothing short of a stream-0 write's
-            // completion orders a stream-1 read of the same address behind it. Advanced lazily:
-            // polled only when a refill could consume more than the window it already sees.
-            if (want_refill && spool_done != spool_wr &&
-                static_cast<uint32_t>(spool_done - spool_rd_iss) < kBounceBytes &&
-                experimental::dma_get_writes_outstanding(kDmaShip) == 0) {
-                spool_done = spool_wr;
-            }
-            if (want_refill && spool_done != spool_rd_iss) {
-                uint32_t len = static_cast<uint32_t>(spool_done - spool_rd_iss);
-                if (len > kBounceBytes) {
-                    len = kBounceBytes;
-                }
-                if (len > kSpoolBytes - spool_rd_iss_off) {
-                    len = kSpoolBytes - spool_rd_iss_off;
-                }
-                dma_read_unchecked(kDmaDrain, kSpoolBase + spool_rd_iss_off, kBounceBase0 + emp * kBounceBytes, len);
-                spool_rd_iss += len;
-                spool_rd_iss_off += len;
-                if (spool_rd_iss_off == kSpoolBytes) {
-                    spool_rd_iss_off = 0;
-                }
-                b[emp].rd_mark = ++dma_rd_issued;
-                b[emp].rd_end = spool_rd_iss;
-                b[emp].bytes = len;
-                b[emp].off = 0;
-                b[emp].seq = drain_chunks;
-                b[emp].state = kBounceReading;
-                drain_chunks++;
-                did = true;
-            }
-            // Ship a READY bounce, as much as the host FIFO has credit for right now. Partial ships
-            // keep the FIFO fed under credit pressure. Oldest first when both are ready: the socket
-            // is a byte stream and the younger bounce would reorder the wire. No per-ship command
-            // init and no per-ship notify -- together most of a shipping pass's cost.
-            uint32_t rdy = 2u;
-            if (b[0].state == kBounceReady && b[1].state == kBounceReady) {
-                rdy = static_cast<int32_t>(b[0].seq - b[1].seq) < 0 ? 0u : 1u;
-            } else if (b[0].state == kBounceReady) {
-                rdy = 0u;
-            } else if (b[1].state == kBounceReady) {
-                rdy = 1u;
-            }
-            if (rdy != 2u) {
-                invalidate_l1_cache();
-                const uint32_t bytes_free = sender.downstream_fifo_total_size - (sender.bytes_sent - *acked0);
-                uint32_t nb = b[rdy].bytes - b[rdy].off;
-                if (bytes_free < nb) {
-                    nb = bytes_free & ~(kPageBytes - 1u);
-                }
-                if (nb != 0) {
-                    push_fifo(kBounceBase0 + rdy * kBounceBytes + b[rdy].off, sender.write_ptr, nb);
-                    socket_push_pages(sender, nb / kPageBytes);
-                    notify_pending = true;
-                    b[rdy].off += nb;
-                    if (b[rdy].off == b[rdy].bytes) {
-                        b[rdy].state = kBounceShipping;
-                        b[rdy].off = 0;
-                        // The ack mirror is cumulative, so this also covers earlier partial ships.
-                        b[rdy].ack_target = noc_nonposted_writes_acked[NOC_INDEX];
-                    }
-                    did = true;
-                }
-            }
-            if (did) {
-                pump_level = pump_band(static_cast<uint32_t>(spool_wr - spool_rd));
-            }
-            return did;
-        }
-    };
-
     // Ship `count` adjacent staged slots. A staged slot is already its frame's wire image, so a
     // frame is one write (or one DMA), and the trailing page fill is never written -- the host
     // derives every offset from the control vector and reads past it.
@@ -425,18 +266,18 @@ void kernel_main() {
             // Full spool: pump until there is room. This wait, not a drop, is the spool's
             // back-pressure -- frames stay safe in staging, the sweep slows, producers stall.
             // Interruptible only by the host's stop: lifecycle lives in the close path.
-            while (kSpoolBytes - static_cast<uint32_t>(spool_wr - spool_rd) < bytes) {
+            while (!pump.has_room(bytes)) {
                 if (*stop != 0) {
                     return;
                 }
                 invalidate_l1_cache();
-                drain_pump();
+                pump.pass(sender, acked0, push_fifo);
             }
             // The DMA engine reads the control and length words the scalar core staged; Blackhole
             // stores can reach SRAM out of order.
             asm volatile("fence" ::: "memory");
             for (uint32_t f = 0; f < count;) {
-                uint32_t fsrc = kStageBase + (start + f) * kSlotBytes;
+                const uint32_t fsrc = kStageBase + (start + f) * kSlotBytes;
                 // Whole page-rounded frames, dead tail bytes included: the spool offset then
                 // advances in lockstep with the FIFO write pointer, so the spool is a byte-exact
                 // image of the wire and the drain needs no frame geometry at all.
@@ -449,20 +290,9 @@ void kernel_main() {
                     nfused++;
                 }
                 f += nfused;
-                while (len != 0) {
-                    const uint32_t piece = len > kSpoolBytes - spool_wr_off ? kSpoolBytes - spool_wr_off : len;
-                    dma_write_unchecked(kDmaShip, fsrc, kSpoolBase + spool_wr_off, piece);
-                    dma_issued++;
-                    spool_wr += piece;
-                    spool_wr_off += piece;
-                    if (spool_wr_off == kSpoolBytes) {
-                        spool_wr_off = 0;
-                    }
-                    fsrc += piece;
-                    len -= piece;
-                }
+                pump.append(fsrc, len);
             }
-            pump_level = pump_band(static_cast<uint32_t>(spool_wr - spool_rd));
+            pump.rebalance();
             return;
         }
         // Direct push: reserve host FIFO credit, then write the frames straight to the host.
@@ -490,16 +320,6 @@ void kernel_main() {
         }
         socket_push_pages(sender, npages);
         notify_host();
-    };
-
-    // The batched bytes_sent notify for pump ships: once per sweep instead of once per chunk.
-    auto drain_notify = [&]() {
-        if constexpr (kSpool) {
-            if (notify_pending) {
-                notify_host();
-                notify_pending = false;
-            }
-        }
     };
 
     // Main loop. On stop=1, keep sweeping until one whole sweep moves nothing, so markers still in
@@ -733,7 +553,7 @@ void kernel_main() {
             auto ship_frames = [&](uint32_t n, uint32_t g) {
                 emit_slots(g * kGenSlots, n);
                 if constexpr (kSpool) {
-                    gen_dma_mark[g] = dma_issued;
+                    gen_dma_mark[g] = pump.dma_issued;
                 }
                 gen_shipped[g] = true;
             };
@@ -757,7 +577,7 @@ void kernel_main() {
                     if constexpr (kSpool) {
                         // This generation's ship writes only: stream completion is FIFO,
                         // so outstanding <= later-issues means this generation retired.
-                        const uint32_t since = dma_issued - gen_dma_mark[gen];
+                        const uint32_t since = pump.dma_issued - gen_dma_mark[gen];
                         const uint32_t cap = since > kDmaOutstandingMax ? kDmaOutstandingMax : since;
                         while (experimental::dma_get_writes_outstanding(kDmaShip) > cap) {
                         }
@@ -796,8 +616,8 @@ void kernel_main() {
                     ship_frames(pend_n, gen == 0u ? kNGens - 1u : gen - 1u);
                 }
                 if constexpr (kSpool) {
-                    if (pump_level >= 3u) {
-                        drain_pump();
+                    if (pump.level >= 3u) {
+                        pump.pass(sender, acked0, push_fifo);
                     }
                 }
 
@@ -807,8 +627,8 @@ void kernel_main() {
                 while (!ncrisc_noc_reads_flushed(kReadNoc)) {
                     if constexpr (kSpool) {
                         // Level 3 means occupancy is over the 5/8 line, so nonempty holds.
-                        if (pump_level >= 3u) {
-                            drain_pump();
+                        if (pump.level >= 3u) {
+                            pump.pass(sender, acked0, push_fifo);
                         }
                     }
                 }
@@ -849,10 +669,10 @@ void kernel_main() {
         // Busy sweeps below the first band skip the post-sweep pump entirely: the spool is the
         // burst absorber, and a capture that fits in it deserves pure gather.
         if constexpr (kSpool) {
-            if (pump_level >= 2u || (pump_level == 1u && (sweeps & 1u) != 0) || fresh_boost ||
+            if (pump.level >= 2u || (pump.level == 1u && (sweeps & 1u) != 0) || pump.fresh_boost ||
                 relieved == relieved_at_sweep_start) {
-                drain_pump();
-                drain_notify();
+                pump.pass(sender, acked0, push_fifo);
+                pump.notify(notify_host);
             }
         }
 
@@ -866,27 +686,8 @@ void kernel_main() {
             }
             grid_busy = grow_streak >= kBatchArmSweeps;
         }
-        // Freshness deadline, checked every 64 sweeps because even one wall-clock read per sweep
-        // measurably stalls producers at the saturation boundary (~1 ms of stride is noise against
-        // the 50 ms bound). A workload too light to reach the occupancy bands would otherwise sit
-        // in the spool for seconds; the deadline escalates it to the latched per-sweep trickle,
-        // never to inline pumping -- freshness is a latency bound, not a pressure emergency.
         if constexpr (kSpool) {
-            if (++fresh_tick >= 64u) {
-                fresh_tick = 0;
-                if (spool_wr == spool_rd) {
-                    spool_oldest = 0;
-                    fresh_boost = false;
-                } else {
-                    const uint64_t now = get_timestamp();
-                    if (spool_oldest == 0 || pump_level >= 1u || fresh_boost) {
-                        spool_oldest = now;
-                        fresh_boost = pump_level == 0u && fresh_boost;
-                    } else if (now - spool_oldest > kSpoolFreshCycles) {
-                        fresh_boost = true;
-                    }
-                }
-            }
+            pump.freshness_tick(kSpoolFreshCycles);
         }
         // Idle pacing: collapse on work, creep toward the ceiling when idle. Live-but-untriggered
         // lanes count as work here -- a head only reaches a producer on a ship, so sleeping while
@@ -904,7 +705,7 @@ void kernel_main() {
             const uint64_t until = get_timestamp() + gap;
             while (get_timestamp() < until) {
                 if constexpr (kSpool) {
-                    drain_pump();  // idle time is drain time
+                    pump.pass(sender, acked0, push_fifo);  // idle time is drain time
                 }
             }
         }
@@ -916,11 +717,11 @@ void kernel_main() {
     if constexpr (kSpool) {
         while (experimental::dma_get_writes_outstanding(kDmaShip) != 0) {
         }
-        while (spool_rd_iss != spool_wr || b[0].state != kBounceEmpty || b[1].state != kBounceEmpty) {
-            drain_pump();
+        while (!pump.drained()) {
+            pump.pass(sender, acked0, push_fifo);
             // Notify per pass, not per sweep: with a host FIFO smaller than the backlog, the
             // acks that free credit only come after the host has seen the bytes.
-            drain_notify();
+            pump.notify(notify_host);
             // The host's teardown escalates stop to 2 after its own timeout -- the close path's
             // kill switch for a drain whose consumer will never finish it.
             invalidate_l1_cache();
@@ -929,7 +730,7 @@ void kernel_main() {
                 break;
             }
         }
-        drain_notify();
+        pump.notify(notify_host);
     }
 
     // socket_barrier waits for the host to ack everything, so it would hang on a dead consumer.
