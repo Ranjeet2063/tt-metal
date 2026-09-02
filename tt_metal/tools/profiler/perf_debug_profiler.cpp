@@ -1265,7 +1265,9 @@ bool PerfDebugProfiler::boot_device(
 
         const uint32_t slot_bytes = slot_bytes_all;
         constexpr uint32_t kCfgReserve = 8 * 1024;
-        constexpr uint32_t kScratchBytes = 128 * 32;
+        // One 64-byte record per core (landed tails, head mirror, wire XY); the kernel's max_cores bound.
+        constexpr uint32_t kMaxCores = 128;
+        constexpr uint32_t kScratchBytes = kMaxCores * 64;
         // done(64) + stop(64) + results(64 words = 256) + handshake(64). Was 512 when results was 48 words.
         constexpr uint32_t kMiscBytes = 1024;
         const uint32_t fixed = kCfgReserve + kScratchBytes + kMiscBytes;
@@ -1280,8 +1282,8 @@ bool PerfDebugProfiler::boot_device(
         // The self frame is a full slot (prefix + control vector + five rings), so it needs somewhere slot-sized
         const uint32_t nstage_drain = nstage;
         const uint32_t stage_base = ctx.drisc_l1_base[d];
-        const uint32_t head_scratch = stage_base + nstage * slot_bytes;
-        ctx.done_addr[d] = head_scratch + kScratchBytes;
+        const uint32_t core_records = stage_base + nstage * slot_bytes;
+        ctx.done_addr[d] = core_records + kScratchBytes;
         ctx.stop_addr[d] = ctx.done_addr[d] + 64;
         const uint32_t cfg_l1 = ctx.drisc_l1_base[d] + region - kCfgReserve;
         TT_FATAL(ctx.stop_addr[d] + 64 <= cfg_l1, "DRISC L1 layout overlaps the socket config");
@@ -1526,11 +1528,11 @@ bool PerfDebugProfiler::boot_device(
             const std::unordered_map<std::string, uint32_t> cargs = {
                 {"stage_base", stage_base},
                 {"n_stage", nstage_drain},
-                {"head_scratch", head_scratch},
+                {"core_records", core_records},
                 {"done_addr", ctx.done_addr[d]},
                 {"stop_addr", ctx.stop_addr[d]},
                 {"socket_config_addr", ctx.sockets[sk]->get_config_buffer_address()},
-                {"max_cores", 128},
+                {"max_cores", kMaxCores},
                 // With the egress NoC alternating on d&1, d&2 splits each NoC's pushers across two of
                 // the four unicast request VCs; TT_METAL_PERF_DEBUG_FILLER_VCS (comma-separated, one
                 // entry per filler) overrides the whole assignment for arbitration experiments at the
