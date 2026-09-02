@@ -47,6 +47,10 @@ constexpr uint32_t kSlotWords = kernel_profiler::spsc_span_slot_words(kNumRisc);
 constexpr uint32_t kSlotBytes = kSlotWords * 4u;
 constexpr uint32_t kWireCtrl = kernel_profiler::SPSC_SPAN_WIRE_CTRL_WORDS;
 constexpr uint32_t kPayloadCapWords = kSlotWords - kPrefix - kWireCtrl;
+// The lane walk has no room gate: a frame of five full rings and their pads always fits the slot.
+static_assert(
+    kNumRisc * (kRingWords + kernel_profiler::SPSC_SPAN_PACK_ALIGN_WORDS - 1u) <= kPayloadCapWords,
+    "a full span no longer fits a slot");
 constexpr uint32_t kPageWords = kernel_profiler::SPSC_SPAN_PAGE_WORDS;
 constexpr uint32_t kPageBytes = kPageWords * 4u;
 // Reads take the NoC the writes do not: NOC_INDEX carries egress, the other NoC carries gathers.
@@ -371,7 +375,6 @@ void kernel_main() {
             // barrier.
             volatile tt_l1_ptr uint32_t* __restrict heads =
                 reinterpret_cast<volatile tt_l1_ptr uint32_t*>(head_scratch(c));
-            uint32_t live = 0;
             uint32_t off = kPrefix + kWireCtrl;
             ncrisc_noc_read_set_state<DM_DEDICATED_NOC, false, false>(kReadNoc, read_cmd_buf, core_noc[c]);
             // The per-lane walk stays a loop, unlike the scan: lane r's bookkeeping hides
@@ -380,37 +383,19 @@ void kernel_main() {
             for (uint32_t r = 0; r < kNumRisc; r++) {
                 const uint32_t tail = tails[r];
                 const uint32_t head = heads[r];
-                uint32_t run = tail - head;
-                if (run > kRingWords) {
-                    run = kRingWords;
+                uint32_t take = tail - head;
+                if (take > kRingWords) {
+                    take = kRingWords;
                 }
-                const uint32_t start = tail - run;
-                // Frames cap at the slot's payload capacity in whole lanes only: a
-                // published tail is a packet boundary but an arbitrary word count is not,
-                // and clamping mid-run split packets across frames and corrupted the lane
-                // stream.
-                uint32_t take = run;
-                uint32_t pad = 0;
-                const bool img = kernel_profiler::spsc_span_wrap_image(start, take, kRingWords);
-                if (take != 0) {
-                    pad = kernel_profiler::spsc_span_pack_pad(img ? 0u : start, off);
-                    const uint32_t used = off - (kPrefix + kWireCtrl);
-                    const uint32_t room = kPayloadCapWords > used + pad ? kPayloadCapWords - used - pad : 0;
-                    // A ring-image ship occupies the whole ring in the slot, not its extent.
-                    const uint32_t need = img ? kRingWords : take;
-                    if (need > room) {
-                        take = 0;
-                        pad = 0;
-                    }
-                }
+                const uint32_t start = tail - take;
                 heads[r] = head + take;
-                live += take;
                 cv[kernel_profiler::SPSC_WIRE_HEAD_0 + r] = start;
-                cv[kernel_profiler::SPSC_WIRE_TAIL_0 + r] = start + take;
+                cv[kernel_profiler::SPSC_WIRE_TAIL_0 + r] = tail;
                 if (take == 0) {
                     continue;
                 }
-                off += pad;
+                const bool img = kernel_profiler::spsc_span_wrap_image(start, take, kRingWords);
+                off += kernel_profiler::spsc_span_pack_pad(img ? 0u : start, off);
                 const uint32_t ring_src = cv_src + (kCtrlWords + r * kRingWords) * 4u;
                 const uint32_t hm = start & (kRingWords - 1u);
                 if (img) {
