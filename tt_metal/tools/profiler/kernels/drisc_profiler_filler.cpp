@@ -116,12 +116,28 @@ static_assert(
         kSlotBytes % (kernel_profiler::SPSC_SPAN_PACK_ALIGN_WORDS * 4u) == 0,
     "packed-gather congruence broken");
 
+// Tail reads and head writes each own a command buffer on the read NoC (the gathers hold
+// read_cmd_buf; nothing else on this core issues atomics or writes there), programmed once with
+// everything that is the same for every core, so a per-core command is the coordinate, one
+// address and the send.
+constexpr uint32_t kCvCmdBuf = write_at_cmd_buf;
+constexpr uint32_t kHeadCmdBuf = write_cmd_buf;
+
+__attribute__((always_inline)) inline uint32_t core_xy(uint64_t noc_addr) {
+    return static_cast<uint32_t>(noc_addr >> NOC_ADDR_COORD_SHIFT) & NOC_COORDINATE_MASK;
+}
+
 // Control-vector wave: read cores [lo, hi)'s tails into CV staging, then wait until `expect`
 // responses have landed since `rd0`. Counted, not barriered: gather responses in flight also bump
 // the counter, which can only hand a scan stale-but-valid tails (they are monotonic).
+__attribute__((always_inline)) inline void cv_issue(const uint64_t* core_noc, uint32_t c) {
+    noc_read_with_state<DM_DEDICATED_NOC, kCvCmdBuf, CQ_NOC_sNDl>(
+        kReadNoc, core_xy(core_noc[c]), 0, kCvBase + c * kCvReadBytes, 0);
+}
+
 __attribute__((always_inline)) inline void cv_issue(const uint64_t* core_noc, uint32_t lo, uint32_t hi) {
     for (uint32_t i = lo; i < hi; i++) {
-        noc_async_read<kCvReadBytes>(core_noc[i] + kCvReadSrcOff, kCvBase + i * kCvReadBytes, kCvReadBytes, kReadNoc);
+        cv_issue(core_noc, i);
     }
 }
 
@@ -139,8 +155,8 @@ __attribute__((always_inline)) inline uint32_t head_scratch(uint32_t c) {
 // safe on the slot rotation) and on the read NoC: on the egress NoC this small packet queues behind
 // frame data, so head visibility inherited the PCIe tile's acceptance jitter.
 __attribute__((always_inline)) inline void post_heads(const uint64_t* core_noc, uint32_t c) {
-    noc_async_write_one_packet<true, true>(
-        head_scratch(c), core_noc[c] + kernel_profiler::SPSC_RING_HEAD_0 * 4u, kNumRisc * 4u, kReadNoc);
+    noc_wwrite_with_state<DM_DEDICATED_NOC, kHeadCmdBuf, CQ_NOC_SNdl, CQ_NOC_SEND, CQ_NOC_WAIT, true, true>(
+        kReadNoc, head_scratch(c), core_xy(core_noc[c]), 0);
 }
 
 __attribute__((always_inline)) inline uint32_t prev_gen(uint32_t g) { return g == 0u ? kNGens - 1u : g - 1u; }
@@ -250,6 +266,25 @@ void kernel_main() {
     // with unacked writes would wedge this run's first barrier.
     noc_local_state_init(NOC_INDEX);
     noc_local_state_init(kReadNoc);
+    // The return coordinate is this NIU's own; firmware programmed it into read_cmd_buf.
+    while (!noc_cmd_buf_ready(kReadNoc, kCvCmdBuf)) {
+    }
+    noc_read_init_state<kCvCmdBuf>(kReadNoc);
+    NOC_CMD_BUF_WRITE_REG(kReadNoc, kCvCmdBuf, NOC_TARG_ADDR_LO, cv_src + kCvReadSrcOff);
+    NOC_CMD_BUF_WRITE_REG(kReadNoc, kCvCmdBuf, NOC_TARG_ADDR_MID, 0);
+    NOC_CMD_BUF_WRITE_REG(kReadNoc, kCvCmdBuf, NOC_RET_ADDR_MID, 0);
+    NOC_CMD_BUF_WRITE_REG(
+        kReadNoc,
+        kCvCmdBuf,
+        NOC_RET_ADDR_COORDINATE,
+        NOC_CMD_BUF_READ_REG(kReadNoc, read_cmd_buf, NOC_RET_ADDR_COORDINATE));
+    NOC_CMD_BUF_WRITE_REG(kReadNoc, kCvCmdBuf, NOC_AT_LEN_BE, kCvReadBytes);
+    while (!noc_cmd_buf_ready(kReadNoc, kHeadCmdBuf)) {
+    }
+    noc_write_init_state<kHeadCmdBuf, CQ_NOC_mkP>(kReadNoc, NOC_UNICAST_WRITE_VC);
+    NOC_CMD_BUF_WRITE_REG(kReadNoc, kHeadCmdBuf, NOC_RET_ADDR_LO, cv_src + kernel_profiler::SPSC_RING_HEAD_0 * 4u);
+    NOC_CMD_BUF_WRITE_REG(kReadNoc, kHeadCmdBuf, NOC_RET_ADDR_MID, 0);
+    NOC_CMD_BUF_WRITE_REG(kReadNoc, kHeadCmdBuf, NOC_AT_LEN_BE, kNumRisc * 4u);
 
     SocketSenderInterface sender = create_sender_socket_interface(kSocketConfigAddr);
     set_sender_socket_page_size(sender, kPageBytes);
@@ -592,10 +627,7 @@ void kernel_main() {
                 ri = 0;
             }
             for (uint32_t i = 0; i < nn; i++) {
-                const uint32_t c = ship_list[ri + i];
-                ncrisc_noc_read_set_state<DM_DEDICATED_NOC, false, false>(kReadNoc, read_cmd_buf, core_noc[c]);
-                ncrisc_noc_read_with_state<DM_DEDICATED_NOC, true, false>(
-                    kReadNoc, read_cmd_buf, cv_src + kCvReadSrcOff, kCvBase + c * kCvReadBytes, kCvReadBytes);
+                cv_issue(core_noc, ship_list[ri + i]);
             }
 
             // The overlap: the previous batch ships on the egress side while this batch's
