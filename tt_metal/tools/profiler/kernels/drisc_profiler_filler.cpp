@@ -63,6 +63,7 @@ constexpr uint32_t kDmaOutstandingMax = 15;
 // Staging layout: two-core batches in kNGens generations and, in spool mode, every slot the
 // generations leave split into two drain bounce buffers.
 constexpr uint32_t kGenSlots = 2;
+static_assert(kGenSlots == 2, "the frame emit is written for two-slot generations");
 constexpr uint32_t kNBounce = kSpool ? 2u : 0u;
 constexpr uint32_t kNGens = (kNStage - kNBounce) / kGenSlots;
 static_assert(kNGens >= 2, "the ship pipeline needs at least two staging generations");
@@ -162,8 +163,6 @@ __attribute__((always_inline)) inline void post_heads(const uint64_t* core_noc, 
         kReadNoc, record(c) + kHeadWord * 4u, core_xy(core_noc[c]), 0);
 }
 
-__attribute__((always_inline)) inline uint32_t prev_gen(uint32_t g) { return g == 0u ? kNGens - 1u : g - 1u; }
-
 // A frame occupies whole socket pages on the wire.
 __attribute__((always_inline)) inline uint32_t page_round(uint32_t bytes) {
     return (bytes + kPageBytes - 1u) & ~(kPageBytes - 1u);
@@ -179,7 +178,7 @@ static uint32_t ring_base;  // lane 0's ring on every worker: the control block 
 // bring each destination to its ring phase, so read src == dst (mod 16 B) holds for every
 // piece, including a wrap split, whose continuation is congruent because the ring capacity is
 // a multiple of the alignment. Returns the smallest per-core peak lane take.
-__attribute__((noinline)) uint32_t issue_batch(const uint8_t* cores, uint32_t n, uint32_t slot) {
+__attribute__((noinline)) uint32_t issue_batch(const uint8_t* cores, uint32_t n, uint32_t slot, uint32_t rb) {
     uint32_t min_peak = ~0u;
     for (uint32_t i = 0; i < n; i++) {
         const uint32_t c = cores[i];
@@ -194,7 +193,9 @@ __attribute__((noinline)) uint32_t issue_batch(const uint8_t* cores, uint32_t n,
             reinterpret_cast<volatile tt_l1_ptr uint32_t*>(record(c) + kHeadWord * 4u);
         uint32_t off = kPrefix + kWireCtrl;
         uint32_t peak = 0;
-        ncrisc_noc_read_set_state<DM_DEDICATED_NOC, false, false>(kReadNoc, read_cmd_buf, core_noc[c]);
+        while (!noc_cmd_buf_ready(kReadNoc, read_cmd_buf)) {
+        }
+        NOC_CMD_BUF_WRITE_REG(kReadNoc, read_cmd_buf, NOC_TARG_ADDR_COORDINATE, core_xy(core_noc[c]));
         // The per-lane walk stays a loop, unlike the scan: lane r's bookkeeping hides
         // behind lane r-1's NIU acceptance, and unrolling front-loaded it against every
         // issue and measurably regressed.
@@ -214,7 +215,7 @@ __attribute__((noinline)) uint32_t issue_batch(const uint8_t* cores, uint32_t n,
             }
             const bool img = kernel_profiler::spsc_span_wrap_image(start, take, kRingWords);
             off += kernel_profiler::spsc_span_pack_pad(img ? 0u : start, off);
-            const uint32_t ring_src = ring_base + r * (kRingWords * 4u);
+            const uint32_t ring_src = rb + r * (kRingWords * 4u);
             const uint32_t hm = start & (kRingWords - 1u);
             if (img) {
                 // A near-full wrapping run ships as its whole ring image in one read
@@ -272,6 +273,9 @@ void kernel_main() {
     while (!noc_cmd_buf_ready(kReadNoc, read_cmd_buf)) {
     }
     NOC_CMD_BUF_WRITE_REG(kReadNoc, read_cmd_buf, NOC_PACKET_TAG, 0);
+    // Worker L1 addresses have no bits above 32, so the gather's address-mid word is zero for every
+    // core: written once, and a core's set_state is its coordinate alone.
+    NOC_CMD_BUF_WRITE_REG(kReadNoc, read_cmd_buf, NOC_TARG_ADDR_MID, 0);
     while (!noc_cmd_buf_ready(kReadNoc, kCvCmdBuf)) {
     }
     noc_read_init_state<kCvCmdBuf>(kReadNoc);
@@ -377,26 +381,19 @@ void kernel_main() {
     // derives every offset from the control vector and reads past it.
     // Inlined by force: out of line this is a closure call per batch, and every captured object
     // (the pump, the socket) is then reached through a pointer in the closure.
-    auto emit_slots = [&](uint32_t start, uint32_t count) __attribute__((always_inline)) {
-        // Never true, and load-bearing: it hands the compiler count >= 1, which is what keeps the
-        // emit loops rotated and the slot address strength-reduced (without it: a spill, a mul, and
-        // +3.4% d1 stalls).
-        if (count == 0) {
-            return;
-        }
+    auto emit_slots = [&](uint32_t base, uint32_t count) __attribute__((always_inline)) {
         // Frames occupy whole pages on the wire, dead tail bytes included, so the FIFO write pointer
         // and the spool offset advance in lockstep and the drain needs no frame geometry at all.
         // A frame's length is its own prefix word: payload words behind the fixed prefix.
-        uint32_t raw[kGenSlots];
-        uint32_t len[kGenSlots];
-        uint32_t bytes = 0;
-        for (uint32_t f = 0; f < count; f++) {
-            const tt_l1_ptr uint32_t* pfx =
-                reinterpret_cast<const tt_l1_ptr uint32_t*>(kStageBase + (start + f) * kSlotBytes);
-            raw[f] = (pfx[1] + kPrefix) * 4u;
-            len[f] = page_round(raw[f]);
-            bytes += len[f];
+        const uint32_t raw0 = (reinterpret_cast<const tt_l1_ptr uint32_t*>(base)[1] + kPrefix) * 4u;
+        const uint32_t len0 = page_round(raw0);
+        uint32_t raw1 = 0;
+        uint32_t len1 = 0;
+        if (count == kGenSlots) {
+            raw1 = (reinterpret_cast<const tt_l1_ptr uint32_t*>(base + kSlotBytes)[1] + kPrefix) * 4u;
+            len1 = page_round(raw1);
         }
+        const uint32_t bytes = len0 + len1;
         if constexpr (kSpool) {
             // Full spool: pump until there is room. This wait, not a drop, is the spool's
             // back-pressure -- frames stay safe in staging, the sweep slows, producers stall.
@@ -412,18 +409,13 @@ void kernel_main() {
             // The DMA engine reads the control and length words the scalar core staged; Blackhole
             // stores can reach SRAM out of order.
             asm volatile("fence" ::: "memory");
-            for (uint32_t f = 0; f < count;) {
-                const uint32_t fsrc = kStageBase + (start + f) * kSlotBytes;
-                // A full-span frame fills its slot exactly, so adjacent full frames are
-                // wire-contiguous in staging and ship as one DMA write.
-                uint32_t piece = len[f];
-                uint32_t nfused = 1;
-                while (f + nfused < count && piece == nfused * kSlotBytes) {
-                    piece += len[f + nfused];
-                    nfused++;
-                }
-                f += nfused;
-                pump.append(fsrc, piece);
+            // A full-span frame fills its slot exactly, so a full first frame and its neighbour are
+            // wire-contiguous in staging and ship as one DMA write.
+            if (len1 != 0 && len0 != kSlotBytes) {
+                pump.append(base, len0);
+                pump.append(base + kSlotBytes, len1);
+            } else {
+                pump.append(base, bytes);
             }
             pump.rebalance();
         } else {
@@ -435,12 +427,13 @@ void kernel_main() {
             }
             const uint32_t fifo_size = sender.downstream_fifo_curr_size;
             uint32_t wr = sender.write_ptr;
-            for (uint32_t f = 0; f < count; f++) {
-                push_fifo(sender, kStageBase + (start + f) * kSlotBytes, wr, raw[f]);
-                wr += len[f];
+            push_fifo(sender, base, wr, raw0);
+            if (len1 != 0) {
+                wr += len0;
                 if (wr >= fifo_size) {
                     wr -= fifo_size;
                 }
+                push_fifo(sender, base + kSlotBytes, wr, raw1);
             }
             socket_push_pages(sender, bytes / kPageBytes);
             notify_bytes_sent(sender);
@@ -477,7 +470,10 @@ void kernel_main() {
         // 1-2% of sweep time in capture codegen alone, and the saturation boundary amplifies
         // that ~200x. The scan must stay in this exact compilation context.
         uint32_t gen = 0;
+        uint32_t gen_base = kStageBase;
         uint32_t pend_n = 0;
+        uint32_t pend_gen = 0;
+        uint32_t pend_base = kStageBase;
         bool have_pend = false;
         uint32_t n_ship = 0;
         uint32_t min_peak = ~0u;
@@ -492,8 +488,8 @@ void kernel_main() {
             }
         };
 
-        auto ship_frames = [&](uint32_t n, uint32_t g) __attribute__((always_inline)) {
-            emit_slots(g * kGenSlots, n);
+        auto ship_frames = [&](uint32_t n, uint32_t g, uint32_t base) __attribute__((always_inline)) {
+            emit_slots(base, n);
             if constexpr (kSpool) {
                 gen_dma_mark[g] = pump.dma_issued;
             }
@@ -621,7 +617,7 @@ void kernel_main() {
                 retire_gen(gen);
                 n = (n_ship - cur) < kGenSlots ? (n_ship - cur) : kGenSlots;
                 batch = &ship_list[cur];
-                const uint32_t pk = issue_batch(batch, n, kStageBase + gen * (kGenSlots * kSlotBytes));
+                const uint32_t pk = issue_batch(batch, n, gen_base, ring_base);
                 if (pk < min_peak) {
                     min_peak = pk;
                 }
@@ -648,7 +644,7 @@ void kernel_main() {
             // The overlap: the previous batch ships on the egress side while this batch's
             // gather reads fly on the read NoC.
             if (have_pend) {
-                ship_frames(pend_n, prev_gen(gen));
+                ship_frames(pend_n, pend_gen, pend_base);
                 have_pend = false;
             }
             if (!more) {
@@ -677,8 +673,11 @@ void kernel_main() {
             advance_heads(n, batch);
 
             pend_n = n;
+            pend_gen = gen;
+            pend_base = gen_base;
             have_pend = true;
             gen = gen + 1u == kNGens ? 0u : gen + 1u;
+            gen_base = gen == 0u ? kStageBase : gen_base + kGenSlots * kSlotBytes;
         }
         // Enter only when the scan would have shipped every core anyway: all on the list, none empty,
         // none under the ship threshold. A core dropping below either leaves the mode.
