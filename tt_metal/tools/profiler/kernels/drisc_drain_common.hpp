@@ -39,6 +39,37 @@ inline void write_to_host_chunked(uint32_t pcie_xy_enc, uint32_t src_l1, uint64_
     }
 }
 
+// Write `len` bytes of L1 at `src` to FIFO offset `dst`, splitting a piece that crosses the FIFO wrap --
+// socket_push_pages only wraps the pointer. fifo_size is a whole number of pages, so the split preserves
+// the pack pads' NoC congruence.
+inline void push_fifo(const SocketSenderInterface& sender, uint32_t src, uint32_t dst, uint32_t len) {
+    const uint32_t fifo_size = sender.downstream_fifo_curr_size;
+    if (dst >= fifo_size) {
+        dst -= fifo_size;
+    }
+    const uint64_t base = (static_cast<uint64_t>(sender.d2h.data_addr_hi) << 32) | sender.downstream_fifo_addr;
+    const uint32_t first = (dst + len > fifo_size) ? fifo_size - dst : len;
+    write_to_host_chunked(sender.d2h.pcie_xy_enc, src, base + dst, first);
+    if (first < len) {
+        write_to_host_chunked(sender.d2h.pcie_xy_enc, src + first, base, len - first);
+    }
+}
+
+// The bytes_sent notify. Not socket_notify_receiver: that re-inits write_cmd_buf onto a different VC, and
+// the mesh can then deliver the bytes_sent word ahead of the data it announces. Same command state, VC
+// and route as the data makes delivery order the issue order again.
+inline void notify_bytes_sent(const SocketSenderInterface& sender) {
+    volatile tt_l1_ptr sender_socket_md* cfg =
+        reinterpret_cast<volatile tt_l1_ptr sender_socket_md*>(sender.config_addr);
+    cfg->bytes_sent = sender.bytes_sent;
+    asm volatile("fence" ::: "memory");
+    write_to_host_chunked(
+        sender.d2h.pcie_xy_enc,
+        sender.config_addr,
+        (static_cast<uint64_t>(sender.d2h.bytes_sent_addr_hi) << 32) | sender.downstream_bytes_sent_addr,
+        4u);
+}
+
 // Replacement for socket_reserve_pages (socket_api.h), which spins on `bytes_free < num_bytes` with no
 // escape. Keeps waiting through quiesce (stop=1): the receiver is still acking then, and returning would
 // lose frames whose heads were already relieved. Only the host's kill switch (stop=2, written after its
@@ -139,6 +170,11 @@ struct SpoolPump {
     bool fresh_boost = false;
     uint64_t oldest = 0;  // when the spool last went non-empty; 0 = empty
     uint32_t fresh_tick = 0;
+    SocketSenderInterface& sender_;
+    volatile tt_l1_ptr uint32_t* acked_;  // the downstream's bytes_acked word
+
+    explicit SpoolPump(SocketSenderInterface& sender) :
+        sender_(sender), acked_(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(sender.bytes_acked_base_addr)) {}
 
     uint32_t occupancy() const { return static_cast<uint32_t>(wr - rd); }
     bool has_room(uint32_t bytes) const { return kBytes - occupancy() >= bytes; }
@@ -170,12 +206,10 @@ struct SpoolPump {
         }
     }
 
-    // One pass. `push(src_l1, fifo_offset, bytes)` writes bounce bytes to the host FIFO. Inlined at
-    // every call site on purpose: one out-of-line copy measured 15% more d1 stalls (233k vs 198k),
-    // and the six copies fit the DRISC code region with ~50 B to spare -- kernel growth pays here first.
-    template <class Push>
-    __attribute__((always_inline)) void pass(
-        SocketSenderInterface& sender, volatile tt_l1_ptr uint32_t* acked0, Push&& push) {
+    // One pass. Inlined at every call site on purpose: one out-of-line copy measured 15% more d1
+    // stalls (233k vs 198k), and the six copies fit the DRISC code region with ~50 B to spare --
+    // kernel growth pays here first.
+    __attribute__((always_inline)) void pass() {
         // L1-only early-out so idle passes cost no DMA or NIU register reads.
         if (wr == rd && b[0].state == kEmpty && b[1].state == kEmpty) {
             return;
@@ -256,14 +290,14 @@ struct SpoolPump {
         }
         if (rdy != 2u) {
             invalidate_l1_cache();
-            const uint32_t bytes_free = sender.downstream_fifo_total_size - (sender.bytes_sent - *acked0);
+            const uint32_t bytes_free = sender_.downstream_fifo_total_size - (sender_.bytes_sent - *acked_);
             uint32_t nb = b[rdy].bytes - b[rdy].off;
             if (bytes_free < nb) {
                 nb = bytes_free & ~(kPageBytes - 1u);
             }
             if (nb != 0) {
-                push(kBounceBase + rdy * kBounceBytes + b[rdy].off, sender.write_ptr, nb);
-                socket_push_pages(sender, nb / kPageBytes);
+                push_fifo(sender_, kBounceBase + rdy * kBounceBytes + b[rdy].off, sender_.write_ptr, nb);
+                socket_push_pages(sender_, nb / kPageBytes);
                 notify_pending = true;
                 b[rdy].off += nb;
                 if (b[rdy].off == b[rdy].bytes) {
@@ -281,10 +315,9 @@ struct SpoolPump {
     }
 
     // The batched bytes_sent notify for pump ships: once per sweep instead of once per chunk.
-    template <class Notify>
-    __attribute__((always_inline)) void notify(Notify&& notify_host) {
+    __attribute__((always_inline)) void notify() {
         if (notify_pending) {
-            notify_host();
+            notify_bytes_sent(sender_);
             notify_pending = false;
         }
     }

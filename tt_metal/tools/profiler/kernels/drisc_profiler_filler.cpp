@@ -139,6 +139,11 @@ __attribute__((always_inline)) inline void post_heads(const uint64_t* core_noc, 
 
 __attribute__((always_inline)) inline uint32_t prev_gen(uint32_t g) { return g == 0u ? kNGens - 1u : g - 1u; }
 
+// A frame occupies whole socket pages on the wire.
+__attribute__((always_inline)) inline uint32_t page_round(uint32_t bytes) {
+    return (bytes + kPageBytes - 1u) & ~(kPageBytes - 1u);
+}
+
 void kernel_main() {
     const uint32_t num_cores = get_arg_val<uint32_t>(0);
     const uint32_t cv_src = get_arg_val<uint32_t>(1);  // profiler_msg_t base on every worker
@@ -158,8 +163,6 @@ void kernel_main() {
     noc_local_state_init(kReadNoc);
 
     SocketSenderInterface sender = create_sender_socket_interface(kSocketConfigAddr);
-    const uint32_t pcie_xy_enc = sender.d2h.pcie_xy_enc;
-    const uint64_t pcie_base = (static_cast<uint64_t>(sender.d2h.data_addr_hi) << 32) | sender.downstream_fifo_addr;
     set_sender_socket_page_size(sender, kPageBytes);
     // Egress write command state, programmed once: nothing else on this core touches write_cmd_buf
     // on the egress NoC, and re-programming per push cost ~0.5 us a sweep.
@@ -167,7 +170,6 @@ void kernel_main() {
 
     volatile tt_l1_ptr uint32_t* stop = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(kStopAddr);
     *stop = 0;
-    volatile tt_l1_ptr uint32_t* acked0 = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(sender.bytes_acked_base_addr);
     // The host's launch check polls this: a DRISC that never leaves reset would otherwise wedge every
     // producer on a full ring with no error anywhere.
     volatile tt_l1_ptr uint32_t* hb = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(kDoneAddr + 4);
@@ -193,7 +195,7 @@ void kernel_main() {
     // Per-slot frame geometry, written at gather issue and consumed a whole batch later by the
     // ship. Stored rather than recomputed so the two phases cannot diverge.
     static uint8_t slot_core[kNStage];
-    static uint32_t slot_payload[kNStage];
+    static uint32_t slot_bytes[kNStage];  // wire bytes per staged frame, prefix included
     for (uint32_t i = 0; i < num_cores; i++) {
         hot[i] = 0;
     }
@@ -235,39 +237,8 @@ void kernel_main() {
     bool gen_shipped[kNGens] = {};
 
     uint32_t gen_dma_mark[kNGens] = {};
-    SpoolPump<kSpoolBase, kSpoolBytes, kBounceBase0, kBounceBytes, kPageBytes, kDmaShip, kDmaDrain> pump;
+    SpoolPump<kSpoolBase, kSpoolBytes, kBounceBase0, kBounceBytes, kPageBytes, kDmaShip, kDmaDrain> pump(sender);
     bool killed = false;  // the kill switch (stop=2) broke a wait: the consumer is gone, bytes are stranded
-
-    // Write `len` bytes at FIFO offset `dst`, splitting a piece that crosses the FIFO wrap --
-    // socket_push_pages only wraps the pointer. fifo_size is a whole number of pages, so the split
-    // preserves the pack pads' NoC congruence.
-    auto push_fifo = [&](uint32_t src, uint32_t dst, uint32_t len) {
-        const uint32_t fifo_size = sender.downstream_fifo_curr_size;
-        if (dst >= fifo_size) {
-            dst -= fifo_size;
-        }
-        const uint32_t first = (dst + len > fifo_size) ? fifo_size - dst : len;
-        write_to_host_chunked(pcie_xy_enc, src, pcie_base + dst, first);
-        if (first < len) {
-            write_to_host_chunked(pcie_xy_enc, src + first, pcie_base, len - first);
-        }
-    };
-
-    // The bytes_sent notify. Not socket_notify_receiver: that re-inits write_cmd_buf onto a
-    // different VC, and the mesh can then deliver the bytes_sent word ahead of the data it
-    // announces. Same command state, VC and route as the data makes delivery order the issue
-    // order again.
-    auto notify_host = [&]() {
-        volatile tt_l1_ptr sender_socket_md* cfg =
-            reinterpret_cast<volatile tt_l1_ptr sender_socket_md*>(sender.config_addr);
-        cfg->bytes_sent = sender.bytes_sent;
-        asm volatile("fence" ::: "memory");
-        write_to_host_chunked(
-            pcie_xy_enc,
-            sender.config_addr,
-            (static_cast<uint64_t>(sender.d2h.bytes_sent_addr_hi) << 32) | sender.downstream_bytes_sent_addr,
-            4u);
-    };
 
     // Ship `count` adjacent staged slots. A staged slot is already its frame's wire image, so a
     // frame is one write (or one DMA), and the trailing page fill is never written -- the host
@@ -280,9 +251,14 @@ void kernel_main() {
             return;
         }
         if constexpr (kSpool) {
+            // Whole page-rounded frames, dead tail bytes included: the spool offset then advances
+            // in lockstep with the FIFO write pointer, so the spool is a byte-exact image of the
+            // wire and the drain needs no frame geometry at all.
+            uint32_t len[kGenSlots];
             uint32_t bytes = 0;
             for (uint32_t f = 0; f < count; f++) {
-                bytes += kernel_profiler::spsc_span_frame_words(slot_payload[start + f]) * 4u;
+                len[f] = page_round(slot_bytes[start + f]);
+                bytes += len[f];
             }
             // Full spool: pump until there is room. This wait, not a drop, is the spool's
             // back-pressure -- frames stay safe in staging, the sweep slows, producers stall.
@@ -293,26 +269,23 @@ void kernel_main() {
                     return;
                 }
                 invalidate_l1_cache();
-                pump.pass(sender, acked0, push_fifo);
+                pump.pass();
             }
             // The DMA engine reads the control and length words the scalar core staged; Blackhole
             // stores can reach SRAM out of order.
             asm volatile("fence" ::: "memory");
             for (uint32_t f = 0; f < count;) {
                 const uint32_t fsrc = kStageBase + (start + f) * kSlotBytes;
-                // Whole page-rounded frames, dead tail bytes included: the spool offset then
-                // advances in lockstep with the FIFO write pointer, so the spool is a byte-exact
-                // image of the wire and the drain needs no frame geometry at all.
-                uint32_t len = kernel_profiler::spsc_span_frame_words(slot_payload[start + f]) * 4u;
                 // A full-span frame fills its slot exactly, so adjacent full frames are
                 // wire-contiguous in staging and ship as one DMA write.
+                uint32_t piece = len[f];
                 uint32_t nfused = 1;
-                while (f + nfused < count && len == nfused * kSlotBytes) {
-                    len += kernel_profiler::spsc_span_frame_words(slot_payload[start + f + nfused]) * 4u;
+                while (f + nfused < count && piece == nfused * kSlotBytes) {
+                    piece += len[f + nfused];
                     nfused++;
                 }
                 f += nfused;
-                pump.append(fsrc, len);
+                pump.append(fsrc, piece);
             }
             pump.rebalance();
             return;
@@ -320,7 +293,7 @@ void kernel_main() {
         // Direct push: reserve host FIFO credit, then write the frames straight to the host.
         uint32_t npages = 0;
         for (uint32_t f = 0; f < count; f++) {
-            npages += kernel_profiler::spsc_span_frame_words(slot_payload[start + f]) / kPageWords;
+            npages += page_round(slot_bytes[start + f]) / kPageBytes;
         }
         asm volatile("fence" ::: "memory");
         if (!reserve_pages(sender, npages, stop)) {
@@ -330,15 +303,15 @@ void kernel_main() {
         const uint32_t fifo_size = sender.downstream_fifo_curr_size;
         uint32_t wr = sender.write_ptr;
         for (uint32_t f = 0; f < count; f++) {
-            const uint32_t payload = slot_payload[start + f];
-            push_fifo(kStageBase + (start + f) * kSlotBytes, wr, (kPrefix + payload) * 4u);
-            wr += kernel_profiler::spsc_span_frame_words(payload) * 4u;
+            const uint32_t bytes = slot_bytes[start + f];
+            push_fifo(sender, kStageBase + (start + f) * kSlotBytes, wr, bytes);
+            wr += page_round(bytes);
             if (wr >= fifo_size) {
                 wr -= fifo_size;
             }
         }
         socket_push_pages(sender, npages);
-        notify_host();
+        notify_bytes_sent(sender);
     };
 
     // Main loop. On stop=1, keep sweeping until one whole sweep moves nothing, so markers still in
@@ -386,6 +359,116 @@ void kernel_main() {
         cv_wave(core_noc, 0, cv_chunk, rd0, cv_chunk);
         uint32_t scan_lo = 0;
         uint32_t scan_hi = cv_chunk;
+        // Stage one core's frame: write the prefix and control words locally, then
+        // gather-read each live run straight to its packed wire offset. The pads bring each
+        // destination to its ring phase, so read src == dst (mod 16 B) holds for every
+        // piece, including a wrap split, whose continuation is congruent because the ring
+        // capacity is a multiple of the alignment.
+        auto issue_core = [&](uint32_t c, uint32_t sl) {
+            const uint32_t slot = kStageBase + sl * kSlotBytes;
+            const uint32_t xy = coords[c];
+            const tt_l1_ptr uint32_t* __restrict tails =
+                reinterpret_cast<const tt_l1_ptr uint32_t*>(kCvBase + c * kCvReadBytes);
+            volatile tt_l1_ptr uint32_t* __restrict cv =
+                reinterpret_cast<volatile tt_l1_ptr uint32_t*>(slot + kPrefix * 4u);
+            // The head advance is staged here, hidden behind the NIU's acceptance of the same
+            // lane's gather read; after the batch barrier only the posted head write remains on
+            // the release path. Safe because nothing reads the scratch between issue and that
+            // barrier.
+            volatile tt_l1_ptr uint32_t* __restrict heads =
+                reinterpret_cast<volatile tt_l1_ptr uint32_t*>(head_scratch(c));
+            uint32_t live = 0;
+            uint32_t off = kPrefix + kWireCtrl;
+            ncrisc_noc_read_set_state<DM_DEDICATED_NOC, false, false>(kReadNoc, read_cmd_buf, core_noc[c]);
+            // The per-lane walk stays a loop, unlike the scan: lane r's bookkeeping hides
+            // behind lane r-1's NIU acceptance, and unrolling front-loaded it against every
+            // issue and measurably regressed.
+            for (uint32_t r = 0; r < kNumRisc; r++) {
+                const uint32_t tail = tails[r];
+                const uint32_t head = heads[r];
+                uint32_t run = tail - head;
+                if (run > kRingWords) {
+                    run = kRingWords;
+                }
+                const uint32_t start = tail - run;
+                // Frames cap at the slot's payload capacity in whole lanes only: a
+                // published tail is a packet boundary but an arbitrary word count is not,
+                // and clamping mid-run split packets across frames and corrupted the lane
+                // stream.
+                uint32_t take = run;
+                uint32_t pad = 0;
+                const bool img = kernel_profiler::spsc_span_wrap_image(start, take, kRingWords);
+                if (take != 0) {
+                    pad = kernel_profiler::spsc_span_pack_pad(img ? 0u : start, off);
+                    const uint32_t used = off - (kPrefix + kWireCtrl);
+                    const uint32_t room = kPayloadCapWords > used + pad ? kPayloadCapWords - used - pad : 0;
+                    // A ring-image ship occupies the whole ring in the slot, not its extent.
+                    const uint32_t need = img ? kRingWords : take;
+                    if (need > room) {
+                        take = 0;
+                        pad = 0;
+                    }
+                }
+                heads[r] = head + take;
+                live += take;
+                cv[kernel_profiler::SPSC_WIRE_HEAD_0 + r] = start;
+                cv[kernel_profiler::SPSC_WIRE_TAIL_0 + r] = start + take;
+                if (take == 0) {
+                    continue;
+                }
+                off += pad;
+                const uint32_t ring_src = cv_src + (kCtrlWords + r * kRingWords) * 4u;
+                const uint32_t hm = start & (kRingWords - 1u);
+                if (img) {
+                    // A near-full wrapping run ships as its whole ring image in one read
+                    // (the decoder linearises by head with the same predicate). Never coalesce
+                    // adjacent ring images into one read: it starves the producer's L1 port,
+                    // up to ~70x the stall floor at five rings per read.
+                    ncrisc_noc_read_with_state<DM_DEDICATED_NOC, true, false>(
+                        kReadNoc, read_cmd_buf, ring_src, slot + off * 4u, kRingWords * 4u);
+                    off += kRingWords;
+                } else if (hm + take > kRingWords) {
+                    // A small wrapping run ships as the two-piece split, byte-exact: at
+                    // sustained rates the image's dead remainder is most of the ring, and
+                    // there the drain, not the sweep, is the binding resource.
+                    const uint32_t first = kRingWords - hm;
+                    ncrisc_noc_read_with_state<DM_DEDICATED_NOC, true, false>(
+                        kReadNoc, read_cmd_buf, ring_src + hm * 4u, slot + off * 4u, first * 4u);
+                    ncrisc_noc_read_with_state<DM_DEDICATED_NOC, true, false>(
+                        kReadNoc, read_cmd_buf, ring_src, slot + (off + first) * 4u, (take - first) * 4u);
+                    off += take;
+                } else {
+                    ncrisc_noc_read_with_state<DM_DEDICATED_NOC, true, false>(
+                        kReadNoc, read_cmd_buf, ring_src + hm * 4u, slot + off * 4u, take * 4u);
+                    off += take;
+                }
+            }
+            cv[kernel_profiler::SPSC_WIRE_XY] = xy;
+            // pfx[0] is constant and staged once at init; only the payload word varies.
+            volatile tt_l1_ptr uint32_t* pfx = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(slot);
+            pfx[1] = off - kPrefix;
+            slot_bytes[sl] = off * 4u;
+            slot_core[sl] = static_cast<uint8_t>(c);
+        };
+
+        // Heads go out the moment the batch's read barrier passes, not with the frame
+        // emit: the payload is resident in staging once the reads land, so the producer's
+        // ring slots are free regardless of when the frame reaches the host.
+        auto advance_heads = [&](uint32_t n, uint32_t g) {
+            for (uint32_t i = 0; i < n; i++) {
+                post_heads(core_noc, slot_core[g * kGenSlots + i]);
+                relieved++;
+            }
+        };
+
+        auto ship_frames = [&](uint32_t n, uint32_t g) {
+            emit_slots(g * kGenSlots, n);
+            if constexpr (kSpool) {
+                gen_dma_mark[g] = pump.dma_issued;
+            }
+            gen_shipped[g] = true;
+        };
+
         uint32_t cur = 0;
         while (true) {
             for (uint32_t c = scan_lo; c < scan_hi; c++) {
@@ -458,116 +541,6 @@ void kernel_main() {
             }
             scan_lo = scan_hi;
 
-            // Stage one core's frame: write the prefix and control words locally, then
-            // gather-read each live run straight to its packed wire offset. The pads bring each
-            // destination to its ring phase, so read src == dst (mod 16 B) holds for every
-            // piece, including a wrap split, whose continuation is congruent because the ring
-            // capacity is a multiple of the alignment.
-            auto issue_core = [&](uint32_t c, uint32_t sl) {
-                const uint32_t slot = kStageBase + sl * kSlotBytes;
-                const uint32_t xy = coords[c];
-                const tt_l1_ptr uint32_t* __restrict tails =
-                    reinterpret_cast<const tt_l1_ptr uint32_t*>(kCvBase + c * kCvReadBytes);
-                volatile tt_l1_ptr uint32_t* __restrict cv =
-                    reinterpret_cast<volatile tt_l1_ptr uint32_t*>(slot + kPrefix * 4u);
-                // The head advance is staged here, hidden behind the NIU's acceptance of the same
-                // lane's gather read; after the batch barrier only the posted head write remains on
-                // the release path. Safe because nothing reads the scratch between issue and that
-                // barrier.
-                volatile tt_l1_ptr uint32_t* __restrict heads =
-                    reinterpret_cast<volatile tt_l1_ptr uint32_t*>(head_scratch(c));
-                uint32_t live = 0;
-                uint32_t off = kPrefix + kWireCtrl;
-                ncrisc_noc_read_set_state<DM_DEDICATED_NOC, false, false>(kReadNoc, read_cmd_buf, core_noc[c]);
-                // The per-lane walk stays a loop, unlike the scan: lane r's bookkeeping hides
-                // behind lane r-1's NIU acceptance, and unrolling front-loaded it against every
-                // issue and measurably regressed.
-                for (uint32_t r = 0; r < kNumRisc; r++) {
-                    const uint32_t tail = tails[r];
-                    const uint32_t head = heads[r];
-                    uint32_t run = tail - head;
-                    if (run > kRingWords) {
-                        run = kRingWords;
-                    }
-                    const uint32_t start = tail - run;
-                    // Frames cap at the slot's payload capacity in whole lanes only: a
-                    // published tail is a packet boundary but an arbitrary word count is not,
-                    // and clamping mid-run split packets across frames and corrupted the lane
-                    // stream.
-                    uint32_t take = run;
-                    uint32_t pad = 0;
-                    const bool img = kernel_profiler::spsc_span_wrap_image(start, take, kRingWords);
-                    if (take != 0) {
-                        pad = kernel_profiler::spsc_span_pack_pad(img ? 0u : start, off);
-                        const uint32_t used = off - (kPrefix + kWireCtrl);
-                        const uint32_t room = kPayloadCapWords > used + pad ? kPayloadCapWords - used - pad : 0;
-                        // A ring-image ship occupies the whole ring in the slot, not its extent.
-                        const uint32_t need = img ? kRingWords : take;
-                        if (need > room) {
-                            take = 0;
-                            pad = 0;
-                        }
-                    }
-                    heads[r] = head + take;
-                    live += take;
-                    cv[kernel_profiler::SPSC_WIRE_HEAD_0 + r] = start;
-                    cv[kernel_profiler::SPSC_WIRE_TAIL_0 + r] = start + take;
-                    if (take == 0) {
-                        continue;
-                    }
-                    off += pad;
-                    const uint32_t ring_src = cv_src + (kCtrlWords + r * kRingWords) * 4u;
-                    const uint32_t hm = start & (kRingWords - 1u);
-                    if (img) {
-                        // A near-full wrapping run ships as its whole ring image in one read
-                        // (the decoder linearises by head with the same predicate). Never coalesce
-                        // adjacent ring images into one read: it starves the producer's L1 port,
-                        // up to ~70x the stall floor at five rings per read.
-                        ncrisc_noc_read_with_state<DM_DEDICATED_NOC, true, false>(
-                            kReadNoc, read_cmd_buf, ring_src, slot + off * 4u, kRingWords * 4u);
-                        off += kRingWords;
-                    } else if (hm + take > kRingWords) {
-                        // A small wrapping run ships as the two-piece split, byte-exact: at
-                        // sustained rates the image's dead remainder is most of the ring, and
-                        // there the drain, not the sweep, is the binding resource.
-                        const uint32_t first = kRingWords - hm;
-                        ncrisc_noc_read_with_state<DM_DEDICATED_NOC, true, false>(
-                            kReadNoc, read_cmd_buf, ring_src + hm * 4u, slot + off * 4u, first * 4u);
-                        ncrisc_noc_read_with_state<DM_DEDICATED_NOC, true, false>(
-                            kReadNoc, read_cmd_buf, ring_src, slot + (off + first) * 4u, (take - first) * 4u);
-                        off += take;
-                    } else {
-                        ncrisc_noc_read_with_state<DM_DEDICATED_NOC, true, false>(
-                            kReadNoc, read_cmd_buf, ring_src + hm * 4u, slot + off * 4u, take * 4u);
-                        off += take;
-                    }
-                }
-                cv[kernel_profiler::SPSC_WIRE_XY] = xy;
-                // pfx[0] is constant and staged once at init; only the payload word varies.
-                volatile tt_l1_ptr uint32_t* pfx = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(slot);
-                pfx[1] = off - kPrefix;
-                slot_payload[sl] = off - kPrefix;
-                slot_core[sl] = static_cast<uint8_t>(c);
-            };
-
-            // Heads go out the moment the batch's read barrier passes, not with the frame
-            // emit: the payload is resident in staging once the reads land, so the producer's
-            // ring slots are free regardless of when the frame reaches the host.
-            auto advance_heads = [&](uint32_t n, uint32_t g) {
-                for (uint32_t i = 0; i < n; i++) {
-                    post_heads(core_noc, slot_core[g * kGenSlots + i]);
-                    relieved++;
-                }
-            };
-
-            auto ship_frames = [&](uint32_t n, uint32_t g) {
-                emit_slots(g * kGenSlots, n);
-                if constexpr (kSpool) {
-                    gen_dma_mark[g] = pump.dma_issued;
-                }
-                gen_shipped[g] = true;
-            };
-
             while (cur < n_ship) {
                 // Refill the ship list before it runs dry: the per-batch tail refresh below
                 // only covers cores already on the list, so a batch issued right after a
@@ -627,7 +600,7 @@ void kernel_main() {
                 }
                 if constexpr (kSpool) {
                     if (pump.level >= 3u) {
-                        pump.pass(sender, acked0, push_fifo);
+                        pump.pass();
                     }
                 }
 
@@ -638,7 +611,7 @@ void kernel_main() {
                     if constexpr (kSpool) {
                         // Level 3 means occupancy is over the 5/8 line, so nonempty holds.
                         if (pump.level >= 3u) {
-                            pump.pass(sender, acked0, push_fifo);
+                            pump.pass();
                         }
                     }
                 }
@@ -677,8 +650,8 @@ void kernel_main() {
         if constexpr (kSpool) {
             if (pump.level >= 2u || (pump.level == 1u && (sweeps & 1u) != 0) || pump.fresh_boost ||
                 relieved == relieved_at_sweep_start) {
-                pump.pass(sender, acked0, push_fifo);
-                pump.notify(notify_host);
+                pump.pass();
+                pump.notify();
             }
         }
 
@@ -711,7 +684,7 @@ void kernel_main() {
             const uint64_t until = get_timestamp() + gap;
             while (get_timestamp() < until) {
                 if constexpr (kSpool) {
-                    pump.pass(sender, acked0, push_fifo);  // idle time is drain time
+                    pump.pass();  // idle time is drain time
                 }
             }
         }
@@ -720,13 +693,11 @@ void kernel_main() {
     // Exit. Everything the run spooled must reach the host FIFO before the socket barrier can
     // pass; bounded, so a consumer that stopped acking strands bytes instead of wedging teardown.
     if constexpr (kSpool) {
-        while (experimental::dma_get_writes_outstanding(kDmaShip) != 0) {
-        }
         while (!pump.drained()) {
-            pump.pass(sender, acked0, push_fifo);
+            pump.pass();
             // Notify per pass, not per sweep: with a host FIFO smaller than the backlog, the
             // acks that free credit only come after the host has seen the bytes.
-            pump.notify(notify_host);
+            pump.notify();
             // The host's teardown escalates stop to 2 after its own timeout -- the close path's
             // kill switch for a drain whose consumer will never finish it.
             invalidate_l1_cache();
@@ -735,7 +706,7 @@ void kernel_main() {
                 break;
             }
         }
-        pump.notify(notify_host);
+        pump.notify();
     }
 
     // socket_barrier waits for the host to ack everything, so it would hang on a dead consumer.
