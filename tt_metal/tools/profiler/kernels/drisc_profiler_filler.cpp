@@ -147,15 +147,10 @@ void kernel_main() {
     volatile tt_l1_ptr uint32_t* stop = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(kStopAddr);
     *stop = 0;
     volatile tt_l1_ptr uint32_t* acked0 = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(sender.bytes_acked_base_addr);
-    // Liveness the host can read while the loop runs: without the phase word it cannot tell
-    // "exited" from "blocked" from "idle". Every blocking call gets its own phase value.
+    // The host's launch check polls this: a DRISC that never leaves reset would otherwise wedge every
+    // producer on a full ring with no error anywhere.
     volatile tt_l1_ptr uint32_t* hb = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(kDoneAddr + 4);
-    volatile tt_l1_ptr uint32_t* phase = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(kDoneAddr + 8);
-    constexpr uint32_t kPhaseInit = 1, kPhasePoll = 2, kPhaseReserve = 3, kPhaseWrite = 4, kPhaseExit = 5;
-    constexpr uint32_t kPhWrChunk = 6, kPhWrPush = 7, kPhWrNotify = 8, kPhWrDone = 9;
-    constexpr uint32_t kPhDropped = 10, kPhBar1 = 11, kPhSockBar = 14, kPhTailBar = 15;
     *hb = 0;
-    *phase = kPhaseInit;
 
     // Every frame's prefix is identical, and of the control words only heads, tails and the core
     // identity are staged per frame -- the rest must read zero on the wire. Written once here.
@@ -197,7 +192,7 @@ void kernel_main() {
         tails_seen[c] = tsum;
     }
 
-    uint32_t frames = 0;
+    uint32_t relieved = 0;
     uint32_t sweeps = 0;
     uint32_t gap = 0;
     // Ship-threshold arming. Batching must never hold pre-burst trickle across a burst onset (a
@@ -252,9 +247,9 @@ void kernel_main() {
     bool fresh_boost = false;
     uint64_t spool_oldest = 0;  // when the spool last went non-empty; 0 = empty
     uint32_t fresh_tick = 0;
-    bool drain_dead = false;  // teardown escalated (stop=2) with bytes stranded in the spool
-    uint32_t credit_timeouts = 0;
-    uint32_t drain_chunks = 0;  // also the refill sequence number: b_seq ordering reads it
+    bool drain_dead = false;       // teardown escalated (stop=2) with bytes stranded in the spool
+    bool stopped_blocked = false;  // the stop word broke a credit wait with frames still staged
+    uint32_t drain_chunks = 0;     // also the refill sequence number: b_seq ordering reads it
 
     // Write `len` bytes at FIFO offset `dst`, splitting a piece that crosses the FIFO wrap --
     // socket_push_pages only wraps the pointer. fifo_size is a whole number of pages, so the split
@@ -425,21 +420,16 @@ void kernel_main() {
             // Full spool: pump until there is room. This wait, not a drop, is the spool's
             // back-pressure -- frames stay safe in staging, the sweep slows, producers stall.
             // Interruptible only by the host's stop: lifecycle lives in the close path.
-            if (kSpoolBytes - static_cast<uint32_t>(spool_wr - spool_rd) < bytes) {
-                *phase = kPhaseReserve;
-                while (kSpoolBytes - static_cast<uint32_t>(spool_wr - spool_rd) < bytes && *stop == 0) {
-                    invalidate_l1_cache();
-                    drain_pump();
+            while (kSpoolBytes - static_cast<uint32_t>(spool_wr - spool_rd) < bytes) {
+                if (*stop != 0) {
+                    return;
                 }
-            }
-            if (kSpoolBytes - static_cast<uint32_t>(spool_wr - spool_rd) < bytes) {
-                *phase = kPhDropped;
-                return;
+                invalidate_l1_cache();
+                drain_pump();
             }
             // The DMA engine reads the control and length words the scalar core staged; Blackhole
             // stores can reach SRAM out of order.
             asm volatile("fence" ::: "memory");
-            *phase = kPhaseWrite;
             for (uint32_t f = 0; f < count;) {
                 uint32_t fsrc = kStageBase + (start + f) * kSlotBytes;
                 // Whole page-rounded frames, dead tail bytes included: the spool offset then
@@ -467,9 +457,7 @@ void kernel_main() {
                     len -= piece;
                 }
             }
-            const uint32_t occ = static_cast<uint32_t>(spool_wr - spool_rd);
-            pump_level = pump_band(occ);
-            *phase = kPhWrDone;
+            pump_level = pump_band(static_cast<uint32_t>(spool_wr - spool_rd));
             return;
         }
         // Direct push: reserve host FIFO credit, then write the frames straight to the host.
@@ -478,18 +466,13 @@ void kernel_main() {
             npages += kernel_profiler::spsc_span_frame_words(slot_payload[start + f]) / kPageWords;
         }
         asm volatile("fence" ::: "memory");
-        *phase = kPhaseReserve;
-        const bool credited = reserve_pages(sender, npages, stop);
-        *phase = kPhaseWrite;
-        if (!credited) {
+        if (!reserve_pages(sender, npages, stop)) {
             // Drop rather than block: the heads for these slots were already written back, so the
             // producers stay unblocked and the workload completes. Capture is best-effort; the
             // workload is not.
-            *phase = kPhDropped;
-            credit_timeouts++;
+            stopped_blocked = true;
             return;
         }
-        *phase = kPhWrChunk;
         const uint32_t fifo_size = sender.downstream_fifo_curr_size;
         uint32_t wr = sender.write_ptr;
         for (uint32_t f = 0; f < count; f++) {
@@ -500,11 +483,8 @@ void kernel_main() {
                 wr -= fifo_size;
             }
         }
-        *phase = kPhWrPush;
         socket_push_pages(sender, npages);
-        *phase = kPhWrNotify;
         notify_host();
-        *phase = kPhWrDone;
     };
 
     // The batched bytes_sent notify for pump ships: once per sweep instead of once per chunk.
@@ -521,21 +501,20 @@ void kernel_main() {
     // worker rings ship instead of being stranded; exiting on the stop word directly is what
     // silently truncated captures.
     uint64_t stop_seen_at = 0;
-    uint32_t frames_at_stop_check = 0;
+    uint32_t relieved_at_stop_check = 0;
     for (;;) {
         invalidate_l1_cache();
         if (*stop != 0) {
             if (stop_seen_at == 0) {
                 stop_seen_at = get_timestamp();
-            } else if (frames == frames_at_stop_check || get_timestamp() - stop_seen_at > kStopDrainCycles) {
+            } else if (relieved == relieved_at_stop_check || get_timestamp() - stop_seen_at > kStopDrainCycles) {
                 break;
             }
-            frames_at_stop_check = frames;
+            relieved_at_stop_check = relieved;
         }
         sweeps++;
         *hb = sweeps;
-        *phase = kPhasePoll;
-        const uint32_t frames_at_sweep_start = frames;
+        const uint32_t relieved_at_sweep_start = relieved;
 
         uint32_t sweep_peak = 0;
         bool sweep_grew = false;
@@ -742,7 +721,7 @@ void kernel_main() {
                     // visibility inherited the PCIe tile's acceptance jitter.
                     noc_async_write_one_packet<true, true>(
                         sc, core_noc[c] + kernel_profiler::SPSC_RING_HEAD_0 * 4u, kNumRisc * 4u, kReadNoc);
-                    frames++;
+                    relieved++;
                 }
             };
 
@@ -767,7 +746,6 @@ void kernel_main() {
                 // waited on inside its own sweep -- this is the wait that catches it if the
                 // pace gap has not already drained it.
                 if (gen_shipped[gen]) {
-                    *phase = kPhBar1;
                     // Bare waits: both predicates complete on this device alone (the DMA
                     // engine's writes to GDDR, the NIU's sent counter), so no consumer
                     // state can hang them. Host-gated waits keep their bounds.
@@ -867,7 +845,7 @@ void kernel_main() {
         // burst absorber, and a capture that fits in it deserves pure gather.
         if constexpr (kSpool) {
             if (pump_level >= 2u || (pump_level == 1u && (sweeps & 1u) != 0) || fresh_boost ||
-                frames == frames_at_sweep_start) {
+                relieved == relieved_at_sweep_start) {
                 drain_pump();
                 drain_notify();
             }
@@ -908,7 +886,7 @@ void kernel_main() {
         // Idle pacing: collapse on work, creep toward the ceiling when idle. Live-but-untriggered
         // lanes count as work here -- a head only reaches a producer on a ship, so sleeping while
         // lanes fill toward the trigger is exactly wrong.
-        if (frames != frames_at_sweep_start || sweep_peak >= kCvBusyPeak) {
+        if (relieved != relieved_at_sweep_start || sweep_peak >= kCvBusyPeak) {
             gap = 0;
         } else {
             uint32_t inc = gap >> 1;
@@ -950,12 +928,10 @@ void kernel_main() {
     }
 
     // socket_barrier waits for the host to ack everything, so it would hang on a dead consumer.
-    const bool consumer_gone = credit_timeouts != 0 || drain_dead;
-    *phase = kPhSockBar;
+    const bool consumer_gone = stopped_blocked || drain_dead;
     if (!consumer_gone) {
         socket_barrier(sender);
     }
-    *phase = kPhTailBar;
     while (!ncrisc_noc_nonposted_writes_flushed(NOC_INDEX)) {
     }
     // The posted head write-backs are outside that barrier's predicate; drain their sent counter
@@ -964,7 +940,6 @@ void kernel_main() {
     while (!(ncrisc_noc_posted_writes_sent(NOC_INDEX) && ncrisc_noc_posted_writes_sent(kReadNoc)) &&
            get_timestamp() < t_ps) {
     }
-    *phase = kPhaseExit;
     // Written back only for a live consumer: after dropped frames the socket's view of bytes_sent
     // is already out of sync with the host's, and the socket is being torn down either way.
     if (!consumer_gone) {
@@ -974,7 +949,7 @@ void kernel_main() {
     // Published last, after the socket barrier, so the host only sees `done` once every page is
     // out.
     volatile tt_l1_ptr uint32_t* done = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(kDoneAddr);
-    *done = 0xD09E0000u | (frames & 0xFFFFu);
+    *done = 0xD09E0000u;
 
     // NIU restore, on the host's word. NIU_CFG_0 persists until chip reset, so whoever set stream
     // mode owns putting it back -- and last, because the flip to NOC2AXI takes this L1 (`done`,

@@ -14,8 +14,6 @@
 #pragma once
 
 #include <cstdint>
-#include <string_view>
-#include <unordered_map>
 #include <vector>
 
 #include "tools/profiler/perf_debug_consumer.hpp"
@@ -62,11 +60,6 @@ private:
     // id -> name, mirrored per-ELF from llrt::ZoneMetaRegistry. Member (not shared): this consumer runs
     // on its own delivery thread, so lookups take no lock.
     ZoneNameMirror names_;
-    // Zone NAME -> explicit Tracy zone colour, for the drainer zones. KEYED BY NAME, never by id: a
-    // structural zone id legitimately moves whenever a source line does, so an id-keyed table would
-    // silently stop matching after any edit to the drain kernel. Filled in the constructor with
-    // string literals, so string_view keys never dangle.
-    std::unordered_map<std::string_view, uint32_t> zone_colors_;
 };
 
 }  // namespace perf_debug

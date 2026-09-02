@@ -136,9 +136,6 @@ private:
         const std::shared_ptr<distributed::MeshDevice>& mesh_device,
         DeviceCtx& ctx,
         const distributed::MeshCoordinate& coord);
-    // Read the drainer's LIVE state (done word, heartbeat, phase) mid-run and log it. Distinguishes
-    // "kernel exited" from "kernel blocked in the credit wait" from "kernel sweeping with nothing to do".
-    void dump_drainer_state(DeviceCtx& ctx, uint32_t d, const char* why);
     // After the drainers swept-to-empty and the receiver drained: compare every worker lane's own tail
     // against the receiver's consumed-words mirror, so a stop-path regression can never lose the capture
     // tail silently again.

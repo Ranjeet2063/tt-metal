@@ -356,8 +356,7 @@ constexpr std::uint32_t spsc_span_pack_pad(std::uint32_t start_counter, std::uin
 // use this one predicate: a disagreement mis-walks every lane after the first.
 constexpr static std::uint32_t SPSC_SPAN_WRAP_IMAGE_MAX_PAD_WORDS = 64;
 constexpr bool spsc_span_wrap_image(std::uint32_t start, std::uint32_t extent, std::uint32_t ring_cap) {
-    return (start & (ring_cap - 1u)) + extent > ring_cap &&
-           ring_cap - extent <= SPSC_SPAN_WRAP_IMAGE_MAX_PAD_WORDS;
+    return (start & (ring_cap - 1u)) + extent > ring_cap && ring_cap - extent <= SPSC_SPAN_WRAP_IMAGE_MAX_PAD_WORDS;
 }
 
 inline std::uint32_t spsc_span_w0() { return SPSC_SPAN_PACKET_TYPE << SPSC_SPAN_TYPE_SHIFT; }
@@ -455,39 +454,6 @@ public:
 private:
     MarkFn& mark_;
     bool started_;
-};
-
-// ---- NoC-FOOTPRINT per-sweep sample: the PP_DATA payload contract ------------------------------------
-//
-// One PP_DATA packet per drainer sweep, carrying that sweep's NoC counter DELTAS. Defined HERE, in the one
-// header both the drain kernel and the host consumer already include, because a positional payload described
-// in two places is a format that drifts -- which is the whole reason PP_* lives in a shared header at all.
-//
-// Wire shape (see spsc_packet.h PP_DATA): [0] word0 = data_w0(id, size)  [1] timer_low  [2..] payload.
-// The 7-bit size field DECLARES the payload length and the host walk advances by 2 + size, so the payload
-// carries exactly the live counters for this role and is never padded to a fixed shape.
-//
-// ROLE-SPECIALISED, and that is where the code saving comes from: kRole is a compile-time arg and each role
-// gets its own JIT ELF, so `if constexpr` compiles only that role's four counters. The other four are
-// structurally zero -- measured exactly 0 on silicon (FINDINGS N+42/N+43: a filler's NoC 0 read and NoC 1
-// write columns, a mover's entire NoC 1 side) -- so shipping them per sweep would be paying to transmit a
-// proven constant. The out[] LIFETIME totals still carry all eight; that is where the NoC-split proof lives
-// as a standing invariant, and it costs nothing because it is read once at teardown.
-//
-// ONE TIMESTAMP FOR THE WHOLE PACKET, and this is correct rather than a compromise. Every value is a DELTA
-// OVER THE INTERVAL since the previous sample, and a delta belongs to an interval, not to an instant. The
-// counters are also read back-to-back a few tens of cycles apart, so per-counter timestamps would be
-// fictitious precision. Do not "fix" this by splitting the packet.
-static constexpr std::uint32_t SPSC_NOCFP_WORDS = 4;         // payload words == values, in the order below
-enum SpscNocFpWord {
-    // A FILLER reads on kReadNoc (NoC 1) and writes on NOC_INDEX (NoC 0); a MOVER does both on NOC_INDEX.
-    // So these four names are per-ROLE meanings of "the NoC this role reads on" / "the NoC it writes on",
-    // NOT fixed NoC indices -- the host resolves which physical NoC from out[38]/out[39], which already
-    // report NOC_INDEX and kReadNoc.
-    SPSC_NOCFP_RD_WORDS = 0,  // NIU_MST_RD_DATA_WORD_RECEIVED delta, in NoC words (NOC_WORD_BYTES each)
-    SPSC_NOCFP_RD_TXNS = 1,   // NIU_MST_RD_REQ_SENT delta
-    SPSC_NOCFP_WR_WORDS = 2,  // NIU_MST_NONPOSTED_WR_DATA_WORD_SENT delta, in NoC words
-    SPSC_NOCFP_WR_TXNS = 3,   // NIU_MST_NONPOSTED_WR_REQ_SENT delta
 };
 
 // Total words a frame occupies on the wire, including the prefix and the pad up to a socket page.

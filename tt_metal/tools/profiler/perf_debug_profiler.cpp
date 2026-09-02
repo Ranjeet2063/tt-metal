@@ -647,36 +647,6 @@ void PerfDebugProfiler::start(const std::shared_ptr<distributed::MeshDevice>& me
         // ~110 cores typically run the workload, and pre-creating all of them litters the capture with
         // empty (count=0) contexts that read as "cores not showing up". The per-zone mutex+lookup cost is
         // identical either way; lazy creation just avoids minting dead contexts.
-        // Give each drainer's rows its ROLE, so a plot reads "DRISC 9-9 FILLER" instead of coordinates the
-        // reader has to map back to a job by hand. A string literal: the role text is interned into a plot
-        // name whose pointer the SERVER dereferences, so it has to outlive everything.
-        if (tracy_ != nullptr) {
-            for (uint32_t d = 0; d < kNFillers; d++) {
-                if (ctx.drain_program[d] == nullptr) {
-                    continue;
-                }
-                const char* role = "FILLER";
-                // TRANSLATE: the handler keys on NOC0 coords (that is what a decoded event carries), while
-                // drisc_virtual is the VIRTUAL space. Registering the virtual pair would look up nothing and
-                // the label would silently fall back to bare coordinates -- the failure would have been an
-                // absent word, not an error. virt_to_noc0 exists for exactly this reason.
-                const auto nit = ctx.virt_to_noc0.find(
-                    (static_cast<uint64_t>(ctx.drisc_virtual[d].x) << 32) |
-                    static_cast<uint64_t>(ctx.drisc_virtual[d].y));
-                if (nit == ctx.virt_to_noc0.end()) {
-                    log_warning(
-                        tt::LogMetal,
-                        "[perf-debug profiler] DRISC {} at virtual ({},{}) has no NOC0 mapping -- its plot rows "
-                        "will be labelled by coordinate only, without {}",
-                        d,
-                        ctx.drisc_virtual[d].x,
-                        ctx.drisc_virtual[d].y,
-                        role);
-                    continue;
-                }
-                tracy_->SetDriscRole(ctx.chip_id, nit->second.first, nit->second.second, role);
-            }
-        }
         ctx.active = true;
         devices_.push_back(std::move(ctx));
     }
@@ -724,15 +694,11 @@ void PerfDebugProfiler::start(const std::shared_ptr<distributed::MeshDevice>& me
                 }
             }
         }
-        perf_debug::ReceiverConfig rcfg;
         // No load_zone_names hook: names come per-ELF from llrt::ZoneMetaRegistry, which each consumer
         // mirrors lazily (the table GROWS as binaries JIT-load, so a one-shot snapshot would be taken when
         // it holds a fraction of its final size). PRODUCER-STALL and the DRISC self-zones are ordinary
         // zones with ordinary ELF records now -- nothing is registered by hand.
-        rcfg.starvation_diagnostic = [this](uint32_t dev, uint32_t sock) {
-            dump_drainer_state(devices_[dev], sock, "receiver-starved");
-        };
-        receiver_ = std::make_unique<perf_debug::PerfDebugReceiver>(std::move(rcfg), std::move(rdevs));
+        receiver_ = std::make_unique<perf_debug::PerfDebugReceiver>(std::move(rdevs));
         if (tracy_push_enabled()) {
             tracy_consumer_ = std::make_unique<perf_debug::PerfDebugTracyConsumer>(tracy_.get());
             // An ordinary public consumer: Tracy takes device zones WHOLE now (one QueueGpuZone item
@@ -1507,8 +1473,8 @@ bool PerfDebugProfiler::boot_device(
                 }
             }
 
-            // Zero done AND the heartbeat/phase words behind it. Zeroing only `done` leaves the PREVIOUS
-            // run's hb/phase in L1, so a drainer that never starts reads as the last run's final state --
+            // Zero done AND the heartbeat word behind it. Zeroing only `done` leaves the PREVIOUS
+            // run's heartbeat in L1, so a drainer that never starts reads as the last run's final state --
             // which is exactly how a failed start got misread as "exited and wedged in the socket tail".
             // ZERO THE DRAINER CORE'S OWN PROFILER RING -- for BOTH core types.
             //
@@ -1531,7 +1497,7 @@ bool PerfDebugProfiler::boot_device(
                 tt_cxy_pair(device_id, ctx.drisc_virtual[d]),
                 drainer_prof_l1);
 
-            // done | hb | phase and the rest of the 64 B pad: a stale value from the previous run reads as
+            // done | heartbeat and the rest of the 64 B pad: a stale value from the previous run reads as
             // this run's live state.
             uint32_t zero3[13] = {};
             cluster.write_core(
@@ -1542,7 +1508,7 @@ bool PerfDebugProfiler::boot_device(
             // ALSO the stop word -- teardown leaves it at 1 (quiesce) or 2 (free the NIU), and the drain loop
             // is `while (... && *stop == 0 ...)`, so a stale value would make the next kernel exit after ONE
             // sweep while the host reports FAILED TO START. (Not the cause of the slow-dispatch wedge below --
-            // that reproduces with stop=0 -- but the same class of stale-state bug as the hb/phase words.)
+            // that reproduces with stop=0 -- but the same class of stale-state bug as the heartbeat word.)
             // FOUR words, not one: stop plus the sync-event rendezvous triple (req | ack | go) that shares its
             // 64 B pad. A stale `req` from a previous run would make every drainer park at a barrier nobody is
             // going to release, and it would present as the workload wedging at the first sweep -- the same
@@ -1641,34 +1607,19 @@ bool PerfDebugProfiler::boot_device(
                     } while (std::chrono::steady_clock::now() < adv_deadline);
                 }
                 if (hb0 == 0 || hb1 == hb0) {
-                    // Report WHERE it stopped, not just that it did. `phase` is the kernel's own progress
-                    // marker; without it this warning sent me chasing a stale stop word and a TLB change,
-                    // when phase=11 says plainly that it is wedged in the sweep-body write barrier.
-                    uint32_t st[5] = {0, 0, 0, 0, 0};
-                    cluster.read_core(
-                        st, sizeof(st), core, ctx.drisc_l1_noc[d] + (ctx.done_addr[d] - ctx.drisc_l1_base[d]));
                     uint32_t stopw = 0;
                     cluster.read_core(
                         &stopw, sizeof(stopw), core, ctx.drisc_l1_noc[d] + (ctx.stop_addr[d] - ctx.drisc_l1_base[d]));
                     log_warning(
                         tt::LogMetal,
                         "[perf-debug profiler] Device {}: drainer {} FAILED TO START (heartbeat {} -> {} after "
-                        "launch). The producers would block forever on a full ring and wedge the workload, so "
-                        "capture is disabled for this run instead. State: done=0x{:x} hb={} phase={} stop={} "
-                        "| write-barrier predicate: HW_ACK_RECEIVED={} vs SW_acked={} (equal => flushed; "
-                        "unequal and FROZEN => the software mirror is out of sync, not a stalled NoC) "
-                        "(phase: 1=INIT 2=POLL 3=RESERVE 4=WRITE 5=EXIT 6-9=write-substeps 11-13=barriers "
-                        "14=socket-barrier 15=tail-barrier)",
+                        "launch, stop word {}). The producers would block forever on a full ring and wedge the "
+                        "workload, so capture is disabled for this run instead.",
                         device_id,
                         d,
                         hb0,
                         hb1,
-                        st[0],
-                        st[1],
-                        st[2],
-                        stopw,
-                        st[3],
-                        st[4]);
+                        stopw);
                     ctx.drain_program[d].reset();
                     ctx.sockets[sk].reset();
                     disarm_producers(mesh_device, device_id);
@@ -1721,62 +1672,6 @@ bool PerfDebugProfiler::boot_device(
     return true;
 }
 
-void PerfDebugProfiler::dump_drainer_state(DeviceCtx& ctx, uint32_t d, const char* why) {
-    if (ctx.drain_program[d] == nullptr) {
-        return;
-    }
-    auto& cluster = MetalContext::instance().get_cluster();
-    const tt_cxy_pair drisc(ctx.chip_id, ctx.drisc_virtual[d]);
-    const uint64_t base = ctx.drisc_l1_noc[d] + (ctx.done_addr[d] - ctx.drisc_l1_base[d]);
-    // done | heartbeat | phase, read as one 3-word block, twice, so a frozen heartbeat is distinguishable
-    // from a slow one. 60 ms is ~2000 sweeps of headroom at the measured 27-30 us/sweep.
-    uint32_t a[3] = {0, 0, 0}, b[3] = {0, 0, 0};
-    cluster.read_core(a, sizeof(a), drisc, base);
-    std::this_thread::sleep_for(std::chrono::milliseconds(60));
-    cluster.read_core(b, sizeof(b), drisc, base);
-    const bool exited = (a[0] & 0xFFFF0000u) == 0xD09E0000u;
-    const char* phase_name = "?";
-    switch (b[2]) {
-        case 1: phase_name = "INIT"; break;
-        case 2: phase_name = "POLL"; break;
-        case 3: phase_name = "RESERVE(credit-wait)"; break;
-        case 4: phase_name = "WRITE"; break;
-        case 5: phase_name = "EXIT"; break;
-        default: break;
-    }
-    uint32_t np = 0, fifo_pages = 0;
-    // After start() the sockets belong to the receiver (single-threaded per instance, so they must not be
-    // polled from here), leaving the FIFO figures for bring-up-time dumps only.
-    const bool have_fifo = ctx.sockets[d] != nullptr;
-    if (have_fifo) {
-        np = ctx.sockets[d]->pages_available();
-        fifo_pages = ctx.sockets[d]->get_fifo_curr_size() / ctx.sockets[d]->get_page_size();
-    }
-    log_warning(
-        tt::LogMetal,
-        "[perf-debug profiler] DRAINER STATE ({}) dev {} drainer {}: done=0x{:08X} ({}) | heartbeat {} -> {} "
-        "({}) | phase {} ({}) | host sees {} of {} fifo pages available",
-        why,
-        ctx.chip_id,
-        d,
-        a[0],
-        exited ? "KERNEL EXITED" : "still resident",
-        a[1],
-        b[1],
-        b[1] == a[1] ? "FROZEN" : "advancing",
-        b[2],
-        phase_name,
-        np,
-        fifo_pages);
-    if (have_fifo && b[1] == a[1] && !exited && b[2] == 3 && np == 0) {
-        log_warning(
-            tt::LogMetal,
-            "[perf-debug profiler]   => CONTRADICTION: drainer blocked on credits while host sees an EMPTY "
-            "fifo. bytes_sent/bytes_acked have desynchronized; the sender is waiting for credit the host "
-            "believes it already granted.");
-    }
-}
-
 void PerfDebugProfiler::stop() {
     if (stopped_.exchange(true)) {
         return;
@@ -1825,11 +1720,6 @@ void PerfDebugProfiler::stop() {
                     tt::LogMetal,
                     "[perf-debug profiler] Device {}: DRISC drainer did not acknowledge stop",
                     ctx.chip_id);
-                // WHERE is it stuck? The phase word is live while the loop runs, so this says which part of
-                // the kernel is blocking instead of leaving it to inference. POLL = sweep body (NoC reads or
-                // the control-vector pass), RESERVE = credit wait (should be impossible now it is bounded),
-                // WRITE = the PCIe write / push / notify / barrier, EXIT = the socket teardown tail.
-                dump_drainer_state(ctx, d, "stop-not-acked");
             } else if (receiver_ != nullptr) {
                 // done follows the drainer's socket barrier, i.e. the host has already read and acked every
                 // byte this socket will ever carry -- the stream can retire itself on one final empty check.

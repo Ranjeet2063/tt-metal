@@ -133,8 +133,7 @@ struct IdleBackoff {
 
 }  // namespace
 
-PerfDebugReceiver::PerfDebugReceiver(ReceiverConfig config, std::vector<ReceiverDeviceConfig> devices) :
-    cfg_(std::move(config)), devices_(std::move(devices)) {
+PerfDebugReceiver::PerfDebugReceiver(std::vector<ReceiverDeviceConfig> devices) : devices_(std::move(devices)) {
     TT_FATAL(devices_.size() <= kPerfDebugMaxDevices, "record dev field holds {} devices", kPerfDebugMaxDevices);
     // The scalar decode packs meta through the bit-field; the AVX2 path packs it by hand, so pin the layout.
     const PerfDebugRawRecMeta meta_probe{0, 5, 2, PerfDebugRawRecType::ZoneEnd};
@@ -435,9 +434,6 @@ void PerfDebugReceiver::decode_thread(std::vector<Stream*> streams) {
                     s->dev,
                     s->sock_idx,
                     watchdog_.count());
-                if (cfg_.starvation_diagnostic) {
-                    cfg_.starvation_diagnostic(s->dev, s->sock_idx);
-                }
             }
         }
         if (all_retired) {

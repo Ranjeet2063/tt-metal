@@ -122,12 +122,6 @@ struct ReceiverDeviceConfig {
     int numa_node = -1;  // host node closest to this device; -1 leaves ring and thread unbound
 };
 
-struct ReceiverConfig {
-    // Optional: called once per stream if it starves for the watchdog window mid-run while
-    // its producers are not done (control plane can dump drainer state; receiver has no MMIO).
-    std::function<void(uint32_t device_index, uint32_t socket_index)> starvation_diagnostic;
-};
-
 // Mirror of the ELF-resolved PRODUCER-STALL zone ids -- one per kernel TU, because that header
 // declares it at namespace scope. Refreshed by cursor once per decoded frame.
 //
@@ -161,7 +155,7 @@ struct StallIdMirror {
 
 class PerfDebugReceiver {
 public:
-    PerfDebugReceiver(ReceiverConfig config, std::vector<ReceiverDeviceConfig> devices);
+    explicit PerfDebugReceiver(std::vector<ReceiverDeviceConfig> devices);
     ~PerfDebugReceiver();
 
     PerfDebugReceiver(const PerfDebugReceiver&) = delete;
@@ -245,7 +239,6 @@ private:
     bool ingest_pass(Stream& s);
     void consumer_thread(Consumer& c);
 
-    ReceiverConfig cfg_;
     std::vector<ReceiverDeviceConfig> devices_;
     PerfDebugCaptureContext ctx_;
     std::vector<std::unique_ptr<Stream>> streams_;

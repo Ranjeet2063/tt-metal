@@ -12,21 +12,7 @@
 
 namespace tt::tt_metal::perf_debug {
 
-PerfDebugTracyConsumer::PerfDebugTracyConsumer(PerfDebugTracyHandler* handler) : handler_(handler) {
-    // The SWEEP/PACE alternation is what a drainer row is read by, so those two must contrast; PACE is
-    // deliberate idleness and gets a recessive grey. Keys are the zone NAMES the drain kernel declares
-    // (TT_ZONE_DEFINE_ID) -- names are the only stable handle on a structural zone id.
-    zone_colors_["DRISC-SWEEP"] = 0x2E86C1;
-    zone_colors_["DRISC-PACE"] = 0x707B7C;
-    zone_colors_["DRISC-READ"] = 0x27AE60;
-    zone_colors_["DRISC-READ-WAIT"] = 0x196F3D;
-    zone_colors_["DRISC-PROC"] = 0x8E44AD;
-    zone_colors_["DRISC-CREDIT-WAIT"] = 0xC0392B;
-    zone_colors_["DRISC-WRITE"] = 0xD35400;
-    zone_colors_["DRISC-WR-BARRIER"] = 0xF1C40F;
-    // White, and the same on both roles: the sync marker is a fiducial, not a phase.
-    zone_colors_["DRISC-SYNC"] = 0xFFFFFF;
-}
+PerfDebugTracyConsumer::PerfDebugTracyConsumer(PerfDebugTracyHandler* handler) : handler_(handler) {}
 
 PerfDebugTracyConsumer::~PerfDebugTracyConsumer() { log_unnamed_ids("tracy", names_); }
 
@@ -123,9 +109,6 @@ void PerfDebugTracyConsumer::operator()(const PerfDebugRecordBatch& batch) {
         pkt.risc = li.risc;
         pkt.timer_id = r.id;
         pkt.name = names_.lookup(r.id);
-        if (auto cit = zone_colors_.find(pkt.name); cit != zone_colors_.end()) {
-            pkt.color = cit->second;
-        }
         const uint64_t base = clock_synced_[r.meta.dev] ? 0 : ts_base_[r.meta.dev];
         const uint64_t start = r.data.zone.start;
         const uint64_t end = r.data.zone.start + r.data.zone.duration;
