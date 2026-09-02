@@ -53,6 +53,8 @@ constexpr uint8_t kReadNoc = NOC_INDEX == 0 ? 1 : 0;
 constexpr bool kSpool = kSpoolBytes != 0;
 constexpr uint8_t kDmaShip = 0;   // TX stream 0: staging -> spool
 constexpr uint8_t kDmaDrain = 1;  // TX stream 1: spool -> bounce
+// The TX stream status register's num_writes_outstanding field is 4 bits wide (gddr_dma_regs.h).
+constexpr uint32_t kDmaOutstandingMax = 15;
 // Staging layout: two-core batches in kNGens generations, one slot of CV staging, and (spool mode)
 // two drain bounce buffers.
 constexpr uint32_t kGenSlots = 2;
@@ -174,7 +176,7 @@ void kernel_main() {
     // ship. Stored rather than recomputed so the two phases cannot diverge.
     static uint8_t slot_core[kNStage];
     static uint32_t slot_payload[kNStage];
-    for (uint32_t i = 0; i < kMaxCores; i++) {
+    for (uint32_t i = 0; i < num_cores; i++) {
         hot[i] = 0;
     }
     // Seed the head mirrors from the tails as they stand now: everything published before this
@@ -753,7 +755,7 @@ void kernel_main() {
                         // This generation's ship writes only: stream completion is FIFO,
                         // so outstanding <= later-issues means this generation retired.
                         const uint32_t since = dma_issued - gen_dma_mark[gen];
-                        const uint32_t cap = since > 15u ? 15u : since;
+                        const uint32_t cap = since > kDmaOutstandingMax ? kDmaOutstandingMax : since;
                         while (experimental::dma_get_writes_outstanding(kDmaShip) > cap) {
                         }
                     } else {
