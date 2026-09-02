@@ -1784,7 +1784,7 @@ void PerfDebugProfiler::verify_completeness(DeviceCtx& ctx, uint32_t device_inde
     uint32_t worst_lane = 0, worst_lane_words = 0;
     uint64_t risc_total[kNRisc] = {};
     struct CoreStall {
-        uint32_t count, vx, vy;
+        uint32_t count, vx, vy, idx;
     };
     std::vector<CoreStall> stalled_cores;
     // WORKER cores only. With DRISC self-profiling on, core_virt also holds the drainer cores, and a DRAM
@@ -1809,7 +1809,7 @@ void PerfDebugProfiler::verify_completeness(DeviceCtx& ctx, uint32_t device_inde
         worst = std::max(worst, core_total);
         cores_hit += (core_total != 0) ? 1 : 0;
         if (core_total != 0) {
-            stalled_cores.push_back({static_cast<uint32_t>(core_total), vx, vy});
+            stalled_cores.push_back({static_cast<uint32_t>(core_total), vx, vy, static_cast<uint32_t>(ci)});
         }
         if (heads.empty()) {
             continue;
@@ -1843,9 +1843,9 @@ void PerfDebugProfiler::verify_completeness(DeviceCtx& ctx, uint32_t device_inde
             return a.count > b.count;
         });
         std::string top;
-        for (size_t i = 0; i < std::min<size_t>(8, stalled_cores.size()); i++) {
+        for (size_t i = 0; i < stalled_cores.size(); i++) {
             const auto& c = stalled_cores[i];
-            top += fmt::format("{}({},{})={}", i != 0 ? " " : "", c.vx, c.vy, c.count);
+            top += fmt::format("{}({},{})#{}={}", i != 0 ? " " : "", c.vx, c.vy, c.idx, c.count);
         }
         log_info(
             tt::LogMetal,
