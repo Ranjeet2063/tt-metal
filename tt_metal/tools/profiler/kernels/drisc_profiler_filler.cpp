@@ -24,6 +24,7 @@ constexpr uint32_t kDoneAddr = get_named_compile_time_arg_val("done_addr");
 constexpr uint32_t kStopAddr = get_named_compile_time_arg_val("stop_addr");
 constexpr uint32_t kSocketConfigAddr = get_named_compile_time_arg_val("socket_config_addr");
 constexpr uint32_t kMaxCores = get_named_compile_time_arg_val("max_cores");
+static_assert(kMaxCores <= 256, "ship_list, slot_core and hot index cores as bytes");
 // Static VC for PCIe pushes, spread across fillers by the host.
 constexpr uint32_t kWriteVc = get_named_compile_time_arg_val("write_vc");
 // Ship threshold, percent of one ring. Binds on the core's fullest LANE, not its span: the
@@ -65,6 +66,8 @@ constexpr uint32_t kCvBase = kStageBase + kNGens * kGenSlots * kSlotBytes;
 constexpr uint32_t kCvReadBytes = 32;
 constexpr uint32_t kCvReadSrcOff = kernel_profiler::SPSC_RING_TAIL_0 * 4u;
 static_assert(kCvReadBytes * kMaxCores <= kSlotBytes, "CV staging must fit its slot");
+// Five head words per core, padded to the NoC write alignment.
+constexpr uint32_t kHeadScratchStride = 32;
 // The bounces take the rest of the CV slot's space plus their own slots, split in two and
 // page-rounded: wide bounces are what pull the sustained drain equilibrium below production.
 constexpr uint32_t kBounceBase0 = kCvBase + kCvReadBytes * kMaxCores;
@@ -86,6 +89,8 @@ constexpr uint32_t kCvIdleGapMax = 5 * kCyclesPerUs;
 // Worst-case host staleness for a workload too light to reach the occupancy bands.
 constexpr uint64_t kSpoolFreshCycles = 50'000 * kCyclesPerUs;
 constexpr uint64_t kStopDrainCycles = 1'000'000 * kCyclesPerUs;
+// How long the exit lets the posted head writes stream out; small packets leave in nanoseconds.
+constexpr uint64_t kPostedDrainCycles = 1000 * kCyclesPerUs;
 // How long the exit waits for the host's NIU-restore word before restoring anyway.
 constexpr uint64_t kNiuRestoreWaitCycles = 10'000'000 * kCyclesPerUs;
 
@@ -119,6 +124,20 @@ __attribute__((always_inline)) inline void cv_wave(
     }
     invalidate_l1_cache();
 }
+
+__attribute__((always_inline)) inline uint32_t head_scratch(uint32_t c) {
+    return kHeadScratch + c * kHeadScratchStride;
+}
+
+// Posted (the barriers protect staging reuse, which a head write never touches; scratch reuse is
+// safe on the slot rotation) and on the read NoC: on the egress NoC this small packet queues behind
+// frame data, so head visibility inherited the PCIe tile's acceptance jitter.
+__attribute__((always_inline)) inline void post_heads(const uint64_t* core_noc, uint32_t c) {
+    noc_async_write_one_packet<true, true>(
+        head_scratch(c), core_noc[c] + kernel_profiler::SPSC_RING_HEAD_0 * 4u, kNumRisc * 4u, kReadNoc);
+}
+
+__attribute__((always_inline)) inline uint32_t prev_gen(uint32_t g) { return g == 0u ? kNGens - 1u : g - 1u; }
 
 void kernel_main() {
     const uint32_t num_cores = get_arg_val<uint32_t>(0);
@@ -159,7 +178,7 @@ void kernel_main() {
     for (uint32_t sl = 0; sl < kNStage; sl++) {
         volatile tt_l1_ptr uint32_t* pfx = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(kStageBase + sl * kSlotBytes);
         pfx[0] = kernel_profiler::spsc_span_w0();
-        for (uint32_t k = 1; k < kPrefix + kCtrlWords; k++) {
+        for (uint32_t k = 1; k < kPrefix + kWireCtrl; k++) {
             pfx[k] = 0;
         }
     }
@@ -184,7 +203,7 @@ void kernel_main() {
     cv_wave(core_noc, 0, num_cores, NOC_STATUS_READ_REG(kReadNoc, NIU_MST_RD_RESP_RECEIVED), num_cores);
     for (uint32_t c = 0; c < num_cores; c++) {
         const tt_l1_ptr uint32_t* tails = reinterpret_cast<const tt_l1_ptr uint32_t*>(kCvBase + c * kCvReadBytes);
-        volatile tt_l1_ptr uint32_t* heads = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(kHeadScratch + c * 32u);
+        volatile tt_l1_ptr uint32_t* heads = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(head_scratch(c));
         uint32_t tsum = 0;
         for (uint32_t r = 0; r < kNumRisc; r++) {
             heads[r] = tails[r];
@@ -209,6 +228,7 @@ void kernel_main() {
     // A head relief is one posted write; re-posting every core's head on this cadence bounds a
     // lost one to a stall instead of parking the producer for the rest of the run.
     constexpr uint32_t kHeadRefreshSweeps = 64;
+    static_assert((kHeadRefreshSweeps & (kHeadRefreshSweeps - 1u)) == 0, "the refresh cadence is a mask");
     // Which staging generations may still have a ship in flight. Persists across sweeps so a
     // sweep's final ship drains under the pace gap or the next CV pass, not on its own critical
     // path.
@@ -253,6 +273,9 @@ void kernel_main() {
     // frame is one write (or one DMA), and the trailing page fill is never written -- the host
     // derives every offset from the control vector and reads past it.
     auto emit_slots = [&](uint32_t start, uint32_t count) {
+        // Never true, and load-bearing: it hands the compiler count >= 1, which is what keeps the
+        // emit loops rotated and the slot address strength-reduced (without it: a spill, a mul, and
+        // +3.4% d1 stalls).
         if (count == 0) {
             return;
         }
@@ -323,7 +346,7 @@ void kernel_main() {
     // silently truncated captures.
     uint64_t stop_seen_at = 0;
     uint32_t relieved_at_stop_check = 0;
-    for (;;) {
+    while (true) {
         invalidate_l1_cache();
         if (*stop != 0) {
             if (stop_seen_at == 0) {
@@ -364,12 +387,12 @@ void kernel_main() {
         uint32_t scan_lo = 0;
         uint32_t scan_hi = cv_chunk;
         uint32_t cur = 0;
-        for (;;) {
+        while (true) {
             for (uint32_t c = scan_lo; c < scan_hi; c++) {
                 const tt_l1_ptr uint32_t* __restrict tails =
                     reinterpret_cast<const tt_l1_ptr uint32_t*>(kCvBase + c * kCvReadBytes);
                 const tt_l1_ptr uint32_t* __restrict mine =
-                    reinterpret_cast<const tt_l1_ptr uint32_t*>(kHeadScratch + c * 32u);
+                    reinterpret_cast<const tt_l1_ptr uint32_t*>(head_scratch(c));
                 // The scan is unrolled into registers on purpose: a loop over indexed arrays
                 // spills on this core, and each spilled word is an L1 round trip per core per
                 // sweep.
@@ -452,7 +475,7 @@ void kernel_main() {
                 // the release path. Safe because nothing reads the scratch between issue and that
                 // barrier.
                 volatile tt_l1_ptr uint32_t* __restrict heads =
-                    reinterpret_cast<volatile tt_l1_ptr uint32_t*>(kHeadScratch + c * 32u);
+                    reinterpret_cast<volatile tt_l1_ptr uint32_t*>(head_scratch(c));
                 uint32_t live = 0;
                 uint32_t off = kPrefix + kWireCtrl;
                 ncrisc_noc_read_set_state<DM_DEDICATED_NOC, false, false>(kReadNoc, read_cmd_buf, core_noc[c]);
@@ -532,15 +555,7 @@ void kernel_main() {
             // ring slots are free regardless of when the frame reaches the host.
             auto advance_heads = [&](uint32_t n, uint32_t g) {
                 for (uint32_t i = 0; i < n; i++) {
-                    const uint32_t sl = g * kGenSlots + i;
-                    const uint32_t c = slot_core[sl];
-                    const uint32_t sc = kHeadScratch + c * 32u;
-                    // Posted (the barriers protect staging reuse, which a head write never
-                    // touches; scratch reuse is safe on the slot rotation) and on the read NoC:
-                    // on the egress NoC this small packet queues behind frame data, so head
-                    // visibility inherited the PCIe tile's acceptance jitter.
-                    noc_async_write_one_packet<true, true>(
-                        sc, core_noc[c] + kernel_profiler::SPSC_RING_HEAD_0 * 4u, kNumRisc * 4u, kReadNoc);
+                    post_heads(core_noc, slot_core[g * kGenSlots + i]);
                     relieved++;
                 }
             };
@@ -608,7 +623,7 @@ void kernel_main() {
                 // The overlap: the previous batch ships on the egress side while this batch's
                 // gather reads fly on the read NoC.
                 if (have_pend) {
-                    ship_frames(pend_n, gen == 0u ? kNGens - 1u : gen - 1u);
+                    ship_frames(pend_n, prev_gen(gen));
                 }
                 if constexpr (kSpool) {
                     if (pump.level >= 3u) {
@@ -636,7 +651,7 @@ void kernel_main() {
             }
             if (cur >= n_ship && scan_hi >= num_cores) {
                 if (have_pend) {
-                    ship_frames(pend_n, gen == 0u ? kNGens - 1u : gen - 1u);
+                    ship_frames(pend_n, prev_gen(gen));
                     have_pend = false;
                 }
                 break;
@@ -654,11 +669,7 @@ void kernel_main() {
         // the head it was last relieved to.
         if ((sweeps & (kHeadRefreshSweeps - 1u)) == 0) {
             for (uint32_t c = 0; c < num_cores; c++) {
-                noc_async_write_one_packet<true, true>(
-                    kHeadScratch + c * 32u,
-                    core_noc[c] + kernel_profiler::SPSC_RING_HEAD_0 * 4u,
-                    kNumRisc * 4u,
-                    kReadNoc);
+                post_heads(core_noc, c);
             }
         }
         // Busy sweeps below the first band skip the post-sweep pump entirely: the spool is the
@@ -733,9 +744,9 @@ void kernel_main() {
     }
     while (!ncrisc_noc_nonposted_writes_flushed(NOC_INDEX)) {
     }
-    // The posted head write-backs are outside that barrier's predicate; drain their sent counter
-    // (small packets stream out in nanoseconds) so no unstreamed head is left behind.
-    const uint64_t t_ps = get_timestamp() + 1000 * kCyclesPerUs;
+    // The posted head write-backs are outside that barrier's predicate; drain their sent counter so
+    // no unstreamed head is left behind.
+    const uint64_t t_ps = get_timestamp() + kPostedDrainCycles;
     while (!(ncrisc_noc_posted_writes_sent(NOC_INDEX) && ncrisc_noc_posted_writes_sent(kReadNoc)) &&
            get_timestamp() < t_ps) {
     }
@@ -753,7 +764,8 @@ void kernel_main() {
     // NIU restore, on the host's word. NIU_CFG_0 persists until chip reset, so whoever set stream
     // mode owns putting it back -- and last, because the flip to NOC2AXI takes this L1 (`done`,
     // the results, bytes_acked) out of the host's view.
-    for (const uint64_t t_end = get_timestamp() + kNiuRestoreWaitCycles; *stop != 2u && get_timestamp() < t_end;) {
+    const uint64_t t_end = get_timestamp() + kNiuRestoreWaitCycles;
+    while (*stop != 2u && get_timestamp() < t_end) {
         invalidate_l1_cache();
     }
     experimental::drisc_set_noc2axi_mode_all();

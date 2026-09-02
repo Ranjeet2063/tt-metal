@@ -48,7 +48,7 @@ inline bool reserve_pages(const SocketSenderInterface& socket, uint32_t num_page
     volatile tt_l1_ptr uint32_t* acked = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(socket.bytes_acked_base_addr);
     const uint32_t acked_end = socket.bytes_acked_base_addr + socket.num_downstreams * bytes_acked_size_bytes;
     while (reinterpret_cast<uint32_t>(acked) < acked_end) {
-        for (;;) {
+        while (true) {
             invalidate_l1_cache();
             // bytes_acked is never ahead of bytes_sent, so this cannot underflow
             const uint32_t bytes_free = socket.downstream_fifo_total_size - (socket.bytes_sent - *acked);
